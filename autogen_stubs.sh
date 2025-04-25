@@ -94,6 +94,13 @@ generate_cuda() {
   python3 -c "import tinygrad.runtime.autogen.cuda"
 }
 
+generate_rockchip() {
+  clang2py /usr/local/include/rknn_api.h /usr/local/include/rknn_custom_op.h /usr/local/include/rknn_matmul_api.h -o $BASE/rockchip.py -l /usr/lib/librknnrt.so
+  fixup $BASE/rockchip.py
+  sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/rockchip.py
+  python3 -c "import tinygrad.runtime.autogen.rockchip"
+}
+
 generate_nvrtc() {
   clang2py /usr/local/cuda/include/nvrtc.h /usr/local/cuda/include/nvJitLink.h -o $BASE/nvrtc.py -l /usr/local/cuda/lib64/libnvrtc.so -l /usr/local/cuda/lib64/libnvJitLink.so
   sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/nvrtc.py
@@ -548,6 +555,7 @@ elif [ "$1" == "adreno" ]; then generate_adreno
 elif [ "$1" == "pci" ]; then generate_pci
 elif [ "$1" == "vfio" ]; then generate_vfio
 elif [ "$1" == "webgpu" ]; then generate_webgpu
-elif [ "$1" == "all" ]; then generate_opencl; generate_hip; generate_comgr; generate_cuda; generate_nvrtc; generate_hsa; generate_kfd; generate_nv; generate_amd; generate_io_uring; generate_libc; generate_am; generate_webgpu
+elif [ "$1" == "rockchip" ]; then generate_rockchip
+elif [ "$1" == "all" ]; then generate_opencl; generate_hip; generate_comgr; generate_cuda; generate_rockchip; generate_nvrtc; generate_hsa; generate_kfd; generate_nv; generate_amd; generate_io_uring; generate_libc; generate_am; generate_webgpu
 else echo "usage: $0 <type>"
 fi
