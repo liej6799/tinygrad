@@ -6,38 +6,22 @@
 # POINTER_SIZE is: 8
 # LONGDOUBLE_SIZE is: 16
 #
-import ctypes, ctypes.util
+import ctypes, os
 
 
-class FunctionFactoryStub:
-    def __getattr__(self, _):
-      return ctypes.CFUNCTYPE(lambda y:y)
 
-# libraries['FIXME_STUB'] explanation
-# As you did not list (-l libraryname.so) a library that exports this function
-# This is a non-working stub instead.
-# You can either re-run clan2py with -l /path/to/library.so
-# Or manually fix this by comment the ctypes.CDLL loading
-_libraries = {}
-_libraries['FIXME_STUB'] = FunctionFactoryStub() #  ctypes.CDLL('FIXME_STUB')
-def string_cast(char_pointer, encoding='utf-8', errors='strict'):
-    value = ctypes.cast(char_pointer, ctypes.c_char_p).value
-    if value is not None and encoding is not None:
-        value = value.decode(encoding, errors=errors)
-    return value
+import functools
+from tinygrad.runtime.support.hcq import FileIOInterface
 
+def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:FileIOInterface, **kwargs):
+  ret = __fd.ioctl((__idir<<30) | (ctypes.sizeof(made := __user_struct(**kwargs))<<16) | (__base<<8) | __nr, made)
+  if ret != 0: raise RuntimeError(f"ioctl returned {ret}")
+  return made
 
-def char_pointer_cast(string, encoding='utf-8'):
-    if encoding is not None:
-        try:
-            string = string.encode(encoding)
-        except AttributeError:
-            # In Python3, bytes has no encode attribute
-            pass
-    string = ctypes.c_char_p(string)
-    return ctypes.cast(string, ctypes.POINTER(ctypes.c_char))
-
-
+def _IO(base, nr): return functools.partial(_do_ioctl, 0, ord(base) if isinstance(base, str) else base, nr, None)
+def _IOW(base, nr, type): return functools.partial(_do_ioctl, 1, ord(base) if isinstance(base, str) else base, nr, type)
+def _IOR(base, nr, type): return functools.partial(_do_ioctl, 2, ord(base) if isinstance(base, str) else base, nr, type)
+def _IOWR(base, nr, type): return functools.partial(_do_ioctl, 3, ord(base) if isinstance(base, str) else base, nr, type)
 
 class AsDictMixin:
     @classmethod
@@ -147,6 +131,25 @@ class Union(ctypes.Union, AsDictMixin):
 
 
 
+def string_cast(char_pointer, encoding='utf-8', errors='strict'):
+    value = ctypes.cast(char_pointer, ctypes.c_char_p).value
+    if value is not None and encoding is not None:
+        value = value.decode(encoding, errors=errors)
+    return value
+
+
+def char_pointer_cast(string, encoding='utf-8'):
+    if encoding is not None:
+        try:
+            string = string.encode(encoding)
+        except AttributeError:
+            # In Python3, bytes has no encode attribute
+            pass
+    string = ctypes.c_char_p(string)
+    return ctypes.cast(string, ctypes.POINTER(ctypes.c_char))
+
+
+
 c_int128 = ctypes.c_ubyte*16
 c_uint128 = c_int128
 void = None
@@ -155,925 +158,1355 @@ if ctypes.sizeof(ctypes.c_longdouble) == 16:
 else:
     c_long_double_t = ctypes.c_ubyte*16
 
-_libraries['librknnrt.so'] = ctypes.CDLL('/usr/lib/librknnrt.so')
 
 
-rknn_context = ctypes.c_uint64
-
-# values for enumeration '_rknn_query_cmd'
-_rknn_query_cmd__enumvalues = {
-    0: 'RKNN_QUERY_IN_OUT_NUM',
-    1: 'RKNN_QUERY_INPUT_ATTR',
-    2: 'RKNN_QUERY_OUTPUT_ATTR',
-    3: 'RKNN_QUERY_PERF_DETAIL',
-    4: 'RKNN_QUERY_PERF_RUN',
-    5: 'RKNN_QUERY_SDK_VERSION',
-    6: 'RKNN_QUERY_MEM_SIZE',
-    7: 'RKNN_QUERY_CUSTOM_STRING',
-    8: 'RKNN_QUERY_NATIVE_INPUT_ATTR',
-    9: 'RKNN_QUERY_NATIVE_OUTPUT_ATTR',
-    8: 'RKNN_QUERY_NATIVE_NC1HWC2_INPUT_ATTR',
-    9: 'RKNN_QUERY_NATIVE_NC1HWC2_OUTPUT_ATTR',
-    10: 'RKNN_QUERY_NATIVE_NHWC_INPUT_ATTR',
-    11: 'RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR',
-    12: 'RKNN_QUERY_DEVICE_MEM_INFO',
-    13: 'RKNN_QUERY_INPUT_DYNAMIC_RANGE',
-    14: 'RKNN_QUERY_CURRENT_INPUT_ATTR',
-    15: 'RKNN_QUERY_CURRENT_OUTPUT_ATTR',
-    16: 'RKNN_QUERY_CURRENT_NATIVE_INPUT_ATTR',
-    17: 'RKNN_QUERY_CURRENT_NATIVE_OUTPUT_ATTR',
-    18: 'RKNN_QUERY_CMD_MAX',
-}
-RKNN_QUERY_IN_OUT_NUM = 0
-RKNN_QUERY_INPUT_ATTR = 1
-RKNN_QUERY_OUTPUT_ATTR = 2
-RKNN_QUERY_PERF_DETAIL = 3
-RKNN_QUERY_PERF_RUN = 4
-RKNN_QUERY_SDK_VERSION = 5
-RKNN_QUERY_MEM_SIZE = 6
-RKNN_QUERY_CUSTOM_STRING = 7
-RKNN_QUERY_NATIVE_INPUT_ATTR = 8
-RKNN_QUERY_NATIVE_OUTPUT_ATTR = 9
-RKNN_QUERY_NATIVE_NC1HWC2_INPUT_ATTR = 8
-RKNN_QUERY_NATIVE_NC1HWC2_OUTPUT_ATTR = 9
-RKNN_QUERY_NATIVE_NHWC_INPUT_ATTR = 10
-RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR = 11
-RKNN_QUERY_DEVICE_MEM_INFO = 12
-RKNN_QUERY_INPUT_DYNAMIC_RANGE = 13
-RKNN_QUERY_CURRENT_INPUT_ATTR = 14
-RKNN_QUERY_CURRENT_OUTPUT_ATTR = 15
-RKNN_QUERY_CURRENT_NATIVE_INPUT_ATTR = 16
-RKNN_QUERY_CURRENT_NATIVE_OUTPUT_ATTR = 17
-RKNN_QUERY_CMD_MAX = 18
-_rknn_query_cmd = ctypes.c_uint32 # enum
-rknn_query_cmd = _rknn_query_cmd
-rknn_query_cmd__enumvalues = _rknn_query_cmd__enumvalues
-
-# values for enumeration '_rknn_tensor_type'
-_rknn_tensor_type__enumvalues = {
-    0: 'RKNN_TENSOR_FLOAT32',
-    1: 'RKNN_TENSOR_FLOAT16',
-    2: 'RKNN_TENSOR_INT8',
-    3: 'RKNN_TENSOR_UINT8',
-    4: 'RKNN_TENSOR_INT16',
-    5: 'RKNN_TENSOR_UINT16',
-    6: 'RKNN_TENSOR_INT32',
-    7: 'RKNN_TENSOR_UINT32',
-    8: 'RKNN_TENSOR_INT64',
-    9: 'RKNN_TENSOR_BOOL',
-    10: 'RKNN_TENSOR_INT4',
-    11: 'RKNN_TENSOR_BFLOAT16',
-    12: 'RKNN_TENSOR_TYPE_MAX',
-}
-RKNN_TENSOR_FLOAT32 = 0
-RKNN_TENSOR_FLOAT16 = 1
-RKNN_TENSOR_INT8 = 2
-RKNN_TENSOR_UINT8 = 3
-RKNN_TENSOR_INT16 = 4
-RKNN_TENSOR_UINT16 = 5
-RKNN_TENSOR_INT32 = 6
-RKNN_TENSOR_UINT32 = 7
-RKNN_TENSOR_INT64 = 8
-RKNN_TENSOR_BOOL = 9
-RKNN_TENSOR_INT4 = 10
-RKNN_TENSOR_BFLOAT16 = 11
-RKNN_TENSOR_TYPE_MAX = 12
-_rknn_tensor_type = ctypes.c_uint32 # enum
-rknn_tensor_type = _rknn_tensor_type
-rknn_tensor_type__enumvalues = _rknn_tensor_type__enumvalues
-try:
-    get_type_string = _libraries['FIXME_STUB'].get_type_string
-    get_type_string.restype = ctypes.POINTER(ctypes.c_ubyte)
-    get_type_string.argtypes = [rknn_tensor_type]
-except AttributeError:
+RKNPU_IOCTL_H = True # macro
+_DRM_H_ = True # macro
+DRM_NAME = "drm" # macro
+DRM_MIN_ORDER = 5 # macro
+DRM_MAX_ORDER = 22 # macro
+DRM_RAM_PERCENT = 10 # macro
+_DRM_LOCK_HELD = 0x80000000 # macro
+_DRM_LOCK_CONT = 0x40000000 # macro
+def _DRM_LOCK_IS_HELD(lock):  # macro
+   return ((lock)&0x80000000)
+def _DRM_LOCK_IS_CONT(lock):  # macro
+   return ((lock)&0x40000000)
+def _DRM_LOCKING_CONTEXT(lock):  # macro
+   return ((lock)&~(0x80000000|0x40000000))
+_DRM_VBLANK_HIGH_CRTC_SHIFT = 1 # macro
+_DRM_PRE_MODESET = 1 # macro
+_DRM_POST_MODESET = 2 # macro
+DRM_CAP_DUMB_BUFFER = 0x1 # macro
+DRM_CAP_VBLANK_HIGH_CRTC = 0x2 # macro
+DRM_CAP_DUMB_PREFERRED_DEPTH = 0x3 # macro
+DRM_CAP_DUMB_PREFER_SHADOW = 0x4 # macro
+DRM_CAP_PRIME = 0x5 # macro
+DRM_PRIME_CAP_IMPORT = 0x1 # macro
+DRM_PRIME_CAP_EXPORT = 0x2 # macro
+DRM_CAP_TIMESTAMP_MONOTONIC = 0x6 # macro
+DRM_CAP_ASYNC_PAGE_FLIP = 0x7 # macro
+DRM_CAP_CURSOR_WIDTH = 0x8 # macro
+DRM_CAP_CURSOR_HEIGHT = 0x9 # macro
+DRM_CAP_ADDFB2_MODIFIERS = 0x10 # macro
+DRM_CAP_PAGE_FLIP_TARGET = 0x11 # macro
+DRM_CAP_CRTC_IN_VBLANK_EVENT = 0x12 # macro
+DRM_CAP_SYNCOBJ = 0x13 # macro
+DRM_CLIENT_CAP_STEREO_3D = 1 # macro
+DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2 # macro
+DRM_CLIENT_CAP_ATOMIC = 3 # macro
+DRM_CLIENT_CAP_ASPECT_RATIO = 4 # macro
+DRM_CLIENT_CAP_WRITEBACK_CONNECTORS = 5 # macro
+# DRM_RDWR = O_RDWR # macro
+# DRM_CLOEXEC = O_CLOEXEC # macro
+DRM_SYNCOBJ_CREATE_SIGNALED = (1<<0) # macro
+DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE = (1<<0) # macro
+DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE = (1<<0) # macro
+DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL = (1<<0) # macro
+DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT = (1<<1) # macro
+DRM_CRTC_SEQUENCE_RELATIVE = 0x00000001 # macro
+DRM_CRTC_SEQUENCE_NEXT_ON_MISS = 0x00000002 # macro
+DRM_IOCTL_BASE = 'd' # macro
+def DRM_IO(nr):  # macro
+   return _IO('d',nr)
+def DRM_IOR(nr, type):  # macro
+   return _IOR('d',nr,type)
+def DRM_IOW(nr, type):  # macro
+   return _IOW('d',nr,type)
+def DRM_IOWR(nr, type):  # macro
+   return _IOWR('d',nr,type)
+DRM_IOCTL_SET_MASTER = DRM_IO ( 0x1e ) # macro
+DRM_IOCTL_DROP_MASTER = DRM_IO ( 0x1f ) # macro
+DRM_IOCTL_AGP_ACQUIRE = DRM_IO ( 0x30 ) # macro
+DRM_IOCTL_AGP_RELEASE = DRM_IO ( 0x31 ) # macro
+# DRM_IOCTL_WAIT_VBLANK = DRM_IOWR ( 0x3a , drm_wait_vblank ) # macro
+# DRM_IOCTL_MODE_GETRESOURCES = DRM_IOWR ( 0xA0 , struct_drm_mode_card_res ) # macro
+# DRM_IOCTL_MODE_GETCRTC = DRM_IOWR ( 0xA1 , struct_drm_mode_crtc ) # macro
+# DRM_IOCTL_MODE_SETCRTC = DRM_IOWR ( 0xA2 , struct_drm_mode_crtc ) # macro
+# DRM_IOCTL_MODE_CURSOR = DRM_IOWR ( 0xA3 , struct_drm_mode_cursor ) # macro
+# DRM_IOCTL_MODE_GETGAMMA = DRM_IOWR ( 0xA4 , struct_drm_mode_crtc_lut ) # macro
+# DRM_IOCTL_MODE_SETGAMMA = DRM_IOWR ( 0xA5 , struct_drm_mode_crtc_lut ) # macro
+# DRM_IOCTL_MODE_GETENCODER = DRM_IOWR ( 0xA6 , struct_drm_mode_get_encoder ) # macro
+# DRM_IOCTL_MODE_GETCONNECTOR = DRM_IOWR ( 0xA7 , struct_drm_mode_get_connector ) # macro
+# DRM_IOCTL_MODE_ATTACHMODE = DRM_IOWR ( 0xA8 , struct_drm_mode_mode_cmd ) # macro
+# DRM_IOCTL_MODE_DETACHMODE = DRM_IOWR ( 0xA9 , struct_drm_mode_mode_cmd ) # macro
+# DRM_IOCTL_MODE_GETPROPERTY = DRM_IOWR ( 0xAA , struct_drm_mode_get_property ) # macro
+# DRM_IOCTL_MODE_SETPROPERTY = DRM_IOWR ( 0xAB , struct_drm_mode_connector_set_property ) # macro
+# DRM_IOCTL_MODE_GETPROPBLOB = DRM_IOWR ( 0xAC , struct_drm_mode_get_blob ) # macro
+# DRM_IOCTL_MODE_GETFB = DRM_IOWR ( 0xAD , struct_drm_mode_fb_cmd ) # macro
+# DRM_IOCTL_MODE_ADDFB = DRM_IOWR ( 0xAE , struct_drm_mode_fb_cmd ) # macro
+# DRM_IOCTL_MODE_PAGE_FLIP = DRM_IOWR ( 0xB0 , struct_drm_mode_crtc_page_flip ) # macro
+# DRM_IOCTL_MODE_DIRTYFB = DRM_IOWR ( 0xB1 , struct_drm_mode_fb_dirty_cmd ) # macro
+# DRM_IOCTL_MODE_CREATE_DUMB = DRM_IOWR ( 0xB2 , struct_drm_mode_create_dumb ) # macro
+# DRM_IOCTL_MODE_MAP_DUMB = DRM_IOWR ( 0xB3 , struct_drm_mode_map_dumb ) # macro
+# DRM_IOCTL_MODE_DESTROY_DUMB = DRM_IOWR ( 0xB4 , struct_drm_mode_destroy_dumb ) # macro
+# DRM_IOCTL_MODE_GETPLANERESOURCES = DRM_IOWR ( 0xB5 , struct_drm_mode_get_plane_res ) # macro
+# DRM_IOCTL_MODE_GETPLANE = DRM_IOWR ( 0xB6 , struct_drm_mode_get_plane ) # macro
+# DRM_IOCTL_MODE_SETPLANE = DRM_IOWR ( 0xB7 , struct_drm_mode_set_plane ) # macro
+# DRM_IOCTL_MODE_ADDFB2 = DRM_IOWR ( 0xB8 , struct_drm_mode_fb_cmd2 ) # macro
+# DRM_IOCTL_MODE_OBJ_GETPROPERTIES = DRM_IOWR ( 0xB9 , struct_drm_mode_obj_get_properties ) # macro
+# DRM_IOCTL_MODE_OBJ_SETPROPERTY = DRM_IOWR ( 0xBA , struct_drm_mode_obj_set_property ) # macro
+# DRM_IOCTL_MODE_CURSOR2 = DRM_IOWR ( 0xBB , struct_drm_mode_cursor2 ) # macro
+# DRM_IOCTL_MODE_ATOMIC = DRM_IOWR ( 0xBC , struct_drm_mode_atomic ) # macro
+# DRM_IOCTL_MODE_CREATEPROPBLOB = DRM_IOWR ( 0xBD , struct_drm_mode_create_blob ) # macro
+# DRM_IOCTL_MODE_DESTROYPROPBLOB = DRM_IOWR ( 0xBE , struct_drm_mode_destroy_blob ) # macro
+# DRM_IOCTL_MODE_CREATE_LEASE = DRM_IOWR ( 0xC6 , struct_drm_mode_create_lease ) # macro
+# DRM_IOCTL_MODE_LIST_LESSEES = DRM_IOWR ( 0xC7 , struct_drm_mode_list_lessees ) # macro
+# DRM_IOCTL_MODE_GET_LEASE = DRM_IOWR ( 0xC8 , struct_drm_mode_get_lease ) # macro
+# DRM_IOCTL_MODE_REVOKE_LEASE = DRM_IOWR ( 0xC9 , struct_drm_mode_revoke_lease ) # macro
+DRM_COMMAND_BASE = 0x40 # macro
+DRM_COMMAND_END = 0xA0 # macro
+DRM_EVENT_VBLANK = 0x01 # macro
+DRM_EVENT_FLIP_COMPLETE = 0x02 # macro
+DRM_EVENT_CRTC_SEQUENCE = 0x03 # macro
+__user = True # macro
+# __packed = ((packed)) # macro
+RKNPU_OFFSET_VERSION = 0x0 # macro
+RKNPU_OFFSET_VERSION_NUM = 0x4 # macro
+RKNPU_OFFSET_PC_OP_EN = 0x8 # macro
+RKNPU_OFFSET_PC_DATA_ADDR = 0x10 # macro
+RKNPU_OFFSET_PC_DATA_AMOUNT = 0x14 # macro
+RKNPU_OFFSET_PC_TASK_CONTROL = 0x30 # macro
+RKNPU_OFFSET_PC_DMA_BASE_ADDR = 0x34 # macro
+RKNPU_OFFSET_PC_TASK_STATUS = 0x3c # macro
+RKNPU_OFFSET_INT_MASK = 0x20 # macro
+RKNPU_OFFSET_INT_CLEAR = 0x24 # macro
+RKNPU_OFFSET_INT_STATUS = 0x28 # macro
+RKNPU_OFFSET_INT_RAW_STATUS = 0x2c # macro
+RKNPU_OFFSET_CLR_ALL_RW_AMOUNT = 0x8010 # macro
+RKNPU_OFFSET_DT_WR_AMOUNT = 0x8034 # macro
+RKNPU_OFFSET_DT_RD_AMOUNT = 0x8038 # macro
+RKNPU_OFFSET_WT_RD_AMOUNT = 0x803c # macro
+RKNPU_OFFSET_ENABLE_MASK = 0xf008 # macro
+RKNPU_INT_CLEAR = 0x1ffff # macro
+RKNPU_PC_DATA_EXTRA_AMOUNT = 4 # macro
+def RKNPU_STR_HELPER(x):  # macro
+   return #x
+def RKNPU_GET_DRV_VERSION_CODE(MAJOR, MINOR, PATCHLEVEL):  # macro
+   return (MAJOR*10000+MINOR*100+PATCHLEVEL)
+def RKNPU_GET_DRV_VERSION_MAJOR(CODE):  # macro
+   return (CODE/10000)
+def RKNPU_GET_DRV_VERSION_MINOR(CODE):  # macro
+   return ((CODE%10000)/100)
+def RKNPU_GET_DRV_VERSION_PATCHLEVEL(CODE):  # macro
+   return (CODE%100)
+RKNPU_ACTION = 0x00 # macro
+RKNPU_SUBMIT = 0x01 # macro
+RKNPU_MEM_CREATE = 0x02 # macro
+RKNPU_MEM_MAP = 0x03 # macro
+RKNPU_MEM_DESTROY = 0x04 # macro
+RKNPU_MEM_SYNC = 0x05 # macro
+RKNPU_IOC_MAGIC = 'r' # macro
+def RKNPU_IOW(nr, type):  # macro
+   return _IOW('r',nr,type)
+def RKNPU_IOR(nr, type):  # macro
+   return _IOR('r',nr,type)
+def RKNPU_IOWR(nr, type):  # macro
+   return _IOWR('r',nr,type)
+drm_handle_t = ctypes.c_uint32
+drm_context_t = ctypes.c_uint32
+drm_drawable_t = ctypes.c_uint32
+drm_magic_t = ctypes.c_uint32
+class struct_drm_clip_rect(Structure):
     pass
 
-# values for enumeration '_rknn_tensor_qnt_type'
-_rknn_tensor_qnt_type__enumvalues = {
-    0: 'RKNN_TENSOR_QNT_NONE',
-    1: 'RKNN_TENSOR_QNT_DFP',
-    2: 'RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC',
-    3: 'RKNN_TENSOR_QNT_MAX',
-}
-RKNN_TENSOR_QNT_NONE = 0
-RKNN_TENSOR_QNT_DFP = 1
-RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC = 2
-RKNN_TENSOR_QNT_MAX = 3
-_rknn_tensor_qnt_type = ctypes.c_uint32 # enum
-rknn_tensor_qnt_type = _rknn_tensor_qnt_type
-rknn_tensor_qnt_type__enumvalues = _rknn_tensor_qnt_type__enumvalues
-try:
-    get_qnt_type_string = _libraries['FIXME_STUB'].get_qnt_type_string
-    get_qnt_type_string.restype = ctypes.POINTER(ctypes.c_ubyte)
-    get_qnt_type_string.argtypes = [rknn_tensor_qnt_type]
-except AttributeError:
-    pass
-
-# values for enumeration '_rknn_tensor_format'
-_rknn_tensor_format__enumvalues = {
-    0: 'RKNN_TENSOR_NCHW',
-    1: 'RKNN_TENSOR_NHWC',
-    2: 'RKNN_TENSOR_NC1HWC2',
-    3: 'RKNN_TENSOR_UNDEFINED',
-    4: 'RKNN_TENSOR_FORMAT_MAX',
-}
-RKNN_TENSOR_NCHW = 0
-RKNN_TENSOR_NHWC = 1
-RKNN_TENSOR_NC1HWC2 = 2
-RKNN_TENSOR_UNDEFINED = 3
-RKNN_TENSOR_FORMAT_MAX = 4
-_rknn_tensor_format = ctypes.c_uint32 # enum
-rknn_tensor_format = _rknn_tensor_format
-rknn_tensor_format__enumvalues = _rknn_tensor_format__enumvalues
-
-# values for enumeration '_rknn_core_mask'
-_rknn_core_mask__enumvalues = {
-    0: 'RKNN_NPU_CORE_AUTO',
-    1: 'RKNN_NPU_CORE_0',
-    2: 'RKNN_NPU_CORE_1',
-    4: 'RKNN_NPU_CORE_2',
-    3: 'RKNN_NPU_CORE_0_1',
-    7: 'RKNN_NPU_CORE_0_1_2',
-    65535: 'RKNN_NPU_CORE_ALL',
-    65536: 'RKNN_NPU_CORE_UNDEFINED',
-}
-RKNN_NPU_CORE_AUTO = 0
-RKNN_NPU_CORE_0 = 1
-RKNN_NPU_CORE_1 = 2
-RKNN_NPU_CORE_2 = 4
-RKNN_NPU_CORE_0_1 = 3
-RKNN_NPU_CORE_0_1_2 = 7
-RKNN_NPU_CORE_ALL = 65535
-RKNN_NPU_CORE_UNDEFINED = 65536
-_rknn_core_mask = ctypes.c_uint32 # enum
-rknn_core_mask = _rknn_core_mask
-rknn_core_mask__enumvalues = _rknn_core_mask__enumvalues
-try:
-    get_format_string = _libraries['FIXME_STUB'].get_format_string
-    get_format_string.restype = ctypes.POINTER(ctypes.c_ubyte)
-    get_format_string.argtypes = [rknn_tensor_format]
-except AttributeError:
-    pass
-class struct__rknn_input_output_num(Structure):
-    pass
-
-struct__rknn_input_output_num._pack_ = 1 # source:False
-struct__rknn_input_output_num._fields_ = [
-    ('n_input', ctypes.c_uint32),
-    ('n_output', ctypes.c_uint32),
+struct_drm_clip_rect._pack_ = 1 # source:False
+struct_drm_clip_rect._fields_ = [
+    ('x1', ctypes.c_uint16),
+    ('y1', ctypes.c_uint16),
+    ('x2', ctypes.c_uint16),
+    ('y2', ctypes.c_uint16),
 ]
 
-rknn_input_output_num = struct__rknn_input_output_num
-class struct__rknn_tensor_attr(Structure):
+class struct_drm_drawable_info(Structure):
     pass
 
-struct__rknn_tensor_attr._pack_ = 1 # source:False
-struct__rknn_tensor_attr._fields_ = [
-    ('index', ctypes.c_uint32),
-    ('n_dims', ctypes.c_uint32),
-    ('dims', ctypes.c_uint32 * 16),
-    ('name', ctypes.c_ubyte * 256),
-    ('n_elems', ctypes.c_uint32),
-    ('size', ctypes.c_uint32),
-    ('fmt', rknn_tensor_format),
-    ('type', rknn_tensor_type),
-    ('qnt_type', rknn_tensor_qnt_type),
-    ('fl', ctypes.c_byte),
-    ('PADDING_0', ctypes.c_ubyte * 3),
-    ('zp', ctypes.c_int32),
-    ('scale', ctypes.c_float),
-    ('w_stride', ctypes.c_uint32),
-    ('size_with_stride', ctypes.c_uint32),
-    ('pass_through', ctypes.c_ubyte),
-    ('PADDING_1', ctypes.c_ubyte * 3),
-    ('h_stride', ctypes.c_uint32),
+struct_drm_drawable_info._pack_ = 1 # source:False
+struct_drm_drawable_info._fields_ = [
+    ('num_rects', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('rects', ctypes.POINTER(struct_drm_clip_rect)),
 ]
 
-rknn_tensor_attr = struct__rknn_tensor_attr
-class struct__rknn_input_range(Structure):
+class struct_drm_tex_region(Structure):
     pass
 
-struct__rknn_input_range._pack_ = 1 # source:False
-struct__rknn_input_range._fields_ = [
-    ('index', ctypes.c_uint32),
-    ('shape_number', ctypes.c_uint32),
-    ('fmt', rknn_tensor_format),
-    ('name', ctypes.c_ubyte * 256),
-    ('dyn_range', ctypes.c_uint32 * 16 * 512),
-    ('n_dims', ctypes.c_uint32),
+struct_drm_tex_region._pack_ = 1 # source:False
+struct_drm_tex_region._fields_ = [
+    ('next', ctypes.c_ubyte),
+    ('prev', ctypes.c_ubyte),
+    ('in_use', ctypes.c_ubyte),
+    ('padding', ctypes.c_ubyte),
+    ('age', ctypes.c_uint32),
 ]
 
-rknn_input_range = struct__rknn_input_range
-class struct__rknn_perf_detail(Structure):
+class struct_drm_hw_lock(Structure):
     pass
 
-struct__rknn_perf_detail._pack_ = 1 # source:False
-struct__rknn_perf_detail._fields_ = [
-    ('perf_data', ctypes.POINTER(ctypes.c_ubyte)),
-    ('data_len', ctypes.c_uint64),
+struct_drm_hw_lock._pack_ = 1 # source:False
+struct_drm_hw_lock._fields_ = [
+    ('lock', ctypes.c_uint32),
+    ('padding', ctypes.c_ubyte * 60),
 ]
 
-rknn_perf_detail = struct__rknn_perf_detail
-class struct__rknn_perf_run(Structure):
+class struct_drm_version(Structure):
     pass
 
-struct__rknn_perf_run._pack_ = 1 # source:False
-struct__rknn_perf_run._fields_ = [
-    ('run_duration', ctypes.c_int64),
+struct_drm_version._pack_ = 1 # source:False
+struct_drm_version._fields_ = [
+    ('version_major', ctypes.c_int32),
+    ('version_minor', ctypes.c_int32),
+    ('version_patchlevel', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('name_len', ctypes.c_uint64),
+    ('name', ctypes.POINTER(ctypes.c_ubyte)),
+    ('date_len', ctypes.c_uint64),
+    ('date', ctypes.POINTER(ctypes.c_ubyte)),
+    ('desc_len', ctypes.c_uint64),
+    ('desc', ctypes.POINTER(ctypes.c_ubyte)),
 ]
 
-rknn_perf_run = struct__rknn_perf_run
-class struct__rknn_sdk_version(Structure):
+DRM_IOCTL_VERSION = DRM_IOWR ( 0x00 , struct_drm_version ) # macro (from list)
+class struct_drm_unique(Structure):
     pass
 
-struct__rknn_sdk_version._pack_ = 1 # source:False
-struct__rknn_sdk_version._fields_ = [
-    ('api_version', ctypes.c_ubyte * 256),
-    ('drv_version', ctypes.c_ubyte * 256),
+struct_drm_unique._pack_ = 1 # source:False
+struct_drm_unique._fields_ = [
+    ('unique_len', ctypes.c_uint64),
+    ('unique', ctypes.POINTER(ctypes.c_ubyte)),
 ]
 
-rknn_sdk_version = struct__rknn_sdk_version
-class struct__rknn_mem_size(Structure):
+DRM_IOCTL_GET_UNIQUE = DRM_IOWR ( 0x01 , struct_drm_unique ) # macro (from list)
+DRM_IOCTL_SET_UNIQUE = DRM_IOW ( 0x10 , struct_drm_unique ) # macro (from list)
+class struct_drm_list(Structure):
     pass
 
-struct__rknn_mem_size._pack_ = 1 # source:False
-struct__rknn_mem_size._fields_ = [
-    ('total_weight_size', ctypes.c_uint32),
-    ('total_internal_size', ctypes.c_uint32),
-    ('total_dma_allocated_size', ctypes.c_uint64),
-    ('total_sram_size', ctypes.c_uint32),
-    ('free_sram_size', ctypes.c_uint32),
-    ('reserved', ctypes.c_uint32 * 10),
+struct_drm_list._pack_ = 1 # source:False
+struct_drm_list._fields_ = [
+    ('count', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('version', ctypes.POINTER(struct_drm_version)),
 ]
 
-rknn_mem_size = struct__rknn_mem_size
-class struct__rknn_custom_string(Structure):
+class struct_drm_block(Structure):
     pass
 
-struct__rknn_custom_string._pack_ = 1 # source:False
-struct__rknn_custom_string._fields_ = [
-    ('string', ctypes.c_ubyte * 1024),
+struct_drm_block._pack_ = 1 # source:False
+struct_drm_block._fields_ = [
+    ('unused', ctypes.c_int32),
 ]
 
-rknn_custom_string = struct__rknn_custom_string
+DRM_IOCTL_BLOCK = DRM_IOWR ( 0x12 , struct_drm_block ) # macro (from list)
+DRM_IOCTL_UNBLOCK = DRM_IOWR ( 0x13 , struct_drm_block ) # macro (from list)
 
-# values for enumeration '_rknn_tensor_mem_flags'
-_rknn_tensor_mem_flags__enumvalues = {
-    1: 'RKNN_TENSOR_MEMORY_FLAGS_ALLOC_INSIDE',
-    2: 'RKNN_TENSOR_MEMORY_FLAGS_FROM_FD',
-    3: 'RKNN_TENSOR_MEMORY_FLAGS_FROM_PHYS',
-    4: 'RKNN_TENSOR_MEMORY_FLAGS_UNKNOWN',
+# values for enumeration 'drm_control_func'
+drm_control_func__enumvalues = {
+    0: '_DRM_ADD_COMMAND',
+    1: '_DRM_RM_COMMAND',
+    2: '_DRM_INST_HANDLER',
+    3: '_DRM_UNINST_HANDLER',
 }
-RKNN_TENSOR_MEMORY_FLAGS_ALLOC_INSIDE = 1
-RKNN_TENSOR_MEMORY_FLAGS_FROM_FD = 2
-RKNN_TENSOR_MEMORY_FLAGS_FROM_PHYS = 3
-RKNN_TENSOR_MEMORY_FLAGS_UNKNOWN = 4
-_rknn_tensor_mem_flags = ctypes.c_uint32 # enum
-rknn_tensor_mem_flags = _rknn_tensor_mem_flags
-rknn_tensor_mem_flags__enumvalues = _rknn_tensor_mem_flags__enumvalues
-
-# values for enumeration '_rknn_mem_alloc_flags'
-_rknn_mem_alloc_flags__enumvalues = {
-    0: 'RKNN_FLAG_MEMORY_FLAGS_DEFAULT',
-    1: 'RKNN_FLAG_MEMORY_CACHEABLE',
-    2: 'RKNN_FLAG_MEMORY_NON_CACHEABLE',
-}
-RKNN_FLAG_MEMORY_FLAGS_DEFAULT = 0
-RKNN_FLAG_MEMORY_CACHEABLE = 1
-RKNN_FLAG_MEMORY_NON_CACHEABLE = 2
-_rknn_mem_alloc_flags = ctypes.c_uint32 # enum
-rknn_mem_alloc_flags = _rknn_mem_alloc_flags
-rknn_mem_alloc_flags__enumvalues = _rknn_mem_alloc_flags__enumvalues
-
-# values for enumeration '_rknn_mem_sync_mode'
-_rknn_mem_sync_mode__enumvalues = {
-    1: 'RKNN_MEMORY_SYNC_TO_DEVICE',
-    2: 'RKNN_MEMORY_SYNC_FROM_DEVICE',
-    3: 'RKNN_MEMORY_SYNC_BIDIRECTIONAL',
-}
-RKNN_MEMORY_SYNC_TO_DEVICE = 1
-RKNN_MEMORY_SYNC_FROM_DEVICE = 2
-RKNN_MEMORY_SYNC_BIDIRECTIONAL = 3
-_rknn_mem_sync_mode = ctypes.c_uint32 # enum
-rknn_mem_sync_mode = _rknn_mem_sync_mode
-rknn_mem_sync_mode__enumvalues = _rknn_mem_sync_mode__enumvalues
-class struct__rknn_tensor_memory(Structure):
+_DRM_ADD_COMMAND = 0
+_DRM_RM_COMMAND = 1
+_DRM_INST_HANDLER = 2
+_DRM_UNINST_HANDLER = 3
+drm_control_func = ctypes.c_uint32 # enum
+class struct_drm_control(Structure):
     pass
 
-struct__rknn_tensor_memory._pack_ = 1 # source:False
-struct__rknn_tensor_memory._fields_ = [
-    ('virt_addr', ctypes.POINTER(None)),
-    ('phys_addr', ctypes.c_uint64),
-    ('fd', ctypes.c_int32),
-    ('offset', ctypes.c_int32),
-    ('size', ctypes.c_uint32),
+struct_drm_control._pack_ = 1 # source:False
+struct_drm_control._fields_ = [
+    ('func', drm_control_func),
+    ('irq', ctypes.c_int32),
+]
+
+DRM_IOCTL_CONTROL = DRM_IOW ( 0x14 , struct_drm_control ) # macro (from list)
+
+# values for enumeration 'drm_map_type'
+drm_map_type__enumvalues = {
+    0: '_DRM_FRAME_BUFFER',
+    1: '_DRM_REGISTERS',
+    2: '_DRM_SHM',
+    3: '_DRM_AGP',
+    4: '_DRM_SCATTER_GATHER',
+    5: '_DRM_CONSISTENT',
+}
+_DRM_FRAME_BUFFER = 0
+_DRM_REGISTERS = 1
+_DRM_SHM = 2
+_DRM_AGP = 3
+_DRM_SCATTER_GATHER = 4
+_DRM_CONSISTENT = 5
+drm_map_type = ctypes.c_uint32 # enum
+
+# values for enumeration 'drm_map_flags'
+drm_map_flags__enumvalues = {
+    1: '_DRM_RESTRICTED',
+    2: '_DRM_READ_ONLY',
+    4: '_DRM_LOCKED',
+    8: '_DRM_KERNEL',
+    16: '_DRM_WRITE_COMBINING',
+    32: '_DRM_CONTAINS_LOCK',
+    64: '_DRM_REMOVABLE',
+    128: '_DRM_DRIVER',
+}
+_DRM_RESTRICTED = 1
+_DRM_READ_ONLY = 2
+_DRM_LOCKED = 4
+_DRM_KERNEL = 8
+_DRM_WRITE_COMBINING = 16
+_DRM_CONTAINS_LOCK = 32
+_DRM_REMOVABLE = 64
+_DRM_DRIVER = 128
+drm_map_flags = ctypes.c_uint32 # enum
+class struct_drm_ctx_priv_map(Structure):
+    pass
+
+struct_drm_ctx_priv_map._pack_ = 1 # source:False
+struct_drm_ctx_priv_map._fields_ = [
+    ('ctx_id', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('handle', ctypes.POINTER(None)),
+]
+
+DRM_IOCTL_SET_SAREA_CTX = DRM_IOW ( 0x1c , struct_drm_ctx_priv_map ) # macro (from list)
+DRM_IOCTL_GET_SAREA_CTX = DRM_IOWR ( 0x1d , struct_drm_ctx_priv_map ) # macro (from list)
+class struct_drm_map(Structure):
+    pass
+
+struct_drm_map._pack_ = 1 # source:False
+struct_drm_map._fields_ = [
+    ('offset', ctypes.c_uint64),
+    ('size', ctypes.c_uint64),
+    ('type', drm_map_type),
+    ('flags', drm_map_flags),
+    ('handle', ctypes.POINTER(None)),
+    ('mtrr', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+DRM_IOCTL_GET_MAP = DRM_IOWR ( 0x04 , struct_drm_map ) # macro (from list)
+DRM_IOCTL_ADD_MAP = DRM_IOWR ( 0x15 , struct_drm_map ) # macro (from list)
+DRM_IOCTL_RM_MAP = DRM_IOW ( 0x1b , struct_drm_map ) # macro (from list)
+class struct_drm_client(Structure):
+    pass
+
+struct_drm_client._pack_ = 1 # source:False
+struct_drm_client._fields_ = [
+    ('idx', ctypes.c_int32),
+    ('auth', ctypes.c_int32),
+    ('pid', ctypes.c_uint64),
+    ('uid', ctypes.c_uint64),
+    ('magic', ctypes.c_uint64),
+    ('iocs', ctypes.c_uint64),
+]
+
+DRM_IOCTL_GET_CLIENT = DRM_IOWR ( 0x05 , struct_drm_client ) # macro (from list)
+
+# values for enumeration 'drm_stat_type'
+drm_stat_type__enumvalues = {
+    0: '_DRM_STAT_LOCK',
+    1: '_DRM_STAT_OPENS',
+    2: '_DRM_STAT_CLOSES',
+    3: '_DRM_STAT_IOCTLS',
+    4: '_DRM_STAT_LOCKS',
+    5: '_DRM_STAT_UNLOCKS',
+    6: '_DRM_STAT_VALUE',
+    7: '_DRM_STAT_BYTE',
+    8: '_DRM_STAT_COUNT',
+    9: '_DRM_STAT_IRQ',
+    10: '_DRM_STAT_PRIMARY',
+    11: '_DRM_STAT_SECONDARY',
+    12: '_DRM_STAT_DMA',
+    13: '_DRM_STAT_SPECIAL',
+    14: '_DRM_STAT_MISSED',
+}
+_DRM_STAT_LOCK = 0
+_DRM_STAT_OPENS = 1
+_DRM_STAT_CLOSES = 2
+_DRM_STAT_IOCTLS = 3
+_DRM_STAT_LOCKS = 4
+_DRM_STAT_UNLOCKS = 5
+_DRM_STAT_VALUE = 6
+_DRM_STAT_BYTE = 7
+_DRM_STAT_COUNT = 8
+_DRM_STAT_IRQ = 9
+_DRM_STAT_PRIMARY = 10
+_DRM_STAT_SECONDARY = 11
+_DRM_STAT_DMA = 12
+_DRM_STAT_SPECIAL = 13
+_DRM_STAT_MISSED = 14
+drm_stat_type = ctypes.c_uint32 # enum
+class struct_drm_stats(Structure):
+    pass
+
+class struct_drm_stats_0(Structure):
+    pass
+
+struct_drm_stats_0._pack_ = 1 # source:False
+struct_drm_stats_0._fields_ = [
+    ('value', ctypes.c_uint64),
+    ('type', drm_stat_type),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+struct_drm_stats._pack_ = 1 # source:False
+struct_drm_stats._fields_ = [
+    ('count', ctypes.c_uint64),
+    ('data', struct_drm_stats_0 * 15),
+]
+
+DRM_IOCTL_GET_STATS = DRM_IOR ( 0x06 , struct_drm_stats ) # macro (from list)
+
+# values for enumeration 'drm_lock_flags'
+drm_lock_flags__enumvalues = {
+    1: '_DRM_LOCK_READY',
+    2: '_DRM_LOCK_QUIESCENT',
+    4: '_DRM_LOCK_FLUSH',
+    8: '_DRM_LOCK_FLUSH_ALL',
+    16: '_DRM_HALT_ALL_QUEUES',
+    32: '_DRM_HALT_CUR_QUEUES',
+}
+_DRM_LOCK_READY = 1
+_DRM_LOCK_QUIESCENT = 2
+_DRM_LOCK_FLUSH = 4
+_DRM_LOCK_FLUSH_ALL = 8
+_DRM_HALT_ALL_QUEUES = 16
+_DRM_HALT_CUR_QUEUES = 32
+drm_lock_flags = ctypes.c_uint32 # enum
+class struct_drm_lock(Structure):
+    pass
+
+struct_drm_lock._pack_ = 1 # source:False
+struct_drm_lock._fields_ = [
+    ('context', ctypes.c_int32),
+    ('flags', drm_lock_flags),
+]
+
+DRM_IOCTL_LOCK = DRM_IOW ( 0x2a , struct_drm_lock ) # macro (from list)
+DRM_IOCTL_UNLOCK = DRM_IOW ( 0x2b , struct_drm_lock ) # macro (from list)
+DRM_IOCTL_FINISH = DRM_IOW ( 0x2c , struct_drm_lock ) # macro (from list)
+
+# values for enumeration 'drm_dma_flags'
+drm_dma_flags__enumvalues = {
+    1: '_DRM_DMA_BLOCK',
+    2: '_DRM_DMA_WHILE_LOCKED',
+    4: '_DRM_DMA_PRIORITY',
+    16: '_DRM_DMA_WAIT',
+    32: '_DRM_DMA_SMALLER_OK',
+    64: '_DRM_DMA_LARGER_OK',
+}
+_DRM_DMA_BLOCK = 1
+_DRM_DMA_WHILE_LOCKED = 2
+_DRM_DMA_PRIORITY = 4
+_DRM_DMA_WAIT = 16
+_DRM_DMA_SMALLER_OK = 32
+_DRM_DMA_LARGER_OK = 64
+drm_dma_flags = ctypes.c_uint32 # enum
+
+# values for enumeration 'drm_buf_desc_flags'
+drm_buf_desc_flags__enumvalues = {
+    1: '_DRM_PAGE_ALIGN',
+    2: '_DRM_AGP_BUFFER',
+    4: '_DRM_SG_BUFFER',
+    8: '_DRM_FB_BUFFER',
+    16: '_DRM_PCI_BUFFER_RO',
+}
+_DRM_PAGE_ALIGN = 1
+_DRM_AGP_BUFFER = 2
+_DRM_SG_BUFFER = 4
+_DRM_FB_BUFFER = 8
+_DRM_PCI_BUFFER_RO = 16
+drm_buf_desc_flags = ctypes.c_uint32 # enum
+class struct_drm_buf_desc(Structure):
+    pass
+
+struct_drm_buf_desc._pack_ = 1 # source:False
+struct_drm_buf_desc._fields_ = [
+    ('count', ctypes.c_int32),
+    ('size', ctypes.c_int32),
+    ('low_mark', ctypes.c_int32),
+    ('high_mark', ctypes.c_int32),
+    ('flags', drm_buf_desc_flags),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('agp_start', ctypes.c_uint64),
+]
+
+DRM_IOCTL_ADD_BUFS = DRM_IOWR ( 0x16 , struct_drm_buf_desc ) # macro (from list)
+DRM_IOCTL_MARK_BUFS = DRM_IOW ( 0x17 , struct_drm_buf_desc ) # macro (from list)
+class struct_drm_buf_info(Structure):
+    pass
+
+struct_drm_buf_info._pack_ = 1 # source:False
+struct_drm_buf_info._fields_ = [
+    ('count', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('list', ctypes.POINTER(struct_drm_buf_desc)),
+]
+
+DRM_IOCTL_INFO_BUFS = DRM_IOWR ( 0x18 , struct_drm_buf_info ) # macro (from list)
+class struct_drm_buf_free(Structure):
+    pass
+
+struct_drm_buf_free._pack_ = 1 # source:False
+struct_drm_buf_free._fields_ = [
+    ('count', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('list', ctypes.POINTER(ctypes.c_int32)),
+]
+
+DRM_IOCTL_FREE_BUFS = DRM_IOW ( 0x1a , struct_drm_buf_free ) # macro (from list)
+class struct_drm_buf_pub(Structure):
+    pass
+
+struct_drm_buf_pub._pack_ = 1 # source:False
+struct_drm_buf_pub._fields_ = [
+    ('idx', ctypes.c_int32),
+    ('total', ctypes.c_int32),
+    ('used', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('address', ctypes.POINTER(None)),
+]
+
+class struct_drm_buf_map(Structure):
+    pass
+
+struct_drm_buf_map._pack_ = 1 # source:False
+struct_drm_buf_map._fields_ = [
+    ('count', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('virtual', ctypes.POINTER(None)),
+    ('list', ctypes.POINTER(struct_drm_buf_pub)),
+]
+
+DRM_IOCTL_MAP_BUFS = DRM_IOWR ( 0x19 , struct_drm_buf_map ) # macro (from list)
+class struct_drm_dma(Structure):
+    pass
+
+struct_drm_dma._pack_ = 1 # source:False
+struct_drm_dma._fields_ = [
+    ('context', ctypes.c_int32),
+    ('send_count', ctypes.c_int32),
+    ('send_indices', ctypes.POINTER(ctypes.c_int32)),
+    ('send_sizes', ctypes.POINTER(ctypes.c_int32)),
+    ('flags', drm_dma_flags),
+    ('request_count', ctypes.c_int32),
+    ('request_size', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('request_indices', ctypes.POINTER(ctypes.c_int32)),
+    ('request_sizes', ctypes.POINTER(ctypes.c_int32)),
+    ('granted_count', ctypes.c_int32),
+    ('PADDING_1', ctypes.c_ubyte * 4),
+]
+
+DRM_IOCTL_DMA = DRM_IOWR ( 0x29 , struct_drm_dma ) # macro (from list)
+
+# values for enumeration 'drm_ctx_flags'
+drm_ctx_flags__enumvalues = {
+    1: '_DRM_CONTEXT_PRESERVED',
+    2: '_DRM_CONTEXT_2DONLY',
+}
+_DRM_CONTEXT_PRESERVED = 1
+_DRM_CONTEXT_2DONLY = 2
+drm_ctx_flags = ctypes.c_uint32 # enum
+class struct_drm_ctx(Structure):
+    pass
+
+struct_drm_ctx._pack_ = 1 # source:False
+struct_drm_ctx._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('flags', drm_ctx_flags),
+]
+
+DRM_IOCTL_ADD_CTX = DRM_IOWR ( 0x20 , struct_drm_ctx ) # macro (from list)
+DRM_IOCTL_RM_CTX = DRM_IOWR ( 0x21 , struct_drm_ctx ) # macro (from list)
+DRM_IOCTL_MOD_CTX = DRM_IOW ( 0x22 , struct_drm_ctx ) # macro (from list)
+DRM_IOCTL_GET_CTX = DRM_IOWR ( 0x23 , struct_drm_ctx ) # macro (from list)
+DRM_IOCTL_SWITCH_CTX = DRM_IOW ( 0x24 , struct_drm_ctx ) # macro (from list)
+DRM_IOCTL_NEW_CTX = DRM_IOW ( 0x25 , struct_drm_ctx ) # macro (from list)
+class struct_drm_ctx_res(Structure):
+    pass
+
+struct_drm_ctx_res._pack_ = 1 # source:False
+struct_drm_ctx_res._fields_ = [
+    ('count', ctypes.c_int32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('contexts', ctypes.POINTER(struct_drm_ctx)),
+]
+
+DRM_IOCTL_RES_CTX = DRM_IOWR ( 0x26 , struct_drm_ctx_res ) # macro (from list)
+class struct_drm_draw(Structure):
+    pass
+
+struct_drm_draw._pack_ = 1 # source:False
+struct_drm_draw._fields_ = [
+    ('handle', ctypes.c_uint32),
+]
+
+DRM_IOCTL_ADD_DRAW = DRM_IOWR ( 0x27 , struct_drm_draw ) # macro (from list)
+DRM_IOCTL_RM_DRAW = DRM_IOWR ( 0x28 , struct_drm_draw ) # macro (from list)
+
+# values for enumeration 'c__EA_drm_drawable_info_type_t'
+c__EA_drm_drawable_info_type_t__enumvalues = {
+    0: 'DRM_DRAWABLE_CLIPRECTS',
+}
+DRM_DRAWABLE_CLIPRECTS = 0
+c__EA_drm_drawable_info_type_t = ctypes.c_uint32 # enum
+drm_drawable_info_type_t = c__EA_drm_drawable_info_type_t
+drm_drawable_info_type_t__enumvalues = c__EA_drm_drawable_info_type_t__enumvalues
+class struct_drm_update_draw(Structure):
+    pass
+
+struct_drm_update_draw._pack_ = 1 # source:False
+struct_drm_update_draw._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('type', ctypes.c_uint32),
+    ('num', ctypes.c_uint32),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('data', ctypes.c_uint64),
+]
+
+DRM_IOCTL_UPDATE_DRAW = DRM_IOW ( 0x3f , struct_drm_update_draw ) # macro (from list)
+class struct_drm_auth(Structure):
+    pass
+
+struct_drm_auth._pack_ = 1 # source:False
+struct_drm_auth._fields_ = [
+    ('magic', ctypes.c_uint32),
+]
+
+DRM_IOCTL_GET_MAGIC = DRM_IOR ( 0x02 , struct_drm_auth ) # macro (from list)
+DRM_IOCTL_AUTH_MAGIC = DRM_IOW ( 0x11 , struct_drm_auth ) # macro (from list)
+class struct_drm_irq_busid(Structure):
+    pass
+
+struct_drm_irq_busid._pack_ = 1 # source:False
+struct_drm_irq_busid._fields_ = [
+    ('irq', ctypes.c_int32),
+    ('busnum', ctypes.c_int32),
+    ('devnum', ctypes.c_int32),
+    ('funcnum', ctypes.c_int32),
+]
+
+DRM_IOCTL_IRQ_BUSID = DRM_IOWR ( 0x03 , struct_drm_irq_busid ) # macro (from list)
+
+# values for enumeration 'drm_vblank_seq_type'
+drm_vblank_seq_type__enumvalues = {
+    0: '_DRM_VBLANK_ABSOLUTE',
+    1: '_DRM_VBLANK_RELATIVE',
+    62: '_DRM_VBLANK_HIGH_CRTC_MASK',
+    67108864: '_DRM_VBLANK_EVENT',
+    134217728: '_DRM_VBLANK_FLIP',
+    268435456: '_DRM_VBLANK_NEXTONMISS',
+    536870912: '_DRM_VBLANK_SECONDARY',
+    1073741824: '_DRM_VBLANK_SIGNAL',
+}
+_DRM_VBLANK_ABSOLUTE = 0
+_DRM_VBLANK_RELATIVE = 1
+_DRM_VBLANK_HIGH_CRTC_MASK = 62
+_DRM_VBLANK_EVENT = 67108864
+_DRM_VBLANK_FLIP = 134217728
+_DRM_VBLANK_NEXTONMISS = 268435456
+_DRM_VBLANK_SECONDARY = 536870912
+_DRM_VBLANK_SIGNAL = 1073741824
+drm_vblank_seq_type = ctypes.c_uint32 # enum
+_DRM_VBLANK_TYPES_MASK = (_DRM_VBLANK_ABSOLUTE|_DRM_VBLANK_RELATIVE) # macro
+_DRM_VBLANK_FLAGS_MASK = (_DRM_VBLANK_EVENT|_DRM_VBLANK_SIGNAL|_DRM_VBLANK_SECONDARY|_DRM_VBLANK_NEXTONMISS) # macro
+class struct_drm_wait_vblank_request(Structure):
+    pass
+
+struct_drm_wait_vblank_request._pack_ = 1 # source:False
+struct_drm_wait_vblank_request._fields_ = [
+    ('type', drm_vblank_seq_type),
+    ('sequence', ctypes.c_uint32),
+    ('signal', ctypes.c_uint64),
+]
+
+class struct_drm_wait_vblank_reply(Structure):
+    pass
+
+struct_drm_wait_vblank_reply._pack_ = 1 # source:False
+struct_drm_wait_vblank_reply._fields_ = [
+    ('type', drm_vblank_seq_type),
+    ('sequence', ctypes.c_uint32),
+    ('tval_sec', ctypes.c_int64),
+    ('tval_usec', ctypes.c_int64),
+]
+
+class union_drm_wait_vblank(Union):
+    _pack_ = 1 # source:False
+    _fields_ = [
+    ('request', struct_drm_wait_vblank_request),
+    ('reply', struct_drm_wait_vblank_reply),
+     ]
+
+class struct_drm_modeset_ctl(Structure):
+    pass
+
+struct_drm_modeset_ctl._pack_ = 1 # source:False
+struct_drm_modeset_ctl._fields_ = [
+    ('crtc', ctypes.c_uint32),
+    ('cmd', ctypes.c_uint32),
+]
+
+DRM_IOCTL_MODESET_CTL = DRM_IOW ( 0x08 , struct_drm_modeset_ctl ) # macro (from list)
+class struct_drm_agp_mode(Structure):
+    pass
+
+struct_drm_agp_mode._pack_ = 1 # source:False
+struct_drm_agp_mode._fields_ = [
+    ('mode', ctypes.c_uint64),
+]
+
+DRM_IOCTL_AGP_ENABLE = DRM_IOW ( 0x32 , struct_drm_agp_mode ) # macro (from list)
+class struct_drm_agp_buffer(Structure):
+    pass
+
+struct_drm_agp_buffer._pack_ = 1 # source:False
+struct_drm_agp_buffer._fields_ = [
+    ('size', ctypes.c_uint64),
+    ('handle', ctypes.c_uint64),
+    ('type', ctypes.c_uint64),
+    ('physical', ctypes.c_uint64),
+]
+
+DRM_IOCTL_AGP_ALLOC = DRM_IOWR ( 0x34 , struct_drm_agp_buffer ) # macro (from list)
+DRM_IOCTL_AGP_FREE = DRM_IOW ( 0x35 , struct_drm_agp_buffer ) # macro (from list)
+class struct_drm_agp_binding(Structure):
+    pass
+
+struct_drm_agp_binding._pack_ = 1 # source:False
+struct_drm_agp_binding._fields_ = [
+    ('handle', ctypes.c_uint64),
+    ('offset', ctypes.c_uint64),
+]
+
+DRM_IOCTL_AGP_BIND = DRM_IOW ( 0x36 , struct_drm_agp_binding ) # macro (from list)
+DRM_IOCTL_AGP_UNBIND = DRM_IOW ( 0x37 , struct_drm_agp_binding ) # macro (from list)
+class struct_drm_agp_info(Structure):
+    pass
+
+struct_drm_agp_info._pack_ = 1 # source:False
+struct_drm_agp_info._fields_ = [
+    ('agp_version_major', ctypes.c_int32),
+    ('agp_version_minor', ctypes.c_int32),
+    ('mode', ctypes.c_uint64),
+    ('aperture_base', ctypes.c_uint64),
+    ('aperture_size', ctypes.c_uint64),
+    ('memory_allowed', ctypes.c_uint64),
+    ('memory_used', ctypes.c_uint64),
+    ('id_vendor', ctypes.c_uint16),
+    ('id_device', ctypes.c_uint16),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+]
+
+DRM_IOCTL_AGP_INFO = DRM_IOR ( 0x33 , struct_drm_agp_info ) # macro (from list)
+class struct_drm_scatter_gather(Structure):
+    pass
+
+struct_drm_scatter_gather._pack_ = 1 # source:False
+struct_drm_scatter_gather._fields_ = [
+    ('size', ctypes.c_uint64),
+    ('handle', ctypes.c_uint64),
+]
+
+DRM_IOCTL_SG_ALLOC = DRM_IOWR ( 0x38 , struct_drm_scatter_gather ) # macro (from list)
+DRM_IOCTL_SG_FREE = DRM_IOW ( 0x39 , struct_drm_scatter_gather ) # macro (from list)
+class struct_drm_set_version(Structure):
+    pass
+
+struct_drm_set_version._pack_ = 1 # source:False
+struct_drm_set_version._fields_ = [
+    ('drm_di_major', ctypes.c_int32),
+    ('drm_di_minor', ctypes.c_int32),
+    ('drm_dd_major', ctypes.c_int32),
+    ('drm_dd_minor', ctypes.c_int32),
+]
+
+DRM_IOCTL_SET_VERSION = DRM_IOWR ( 0x07 , struct_drm_set_version ) # macro (from list)
+class struct_drm_gem_close(Structure):
+    pass
+
+struct_drm_gem_close._pack_ = 1 # source:False
+struct_drm_gem_close._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('pad', ctypes.c_uint32),
+]
+
+DRM_IOCTL_GEM_CLOSE = DRM_IOW ( 0x09 , struct_drm_gem_close ) # macro (from list)
+class struct_drm_gem_flink(Structure):
+    pass
+
+struct_drm_gem_flink._pack_ = 1 # source:False
+struct_drm_gem_flink._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('name', ctypes.c_uint32),
+]
+
+DRM_IOCTL_GEM_FLINK = DRM_IOWR ( 0x0a , struct_drm_gem_flink ) # macro (from list)
+class struct_drm_gem_open(Structure):
+    pass
+
+struct_drm_gem_open._pack_ = 1 # source:False
+struct_drm_gem_open._fields_ = [
+    ('name', ctypes.c_uint32),
+    ('handle', ctypes.c_uint32),
+    ('size', ctypes.c_uint64),
+]
+
+DRM_IOCTL_GEM_OPEN = DRM_IOWR ( 0x0b , struct_drm_gem_open ) # macro (from list)
+class struct_drm_get_cap(Structure):
+    pass
+
+struct_drm_get_cap._pack_ = 1 # source:False
+struct_drm_get_cap._fields_ = [
+    ('capability', ctypes.c_uint64),
+    ('value', ctypes.c_uint64),
+]
+
+DRM_IOCTL_GET_CAP = DRM_IOWR ( 0x0c , struct_drm_get_cap ) # macro (from list)
+class struct_drm_set_client_cap(Structure):
+    pass
+
+struct_drm_set_client_cap._pack_ = 1 # source:False
+struct_drm_set_client_cap._fields_ = [
+    ('capability', ctypes.c_uint64),
+    ('value', ctypes.c_uint64),
+]
+
+DRM_IOCTL_SET_CLIENT_CAP = DRM_IOW ( 0x0d , struct_drm_set_client_cap ) # macro (from list)
+class struct_drm_prime_handle(Structure):
+    pass
+
+struct_drm_prime_handle._pack_ = 1 # source:False
+struct_drm_prime_handle._fields_ = [
+    ('handle', ctypes.c_uint32),
     ('flags', ctypes.c_uint32),
-    ('priv_data', ctypes.POINTER(None)),
+    ('fd', ctypes.c_int32),
 ]
 
-rknn_tensor_mem = struct__rknn_tensor_memory
-class struct__rknn_input(Structure):
+DRM_IOCTL_PRIME_HANDLE_TO_FD = DRM_IOWR ( 0x2d , struct_drm_prime_handle ) # macro (from list)
+DRM_IOCTL_PRIME_FD_TO_HANDLE = DRM_IOWR ( 0x2e , struct_drm_prime_handle ) # macro (from list)
+class struct_drm_syncobj_create(Structure):
     pass
 
-struct__rknn_input._pack_ = 1 # source:False
-struct__rknn_input._fields_ = [
-    ('index', ctypes.c_uint32),
-    ('PADDING_0', ctypes.c_ubyte * 4),
-    ('buf', ctypes.POINTER(None)),
-    ('size', ctypes.c_uint32),
-    ('pass_through', ctypes.c_ubyte),
-    ('PADDING_1', ctypes.c_ubyte * 3),
-    ('type', rknn_tensor_type),
-    ('fmt', rknn_tensor_format),
+struct_drm_syncobj_create._pack_ = 1 # source:False
+struct_drm_syncobj_create._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
 ]
 
-rknn_input = struct__rknn_input
-class struct__rknn_output(Structure):
+DRM_IOCTL_SYNCOBJ_CREATE = DRM_IOWR ( 0xBF , struct_drm_syncobj_create ) # macro (from list)
+class struct_drm_syncobj_destroy(Structure):
     pass
 
-struct__rknn_output._pack_ = 1 # source:False
-struct__rknn_output._fields_ = [
-    ('want_float', ctypes.c_ubyte),
-    ('is_prealloc', ctypes.c_ubyte),
-    ('PADDING_0', ctypes.c_ubyte * 2),
-    ('index', ctypes.c_uint32),
-    ('buf', ctypes.POINTER(None)),
-    ('size', ctypes.c_uint32),
-    ('PADDING_1', ctypes.c_ubyte * 4),
+struct_drm_syncobj_destroy._pack_ = 1 # source:False
+struct_drm_syncobj_destroy._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('pad', ctypes.c_uint32),
 ]
 
-rknn_output = struct__rknn_output
-class struct__rknn_init_extend(Structure):
+DRM_IOCTL_SYNCOBJ_DESTROY = DRM_IOWR ( 0xC0 , struct_drm_syncobj_destroy ) # macro (from list)
+class struct_drm_syncobj_handle(Structure):
     pass
 
-struct__rknn_init_extend._pack_ = 1 # source:False
-struct__rknn_init_extend._fields_ = [
-    ('ctx', ctypes.c_uint64),
-    ('real_model_offset', ctypes.c_int32),
-    ('real_model_size', ctypes.c_uint32),
-    ('model_buffer_fd', ctypes.c_int32),
-    ('model_buffer_flags', ctypes.c_uint32),
-    ('reserved', ctypes.c_ubyte * 112),
+struct_drm_syncobj_handle._pack_ = 1 # source:False
+struct_drm_syncobj_handle._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
+    ('fd', ctypes.c_int32),
+    ('pad', ctypes.c_uint32),
 ]
 
-rknn_init_extend = struct__rknn_init_extend
-class struct__rknn_run_extend(Structure):
+DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD = DRM_IOWR ( 0xC1 , struct_drm_syncobj_handle ) # macro (from list)
+DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE = DRM_IOWR ( 0xC2 , struct_drm_syncobj_handle ) # macro (from list)
+class struct_drm_syncobj_wait(Structure):
     pass
 
-struct__rknn_run_extend._pack_ = 1 # source:False
-struct__rknn_run_extend._fields_ = [
-    ('frame_id', ctypes.c_uint64),
-    ('non_block', ctypes.c_int32),
-    ('timeout_ms', ctypes.c_int32),
+struct_drm_syncobj_wait._pack_ = 1 # source:False
+struct_drm_syncobj_wait._fields_ = [
+    ('handles', ctypes.c_uint64),
+    ('timeout_nsec', ctypes.c_int64),
+    ('count_handles', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
+    ('first_signaled', ctypes.c_uint32),
+    ('pad', ctypes.c_uint32),
+]
+
+DRM_IOCTL_SYNCOBJ_WAIT = DRM_IOWR ( 0xC3 , struct_drm_syncobj_wait ) # macro (from list)
+class struct_drm_syncobj_array(Structure):
+    pass
+
+struct_drm_syncobj_array._pack_ = 1 # source:False
+struct_drm_syncobj_array._fields_ = [
+    ('handles', ctypes.c_uint64),
+    ('count_handles', ctypes.c_uint32),
+    ('pad', ctypes.c_uint32),
+]
+
+DRM_IOCTL_SYNCOBJ_RESET = DRM_IOWR ( 0xC4 , struct_drm_syncobj_array ) # macro (from list)
+DRM_IOCTL_SYNCOBJ_SIGNAL = DRM_IOWR ( 0xC5 , struct_drm_syncobj_array ) # macro (from list)
+class struct_drm_crtc_get_sequence(Structure):
+    pass
+
+struct_drm_crtc_get_sequence._pack_ = 1 # source:False
+struct_drm_crtc_get_sequence._fields_ = [
+    ('crtc_id', ctypes.c_uint32),
+    ('active', ctypes.c_uint32),
+    ('sequence', ctypes.c_uint64),
+    ('sequence_ns', ctypes.c_int64),
+]
+
+DRM_IOCTL_CRTC_GET_SEQUENCE = DRM_IOWR ( 0x3b , struct_drm_crtc_get_sequence ) # macro (from list)
+class struct_drm_crtc_queue_sequence(Structure):
+    pass
+
+struct_drm_crtc_queue_sequence._pack_ = 1 # source:False
+struct_drm_crtc_queue_sequence._fields_ = [
+    ('crtc_id', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
+    ('sequence', ctypes.c_uint64),
+    ('user_data', ctypes.c_uint64),
+]
+
+DRM_IOCTL_CRTC_QUEUE_SEQUENCE = DRM_IOWR ( 0x3c , struct_drm_crtc_queue_sequence ) # macro (from list)
+class struct_drm_event(Structure):
+    pass
+
+struct_drm_event._pack_ = 1 # source:False
+struct_drm_event._fields_ = [
+    ('type', ctypes.c_uint32),
+    ('length', ctypes.c_uint32),
+]
+
+class struct_drm_event_vblank(Structure):
+    pass
+
+struct_drm_event_vblank._pack_ = 1 # source:False
+struct_drm_event_vblank._fields_ = [
+    ('base', struct_drm_event),
+    ('user_data', ctypes.c_uint64),
+    ('tv_sec', ctypes.c_uint32),
+    ('tv_usec', ctypes.c_uint32),
+    ('sequence', ctypes.c_uint32),
+    ('crtc_id', ctypes.c_uint32),
+]
+
+class struct_drm_event_crtc_sequence(Structure):
+    pass
+
+struct_drm_event_crtc_sequence._pack_ = 1 # source:False
+struct_drm_event_crtc_sequence._fields_ = [
+    ('base', struct_drm_event),
+    ('user_data', ctypes.c_uint64),
+    ('time_ns', ctypes.c_int64),
+    ('sequence', ctypes.c_uint64),
+]
+
+drm_clip_rect_t = struct_drm_clip_rect
+drm_drawable_info_t = struct_drm_drawable_info
+drm_tex_region_t = struct_drm_tex_region
+drm_hw_lock_t = struct_drm_hw_lock
+drm_version_t = struct_drm_version
+drm_unique_t = struct_drm_unique
+drm_list_t = struct_drm_list
+drm_block_t = struct_drm_block
+drm_control_t = struct_drm_control
+drm_map_type_t = drm_map_type
+drm_map_type_t__enumvalues = drm_map_type__enumvalues
+drm_map_flags_t = drm_map_flags
+drm_map_flags_t__enumvalues = drm_map_flags__enumvalues
+drm_ctx_priv_map_t = struct_drm_ctx_priv_map
+drm_map_t = struct_drm_map
+drm_client_t = struct_drm_client
+drm_stat_type_t = drm_stat_type
+drm_stat_type_t__enumvalues = drm_stat_type__enumvalues
+drm_stats_t = struct_drm_stats
+drm_lock_flags_t = drm_lock_flags
+drm_lock_flags_t__enumvalues = drm_lock_flags__enumvalues
+drm_control_func_t = drm_control_func
+drm_control_func_t__enumvalues = drm_control_func__enumvalues
+drm_lock_t = struct_drm_lock
+drm_dma_flags_t = drm_dma_flags
+drm_dma_flags_t__enumvalues = drm_dma_flags__enumvalues
+drm_buf_desc_t = struct_drm_buf_desc
+drm_buf_desc_flags_t = drm_buf_desc_flags
+drm_buf_desc_flags_t__enumvalues = drm_buf_desc_flags__enumvalues
+drm_buf_info_t = struct_drm_buf_info
+drm_buf_free_t = struct_drm_buf_free
+drm_buf_pub_t = struct_drm_buf_pub
+drm_buf_map_t = struct_drm_buf_map
+drm_dma_t = struct_drm_dma
+drm_wait_vblank_t = union_drm_wait_vblank
+drm_agp_mode_t = struct_drm_agp_mode
+drm_ctx_flags_t = drm_ctx_flags
+drm_ctx_flags_t__enumvalues = drm_ctx_flags__enumvalues
+drm_ctx_t = struct_drm_ctx
+drm_ctx_res_t = struct_drm_ctx_res
+drm_draw_t = struct_drm_draw
+drm_update_draw_t = struct_drm_update_draw
+drm_auth_t = struct_drm_auth
+drm_irq_busid_t = struct_drm_irq_busid
+drm_vblank_seq_type_t = drm_vblank_seq_type
+drm_vblank_seq_type_t__enumvalues = drm_vblank_seq_type__enumvalues
+drm_agp_buffer_t = struct_drm_agp_buffer
+drm_agp_binding_t = struct_drm_agp_binding
+drm_agp_info_t = struct_drm_agp_info
+drm_scatter_gather_t = struct_drm_scatter_gather
+drm_set_version_t = struct_drm_set_version
+
+# values for enumeration 'e_rknpu_mem_type'
+e_rknpu_mem_type__enumvalues = {
+    0: 'RKNPU_MEM_CONTIGUOUS',
+    1: 'RKNPU_MEM_NON_CONTIGUOUS',
+    0: 'RKNPU_MEM_NON_CACHEABLE',
+    2: 'RKNPU_MEM_CACHEABLE',
+    4: 'RKNPU_MEM_WRITE_COMBINE',
+    8: 'RKNPU_MEM_KERNEL_MAPPING',
+    16: 'RKNPU_MEM_IOMMU',
+    32: 'RKNPU_MEM_ZEROING',
+    64: 'RKNPU_MEM_SECURE',
+    128: 'RKNPU_MEM_NON_DMA32',
+    256: 'RKNPU_MEM_TRY_ALLOC_SRAM',
+    511: 'RKNPU_MEM_MASK',
+}
+RKNPU_MEM_CONTIGUOUS = 0
+RKNPU_MEM_NON_CONTIGUOUS = 1
+RKNPU_MEM_NON_CACHEABLE = 0
+RKNPU_MEM_CACHEABLE = 2
+RKNPU_MEM_WRITE_COMBINE = 4
+RKNPU_MEM_KERNEL_MAPPING = 8
+RKNPU_MEM_IOMMU = 16
+RKNPU_MEM_ZEROING = 32
+RKNPU_MEM_SECURE = 64
+RKNPU_MEM_NON_DMA32 = 128
+RKNPU_MEM_TRY_ALLOC_SRAM = 256
+RKNPU_MEM_MASK = 511
+e_rknpu_mem_type = ctypes.c_uint32 # enum
+
+# values for enumeration 'e_rknpu_mem_sync_mode'
+e_rknpu_mem_sync_mode__enumvalues = {
+    1: 'RKNPU_MEM_SYNC_TO_DEVICE',
+    2: 'RKNPU_MEM_SYNC_FROM_DEVICE',
+    3: 'RKNPU_MEM_SYNC_MASK',
+}
+RKNPU_MEM_SYNC_TO_DEVICE = 1
+RKNPU_MEM_SYNC_FROM_DEVICE = 2
+RKNPU_MEM_SYNC_MASK = 3
+e_rknpu_mem_sync_mode = ctypes.c_uint32 # enum
+
+# values for enumeration 'e_rknpu_job_mode'
+e_rknpu_job_mode__enumvalues = {
+    0: 'RKNPU_JOB_SLAVE',
+    1: 'RKNPU_JOB_PC',
+    0: 'RKNPU_JOB_BLOCK',
+    2: 'RKNPU_JOB_NONBLOCK',
+    4: 'RKNPU_JOB_PINGPONG',
+    8: 'RKNPU_JOB_FENCE_IN',
+    16: 'RKNPU_JOB_FENCE_OUT',
+    31: 'RKNPU_JOB_MASK',
+}
+RKNPU_JOB_SLAVE = 0
+RKNPU_JOB_PC = 1
+RKNPU_JOB_BLOCK = 0
+RKNPU_JOB_NONBLOCK = 2
+RKNPU_JOB_PINGPONG = 4
+RKNPU_JOB_FENCE_IN = 8
+RKNPU_JOB_FENCE_OUT = 16
+RKNPU_JOB_MASK = 31
+e_rknpu_job_mode = ctypes.c_uint32 # enum
+
+# values for enumeration 'e_rknpu_action'
+e_rknpu_action__enumvalues = {
+    0: 'RKNPU_GET_HW_VERSION',
+    1: 'RKNPU_GET_DRV_VERSION',
+    2: 'RKNPU_GET_FREQ',
+    3: 'RKNPU_SET_FREQ',
+    4: 'RKNPU_GET_VOLT',
+    5: 'RKNPU_SET_VOLT',
+    6: 'RKNPU_ACT_RESET',
+    7: 'RKNPU_GET_BW_PRIORITY',
+    8: 'RKNPU_SET_BW_PRIORITY',
+    9: 'RKNPU_GET_BW_EXPECT',
+    10: 'RKNPU_SET_BW_EXPECT',
+    11: 'RKNPU_GET_BW_TW',
+    12: 'RKNPU_SET_BW_TW',
+    13: 'RKNPU_ACT_CLR_TOTAL_RW_AMOUNT',
+    14: 'RKNPU_GET_DT_WR_AMOUNT',
+    15: 'RKNPU_GET_DT_RD_AMOUNT',
+    16: 'RKNPU_GET_WT_RD_AMOUNT',
+    17: 'RKNPU_GET_TOTAL_RW_AMOUNT',
+    18: 'RKNPU_GET_IOMMU_EN',
+    19: 'RKNPU_SET_PROC_NICE',
+    20: 'RKNPU_POWER_ON',
+    21: 'RKNPU_POWER_OFF',
+    22: 'RKNPU_GET_TOTAL_SRAM_SIZE',
+    23: 'RKNPU_GET_FREE_SRAM_SIZE',
+}
+RKNPU_GET_HW_VERSION = 0
+RKNPU_GET_DRV_VERSION = 1
+RKNPU_GET_FREQ = 2
+RKNPU_SET_FREQ = 3
+RKNPU_GET_VOLT = 4
+RKNPU_SET_VOLT = 5
+RKNPU_ACT_RESET = 6
+RKNPU_GET_BW_PRIORITY = 7
+RKNPU_SET_BW_PRIORITY = 8
+RKNPU_GET_BW_EXPECT = 9
+RKNPU_SET_BW_EXPECT = 10
+RKNPU_GET_BW_TW = 11
+RKNPU_SET_BW_TW = 12
+RKNPU_ACT_CLR_TOTAL_RW_AMOUNT = 13
+RKNPU_GET_DT_WR_AMOUNT = 14
+RKNPU_GET_DT_RD_AMOUNT = 15
+RKNPU_GET_WT_RD_AMOUNT = 16
+RKNPU_GET_TOTAL_RW_AMOUNT = 17
+RKNPU_GET_IOMMU_EN = 18
+RKNPU_SET_PROC_NICE = 19
+RKNPU_POWER_ON = 20
+RKNPU_POWER_OFF = 21
+RKNPU_GET_TOTAL_SRAM_SIZE = 22
+RKNPU_GET_FREE_SRAM_SIZE = 23
+e_rknpu_action = ctypes.c_uint32 # enum
+class struct_rknpu_mem_create(Structure):
+    pass
+
+struct_rknpu_mem_create._pack_ = 1 # source:False
+struct_rknpu_mem_create._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
+    ('size', ctypes.c_uint64),
+    ('obj_addr', ctypes.c_uint64),
+    ('dma_addr', ctypes.c_uint64),
+    ('sram_size', ctypes.c_uint64),
+]
+
+DRM_IOCTL_RKNPU_MEM_CREATE = DRM_IOWR ( 0x40 + 0x02 , struct_rknpu_mem_create ) # macro (from list)
+IOCTL_RKNPU_MEM_CREATE = RKNPU_IOWR ( 0x02 , struct_rknpu_mem_create ) # macro (from list)
+class struct_rknpu_mem_map(Structure):
+    pass
+
+struct_rknpu_mem_map._pack_ = 1 # source:False
+struct_rknpu_mem_map._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('reserved', ctypes.c_uint32),
+    ('offset', ctypes.c_uint64),
+]
+
+DRM_IOCTL_RKNPU_MEM_MAP = DRM_IOWR ( 0x40 + 0x03 , struct_rknpu_mem_map ) # macro (from list)
+IOCTL_RKNPU_MEM_MAP = RKNPU_IOWR ( 0x03 , struct_rknpu_mem_map ) # macro (from list)
+class struct_rknpu_mem_destroy(Structure):
+    pass
+
+struct_rknpu_mem_destroy._pack_ = 1 # source:False
+struct_rknpu_mem_destroy._fields_ = [
+    ('handle', ctypes.c_uint32),
+    ('reserved', ctypes.c_uint32),
+    ('obj_addr', ctypes.c_uint64),
+]
+
+DRM_IOCTL_RKNPU_MEM_DESTROY = DRM_IOWR ( 0x40 + 0x04 , struct_rknpu_mem_destroy ) # macro (from list)
+IOCTL_RKNPU_MEM_DESTROY = RKNPU_IOWR ( 0x04 , struct_rknpu_mem_destroy ) # macro (from list)
+class struct_rknpu_mem_sync(Structure):
+    pass
+
+struct_rknpu_mem_sync._pack_ = 1 # source:False
+struct_rknpu_mem_sync._fields_ = [
+    ('flags', ctypes.c_uint32),
+    ('reserved', ctypes.c_uint32),
+    ('obj_addr', ctypes.c_uint64),
+    ('offset', ctypes.c_uint64),
+    ('size', ctypes.c_uint64),
+]
+
+DRM_IOCTL_RKNPU_MEM_SYNC = DRM_IOWR ( 0x40 + 0x05 , struct_rknpu_mem_sync ) # macro (from list)
+IOCTL_RKNPU_MEM_SYNC = RKNPU_IOWR ( 0x05 , struct_rknpu_mem_sync ) # macro (from list)
+class struct_rknpu_task(Structure):
+    pass
+
+struct_rknpu_task._pack_ = 1 # source:True
+struct_rknpu_task._fields_ = [
+    ('flags', ctypes.c_uint32),
+    ('op_idx', ctypes.c_uint32),
+    ('enable_mask', ctypes.c_uint32),
+    ('int_mask', ctypes.c_uint32),
+    ('int_clear', ctypes.c_uint32),
+    ('int_status', ctypes.c_uint32),
+    ('regcfg_amount', ctypes.c_uint32),
+    ('regcfg_offset', ctypes.c_uint32),
+    ('regcmd_addr', ctypes.c_uint64),
+]
+
+class struct_rknpu_subcore_task(Structure):
+    pass
+
+struct_rknpu_subcore_task._pack_ = 1 # source:False
+struct_rknpu_subcore_task._fields_ = [
+    ('task_start', ctypes.c_uint32),
+    ('task_number', ctypes.c_uint32),
+]
+
+class struct_rknpu_submit(Structure):
+    pass
+
+struct_rknpu_submit._pack_ = 1 # source:False
+struct_rknpu_submit._fields_ = [
+    ('flags', ctypes.c_uint32),
+    ('timeout', ctypes.c_uint32),
+    ('task_start', ctypes.c_uint32),
+    ('task_number', ctypes.c_uint32),
+    ('task_counter', ctypes.c_uint32),
+    ('priority', ctypes.c_int32),
+    ('task_obj_addr', ctypes.c_uint64),
+    ('regcfg_obj_addr', ctypes.c_uint64),
+    ('task_base_addr', ctypes.c_uint64),
+    ('user_data', ctypes.c_uint64),
+    ('core_mask', ctypes.c_uint32),
     ('fence_fd', ctypes.c_int32),
-    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('subcore_task', struct_rknpu_subcore_task * 5),
 ]
 
-rknn_run_extend = struct__rknn_run_extend
-class struct__rknn_output_extend(Structure):
+DRM_IOCTL_RKNPU_SUBMIT = DRM_IOWR ( 0x40 + 0x01 , struct_rknpu_submit ) # macro (from list)
+IOCTL_RKNPU_SUBMIT = RKNPU_IOWR ( 0x01 , struct_rknpu_submit ) # macro (from list)
+class struct_rknpu_action(Structure):
     pass
 
-struct__rknn_output_extend._pack_ = 1 # source:False
-struct__rknn_output_extend._fields_ = [
-    ('frame_id', ctypes.c_uint64),
+struct_rknpu_action._pack_ = 1 # source:False
+struct_rknpu_action._fields_ = [
+    ('flags', ctypes.c_uint32),
+    ('value', ctypes.c_uint32),
 ]
 
-rknn_output_extend = struct__rknn_output_extend
-uint32_t = ctypes.c_uint32
-try:
-    rknn_init = _libraries['librknnrt.so'].rknn_init
-    rknn_init.restype = ctypes.c_int32
-    rknn_init.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(None), uint32_t, uint32_t, ctypes.POINTER(struct__rknn_init_extend)]
-except AttributeError:
-    pass
-try:
-    rknn_dup_context = _libraries['librknnrt.so'].rknn_dup_context
-    rknn_dup_context.restype = ctypes.c_int32
-    rknn_dup_context.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
-except AttributeError:
-    pass
-try:
-    rknn_destroy = _libraries['librknnrt.so'].rknn_destroy
-    rknn_destroy.restype = ctypes.c_int32
-    rknn_destroy.argtypes = [rknn_context]
-except AttributeError:
-    pass
-try:
-    rknn_query = _libraries['librknnrt.so'].rknn_query
-    rknn_query.restype = ctypes.c_int32
-    rknn_query.argtypes = [rknn_context, rknn_query_cmd, ctypes.POINTER(None), uint32_t]
-except AttributeError:
-    pass
-try:
-    rknn_inputs_set = _libraries['librknnrt.so'].rknn_inputs_set
-    rknn_inputs_set.restype = ctypes.c_int32
-    rknn_inputs_set.argtypes = [rknn_context, uint32_t, struct__rknn_input * 0]
-except AttributeError:
-    pass
-try:
-    rknn_set_batch_core_num = _libraries['librknnrt.so'].rknn_set_batch_core_num
-    rknn_set_batch_core_num.restype = ctypes.c_int32
-    rknn_set_batch_core_num.argtypes = [rknn_context, ctypes.c_int32]
-except AttributeError:
-    pass
-try:
-    rknn_set_core_mask = _libraries['librknnrt.so'].rknn_set_core_mask
-    rknn_set_core_mask.restype = ctypes.c_int32
-    rknn_set_core_mask.argtypes = [rknn_context, rknn_core_mask]
-except AttributeError:
-    pass
-try:
-    rknn_run = _libraries['librknnrt.so'].rknn_run
-    rknn_run.restype = ctypes.c_int32
-    rknn_run.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_run_extend)]
-except AttributeError:
-    pass
-try:
-    rknn_wait = _libraries['librknnrt.so'].rknn_wait
-    rknn_wait.restype = ctypes.c_int32
-    rknn_wait.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_run_extend)]
-except AttributeError:
-    pass
-try:
-    rknn_outputs_get = _libraries['librknnrt.so'].rknn_outputs_get
-    rknn_outputs_get.restype = ctypes.c_int32
-    rknn_outputs_get.argtypes = [rknn_context, uint32_t, struct__rknn_output * 0, ctypes.POINTER(struct__rknn_output_extend)]
-except AttributeError:
-    pass
-try:
-    rknn_outputs_release = _libraries['librknnrt.so'].rknn_outputs_release
-    rknn_outputs_release.restype = ctypes.c_int32
-    rknn_outputs_release.argtypes = [rknn_context, uint32_t, struct__rknn_output * 0]
-except AttributeError:
-    pass
-uint64_t = ctypes.c_uint64
-try:
-    rknn_create_mem_from_phys = _libraries['librknnrt.so'].rknn_create_mem_from_phys
-    rknn_create_mem_from_phys.restype = ctypes.POINTER(struct__rknn_tensor_memory)
-    rknn_create_mem_from_phys.argtypes = [rknn_context, uint64_t, ctypes.POINTER(None), uint32_t]
-except AttributeError:
-    pass
-int32_t = ctypes.c_int32
-try:
-    rknn_create_mem_from_fd = _libraries['librknnrt.so'].rknn_create_mem_from_fd
-    rknn_create_mem_from_fd.restype = ctypes.POINTER(struct__rknn_tensor_memory)
-    rknn_create_mem_from_fd.argtypes = [rknn_context, int32_t, ctypes.POINTER(None), uint32_t, int32_t]
-except AttributeError:
-    pass
-try:
-    rknn_create_mem_from_mb_blk = _libraries['FIXME_STUB'].rknn_create_mem_from_mb_blk
-    rknn_create_mem_from_mb_blk.restype = ctypes.POINTER(struct__rknn_tensor_memory)
-    rknn_create_mem_from_mb_blk.argtypes = [rknn_context, ctypes.POINTER(None), int32_t]
-except AttributeError:
-    pass
-try:
-    rknn_create_mem = _libraries['librknnrt.so'].rknn_create_mem
-    rknn_create_mem.restype = ctypes.POINTER(struct__rknn_tensor_memory)
-    rknn_create_mem.argtypes = [rknn_context, uint32_t]
-except AttributeError:
-    pass
-try:
-    rknn_create_mem2 = _libraries['librknnrt.so'].rknn_create_mem2
-    rknn_create_mem2.restype = ctypes.POINTER(struct__rknn_tensor_memory)
-    rknn_create_mem2.argtypes = [rknn_context, uint64_t, uint64_t]
-except AttributeError:
-    pass
-try:
-    rknn_destroy_mem = _libraries['librknnrt.so'].rknn_destroy_mem
-    rknn_destroy_mem.restype = ctypes.c_int32
-    rknn_destroy_mem.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_memory)]
-except AttributeError:
-    pass
-try:
-    rknn_set_weight_mem = _libraries['librknnrt.so'].rknn_set_weight_mem
-    rknn_set_weight_mem.restype = ctypes.c_int32
-    rknn_set_weight_mem.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_memory)]
-except AttributeError:
-    pass
-try:
-    rknn_set_internal_mem = _libraries['librknnrt.so'].rknn_set_internal_mem
-    rknn_set_internal_mem.restype = ctypes.c_int32
-    rknn_set_internal_mem.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_memory)]
-except AttributeError:
-    pass
-try:
-    rknn_set_io_mem = _libraries['librknnrt.so'].rknn_set_io_mem
-    rknn_set_io_mem.restype = ctypes.c_int32
-    rknn_set_io_mem.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_memory), ctypes.POINTER(struct__rknn_tensor_attr)]
-except AttributeError:
-    pass
-try:
-    rknn_set_input_shape = _libraries['librknnrt.so'].rknn_set_input_shape
-    rknn_set_input_shape.restype = ctypes.c_int32
-    rknn_set_input_shape.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_attr)]
-except AttributeError:
-    pass
-try:
-    rknn_set_input_shapes = _libraries['librknnrt.so'].rknn_set_input_shapes
-    rknn_set_input_shapes.restype = ctypes.c_int32
-    rknn_set_input_shapes.argtypes = [rknn_context, uint32_t, struct__rknn_tensor_attr * 0]
-except AttributeError:
-    pass
-try:
-    rknn_mem_sync = _libraries['librknnrt.so'].rknn_mem_sync
-    rknn_mem_sync.restype = ctypes.c_int32
-    rknn_mem_sync.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_tensor_memory), rknn_mem_sync_mode]
-except AttributeError:
-    pass
-rknn_custom_op_interal_context = ctypes.c_uint64
-
-# values for enumeration '_rknn_target_type'
-_rknn_target_type__enumvalues = {
-    1: 'RKNN_TARGET_TYPE_CPU',
-    2: 'RKNN_TARGET_TYPE_GPU',
-    3: 'RKNN_TARGET_TYPE_MAX',
-}
-RKNN_TARGET_TYPE_CPU = 1
-RKNN_TARGET_TYPE_GPU = 2
-RKNN_TARGET_TYPE_MAX = 3
-_rknn_target_type = ctypes.c_uint32 # enum
-rknn_target_type = _rknn_target_type
-rknn_target_type__enumvalues = _rknn_target_type__enumvalues
-class struct__rknn_gpu_op_context(Structure):
-    pass
-
-struct__rknn_gpu_op_context._pack_ = 1 # source:False
-struct__rknn_gpu_op_context._fields_ = [
-    ('cl_context', ctypes.POINTER(None)),
-    ('cl_command_queue', ctypes.POINTER(None)),
-    ('cl_kernel', ctypes.POINTER(None)),
-]
-
-rknn_gpu_op_context = struct__rknn_gpu_op_context
-class struct__rknn_custom_op_context(Structure):
-    pass
-
-struct__rknn_custom_op_context._pack_ = 1 # source:False
-struct__rknn_custom_op_context._fields_ = [
-    ('target', rknn_target_type),
-    ('PADDING_0', ctypes.c_ubyte * 4),
-    ('internal_ctx', ctypes.c_uint64),
-    ('gpu_ctx', rknn_gpu_op_context),
-    ('priv_data', ctypes.POINTER(None)),
-]
-
-rknn_custom_op_context = struct__rknn_custom_op_context
-class struct__rknn_custom_op_tensor(Structure):
-    _pack_ = 1 # source:False
-    _fields_ = [
-    ('attr', rknn_tensor_attr),
-    ('mem', rknn_tensor_mem),
-     ]
-
-rknn_custom_op_tensor = struct__rknn_custom_op_tensor
-class struct__rknn_custom_op_attr(Structure):
-    pass
-
-struct__rknn_custom_op_attr._pack_ = 1 # source:False
-struct__rknn_custom_op_attr._fields_ = [
-    ('name', ctypes.c_ubyte * 256),
-    ('dtype', rknn_tensor_type),
-    ('n_elems', ctypes.c_uint32),
-    ('data', ctypes.POINTER(None)),
-]
-
-rknn_custom_op_attr = struct__rknn_custom_op_attr
-class struct__rknn_custom_op(Structure):
-    pass
-
-struct__rknn_custom_op._pack_ = 1 # source:False
-struct__rknn_custom_op._fields_ = [
-    ('version', ctypes.c_uint32),
-    ('target', rknn_target_type),
-    ('op_type', ctypes.c_ubyte * 256),
-    ('cl_kernel_name', ctypes.c_ubyte * 256),
-    ('cl_kernel_source', ctypes.POINTER(ctypes.c_ubyte)),
-    ('cl_source_size', ctypes.c_uint64),
-    ('cl_build_options', ctypes.c_ubyte * 256),
-    ('init', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
-    ('prepare', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
-    ('compute', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
-    ('compute_native', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
-    ('destroy', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context))),
-]
-
-rknn_custom_op = struct__rknn_custom_op
-get_custom_op_func = ctypes.CFUNCTYPE(ctypes.POINTER(struct__rknn_custom_op))
-try:
-    rknn_register_custom_ops = _libraries['librknnrt.so'].rknn_register_custom_ops
-    rknn_register_custom_ops.restype = ctypes.c_int32
-    rknn_register_custom_ops.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_custom_op), uint32_t]
-except AttributeError:
-    pass
-try:
-    rknn_custom_op_get_op_attr = _libraries['librknnrt.so'].rknn_custom_op_get_op_attr
-    rknn_custom_op_get_op_attr.restype = None
-    rknn_custom_op_get_op_attr.argtypes = [ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(struct__rknn_custom_op_attr)]
-except AttributeError:
-    pass
-rknn_matmul_ctx = ctypes.c_uint64
-
-# values for enumeration '_rknn_matmul_quant_type'
-_rknn_matmul_quant_type__enumvalues = {
-    0: 'RKNN_QUANT_TYPE_PER_LAYER_SYM',
-    1: 'RKNN_QUANT_TYPE_PER_LAYER_ASYM',
-    2: 'RKNN_QUANT_TYPE_PER_CHANNEL_SYM',
-    3: 'RKNN_QUANT_TYPE_PER_CHANNEL_ASYM',
-    4: 'RKNN_QUANT_TYPE_PER_GROUP_SYM',
-    5: 'RKNN_QUANT_TYPE_PER_GROUP_ASYM',
-}
-RKNN_QUANT_TYPE_PER_LAYER_SYM = 0
-RKNN_QUANT_TYPE_PER_LAYER_ASYM = 1
-RKNN_QUANT_TYPE_PER_CHANNEL_SYM = 2
-RKNN_QUANT_TYPE_PER_CHANNEL_ASYM = 3
-RKNN_QUANT_TYPE_PER_GROUP_SYM = 4
-RKNN_QUANT_TYPE_PER_GROUP_ASYM = 5
-_rknn_matmul_quant_type = ctypes.c_uint32 # enum
-rknn_matmul_quant_type = _rknn_matmul_quant_type
-rknn_matmul_quant_type__enumvalues = _rknn_matmul_quant_type__enumvalues
-class struct__rknn_quant_params(Structure):
-    pass
-
-struct__rknn_quant_params._pack_ = 1 # source:False
-struct__rknn_quant_params._fields_ = [
-    ('name', ctypes.c_ubyte * 256),
-    ('scale', ctypes.POINTER(ctypes.c_float)),
-    ('scale_len', ctypes.c_int32),
-    ('PADDING_0', ctypes.c_ubyte * 4),
-    ('zp', ctypes.POINTER(ctypes.c_int32)),
-    ('zp_len', ctypes.c_int32),
-    ('PADDING_1', ctypes.c_ubyte * 4),
-]
-
-rknn_quant_params = struct__rknn_quant_params
-
-# values for enumeration '_rknn_matmul_type'
-_rknn_matmul_type__enumvalues = {
-    1: 'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
-    2: 'RKNN_INT8_MM_INT8_TO_INT32',
-    3: 'RKNN_INT8_MM_INT8_TO_INT8',
-    4: 'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
-    5: 'RKNN_FLOAT16_MM_INT8_TO_FLOAT32',
-    6: 'RKNN_FLOAT16_MM_INT8_TO_FLOAT16',
-    7: 'RKNN_FLOAT16_MM_INT4_TO_FLOAT32',
-    8: 'RKNN_FLOAT16_MM_INT4_TO_FLOAT16',
-    9: 'RKNN_INT8_MM_INT8_TO_FLOAT32',
-    10: 'RKNN_INT4_MM_INT4_TO_INT16',
-    11: 'RKNN_INT8_MM_INT4_TO_INT32',
-    12: 'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
-}
-RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 = 1
-RKNN_INT8_MM_INT8_TO_INT32 = 2
-RKNN_INT8_MM_INT8_TO_INT8 = 3
-RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16 = 4
-RKNN_FLOAT16_MM_INT8_TO_FLOAT32 = 5
-RKNN_FLOAT16_MM_INT8_TO_FLOAT16 = 6
-RKNN_FLOAT16_MM_INT4_TO_FLOAT32 = 7
-RKNN_FLOAT16_MM_INT4_TO_FLOAT16 = 8
-RKNN_INT8_MM_INT8_TO_FLOAT32 = 9
-RKNN_INT4_MM_INT4_TO_INT16 = 10
-RKNN_INT8_MM_INT4_TO_INT32 = 11
-RKNN_FLOAT16_MM_INT4_TO_BFLOAT16 = 12
-_rknn_matmul_type = ctypes.c_uint32 # enum
-rknn_matmul_type = _rknn_matmul_type
-rknn_matmul_type__enumvalues = _rknn_matmul_type__enumvalues
-try:
-    get_matmul_type_string = _libraries['FIXME_STUB'].get_matmul_type_string
-    get_matmul_type_string.restype = ctypes.POINTER(ctypes.c_ubyte)
-    get_matmul_type_string.argtypes = [rknn_matmul_type]
-except AttributeError:
-    pass
-class struct__rknn_matmul_tensor_attr(Structure):
-    pass
-
-struct__rknn_matmul_tensor_attr._pack_ = 1 # source:False
-struct__rknn_matmul_tensor_attr._fields_ = [
-    ('name', ctypes.c_ubyte * 256),
-    ('n_dims', ctypes.c_uint32),
-    ('dims', ctypes.c_uint32 * 16),
-    ('size', ctypes.c_uint32),
-    ('type', rknn_tensor_type),
-]
-
-rknn_matmul_tensor_attr = struct__rknn_matmul_tensor_attr
-class struct__rknn_matmul_io_attr(Structure):
-    _pack_ = 1 # source:False
-    _fields_ = [
-    ('A', rknn_matmul_tensor_attr),
-    ('B', rknn_matmul_tensor_attr),
-    ('C', rknn_matmul_tensor_attr),
-     ]
-
-rknn_matmul_io_attr = struct__rknn_matmul_io_attr
-class struct__rknn_matmul_shape(Structure):
-    pass
-
-struct__rknn_matmul_shape._pack_ = 1 # source:False
-struct__rknn_matmul_shape._fields_ = [
-    ('M', ctypes.c_int32),
-    ('K', ctypes.c_int32),
-    ('N', ctypes.c_int32),
-]
-
-rknn_matmul_shape = struct__rknn_matmul_shape
-
-# values for enumeration 'c__EA_rknn_matmul_layout'
-c__EA_rknn_matmul_layout__enumvalues = {
-    0: 'RKNN_MM_LAYOUT_NORM',
-    1: 'RKNN_MM_LAYOUT_NATIVE',
-    2: 'RKNN_MM_LAYOUT_TP_NORM',
-}
-RKNN_MM_LAYOUT_NORM = 0
-RKNN_MM_LAYOUT_NATIVE = 1
-RKNN_MM_LAYOUT_TP_NORM = 2
-c__EA_rknn_matmul_layout = ctypes.c_uint32 # enum
-rknn_matmul_layout = c__EA_rknn_matmul_layout
-rknn_matmul_layout__enumvalues = c__EA_rknn_matmul_layout__enumvalues
-class struct_rknn_matmul_info_t(Structure):
-    pass
-
-struct_rknn_matmul_info_t._pack_ = 1 # source:False
-struct_rknn_matmul_info_t._fields_ = [
-    ('M', ctypes.c_int32),
-    ('K', ctypes.c_int32),
-    ('N', ctypes.c_int32),
-    ('type', rknn_matmul_type),
-    ('B_layout', ctypes.c_int16),
-    ('B_quant_type', ctypes.c_int16),
-    ('AC_layout', ctypes.c_int16),
-    ('AC_quant_type', ctypes.c_int16),
-    ('iommu_domain_id', ctypes.c_int32),
-    ('group_size', ctypes.c_int16),
-    ('reserved', ctypes.c_byte * 34),
-]
-
-rknn_matmul_info = struct_rknn_matmul_info_t
-try:
-    rknn_matmul_create = _libraries['librknnrt.so'].rknn_matmul_create
-    rknn_matmul_create.restype = ctypes.c_int32
-    rknn_matmul_create.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(struct_rknn_matmul_info_t), ctypes.POINTER(struct__rknn_matmul_io_attr)]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_create_dynamic_shape = _libraries['librknnrt.so'].rknn_matmul_create_dynamic_shape
-    rknn_matmul_create_dynamic_shape.restype = ctypes.c_int32
-    rknn_matmul_create_dynamic_shape.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(struct_rknn_matmul_info_t), ctypes.c_int32, struct__rknn_matmul_shape * 0, struct__rknn_matmul_io_attr * 0]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_set_io_mem = _libraries['librknnrt.so'].rknn_matmul_set_io_mem
-    rknn_matmul_set_io_mem.restype = ctypes.c_int32
-    rknn_matmul_set_io_mem.argtypes = [rknn_matmul_ctx, ctypes.POINTER(struct__rknn_tensor_memory), ctypes.POINTER(struct__rknn_matmul_tensor_attr)]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_set_core_mask = _libraries['librknnrt.so'].rknn_matmul_set_core_mask
-    rknn_matmul_set_core_mask.restype = ctypes.c_int32
-    rknn_matmul_set_core_mask.argtypes = [rknn_matmul_ctx, rknn_core_mask]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_set_quant_params = _libraries['librknnrt.so'].rknn_matmul_set_quant_params
-    rknn_matmul_set_quant_params.restype = ctypes.c_int32
-    rknn_matmul_set_quant_params.argtypes = [rknn_matmul_ctx, ctypes.POINTER(struct__rknn_quant_params)]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_get_quant_params = _libraries['librknnrt.so'].rknn_matmul_get_quant_params
-    rknn_matmul_get_quant_params.restype = ctypes.c_int32
-    rknn_matmul_get_quant_params.argtypes = [rknn_matmul_ctx, ctypes.POINTER(struct__rknn_quant_params), ctypes.POINTER(ctypes.c_float)]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_set_dynamic_shape = _libraries['librknnrt.so'].rknn_matmul_set_dynamic_shape
-    rknn_matmul_set_dynamic_shape.restype = ctypes.c_int32
-    rknn_matmul_set_dynamic_shape.argtypes = [rknn_matmul_ctx, ctypes.POINTER(struct__rknn_matmul_shape)]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_run = _libraries['librknnrt.so'].rknn_matmul_run
-    rknn_matmul_run.restype = ctypes.c_int32
-    rknn_matmul_run.argtypes = [rknn_matmul_ctx]
-except AttributeError:
-    pass
-try:
-    rknn_matmul_destroy = _libraries['librknnrt.so'].rknn_matmul_destroy
-    rknn_matmul_destroy.restype = ctypes.c_int32
-    rknn_matmul_destroy.argtypes = [rknn_matmul_ctx]
-except AttributeError:
-    pass
-try:
-    rknn_B_normal_layout_to_native_layout = _libraries['librknnrt.so'].rknn_B_normal_layout_to_native_layout
-    rknn_B_normal_layout_to_native_layout.restype = ctypes.c_int32
-    rknn_B_normal_layout_to_native_layout.argtypes = [ctypes.POINTER(None), ctypes.POINTER(None), ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(struct_rknn_matmul_info_t)]
-except AttributeError:
-    pass
+DRM_IOCTL_RKNPU_ACTION = DRM_IOWR ( 0x40 + 0x00 , struct_rknpu_action ) # macro (from list)
+IOCTL_RKNPU_ACTION = RKNPU_IOWR ( 0x00 , struct_rknpu_action ) # macro (from list)
 __all__ = \
-    ['RKNN_FLAG_MEMORY_CACHEABLE', 'RKNN_FLAG_MEMORY_FLAGS_DEFAULT',
-    'RKNN_FLAG_MEMORY_NON_CACHEABLE',
-    'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
-    'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
-    'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
-    'RKNN_FLOAT16_MM_INT4_TO_FLOAT16',
-    'RKNN_FLOAT16_MM_INT4_TO_FLOAT32',
-    'RKNN_FLOAT16_MM_INT8_TO_FLOAT16',
-    'RKNN_FLOAT16_MM_INT8_TO_FLOAT32', 'RKNN_INT4_MM_INT4_TO_INT16',
-    'RKNN_INT8_MM_INT4_TO_INT32', 'RKNN_INT8_MM_INT8_TO_FLOAT32',
-    'RKNN_INT8_MM_INT8_TO_INT32', 'RKNN_INT8_MM_INT8_TO_INT8',
-    'RKNN_MEMORY_SYNC_BIDIRECTIONAL', 'RKNN_MEMORY_SYNC_FROM_DEVICE',
-    'RKNN_MEMORY_SYNC_TO_DEVICE', 'RKNN_MM_LAYOUT_NATIVE',
-    'RKNN_MM_LAYOUT_NORM', 'RKNN_MM_LAYOUT_TP_NORM',
-    'RKNN_NPU_CORE_0', 'RKNN_NPU_CORE_0_1', 'RKNN_NPU_CORE_0_1_2',
-    'RKNN_NPU_CORE_1', 'RKNN_NPU_CORE_2', 'RKNN_NPU_CORE_ALL',
-    'RKNN_NPU_CORE_AUTO', 'RKNN_NPU_CORE_UNDEFINED',
-    'RKNN_QUANT_TYPE_PER_CHANNEL_ASYM',
-    'RKNN_QUANT_TYPE_PER_CHANNEL_SYM',
-    'RKNN_QUANT_TYPE_PER_GROUP_ASYM', 'RKNN_QUANT_TYPE_PER_GROUP_SYM',
-    'RKNN_QUANT_TYPE_PER_LAYER_ASYM', 'RKNN_QUANT_TYPE_PER_LAYER_SYM',
-    'RKNN_QUERY_CMD_MAX', 'RKNN_QUERY_CURRENT_INPUT_ATTR',
-    'RKNN_QUERY_CURRENT_NATIVE_INPUT_ATTR',
-    'RKNN_QUERY_CURRENT_NATIVE_OUTPUT_ATTR',
-    'RKNN_QUERY_CURRENT_OUTPUT_ATTR', 'RKNN_QUERY_CUSTOM_STRING',
-    'RKNN_QUERY_DEVICE_MEM_INFO', 'RKNN_QUERY_INPUT_ATTR',
-    'RKNN_QUERY_INPUT_DYNAMIC_RANGE', 'RKNN_QUERY_IN_OUT_NUM',
-    'RKNN_QUERY_MEM_SIZE', 'RKNN_QUERY_NATIVE_INPUT_ATTR',
-    'RKNN_QUERY_NATIVE_NC1HWC2_INPUT_ATTR',
-    'RKNN_QUERY_NATIVE_NC1HWC2_OUTPUT_ATTR',
-    'RKNN_QUERY_NATIVE_NHWC_INPUT_ATTR',
-    'RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR',
-    'RKNN_QUERY_NATIVE_OUTPUT_ATTR', 'RKNN_QUERY_OUTPUT_ATTR',
-    'RKNN_QUERY_PERF_DETAIL', 'RKNN_QUERY_PERF_RUN',
-    'RKNN_QUERY_SDK_VERSION', 'RKNN_TARGET_TYPE_CPU',
-    'RKNN_TARGET_TYPE_GPU', 'RKNN_TARGET_TYPE_MAX',
-    'RKNN_TENSOR_BFLOAT16', 'RKNN_TENSOR_BOOL', 'RKNN_TENSOR_FLOAT16',
-    'RKNN_TENSOR_FLOAT32', 'RKNN_TENSOR_FORMAT_MAX',
-    'RKNN_TENSOR_INT16', 'RKNN_TENSOR_INT32', 'RKNN_TENSOR_INT4',
-    'RKNN_TENSOR_INT64', 'RKNN_TENSOR_INT8',
-    'RKNN_TENSOR_MEMORY_FLAGS_ALLOC_INSIDE',
-    'RKNN_TENSOR_MEMORY_FLAGS_FROM_FD',
-    'RKNN_TENSOR_MEMORY_FLAGS_FROM_PHYS',
-    'RKNN_TENSOR_MEMORY_FLAGS_UNKNOWN', 'RKNN_TENSOR_NC1HWC2',
-    'RKNN_TENSOR_NCHW', 'RKNN_TENSOR_NHWC',
-    'RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC', 'RKNN_TENSOR_QNT_DFP',
-    'RKNN_TENSOR_QNT_MAX', 'RKNN_TENSOR_QNT_NONE',
-    'RKNN_TENSOR_TYPE_MAX', 'RKNN_TENSOR_UINT16',
-    'RKNN_TENSOR_UINT32', 'RKNN_TENSOR_UINT8',
-    'RKNN_TENSOR_UNDEFINED', '_rknn_core_mask',
-    '_rknn_matmul_quant_type', '_rknn_matmul_type',
-    '_rknn_mem_alloc_flags', '_rknn_mem_sync_mode', '_rknn_query_cmd',
-    '_rknn_target_type', '_rknn_tensor_format',
-    '_rknn_tensor_mem_flags', '_rknn_tensor_qnt_type',
-    '_rknn_tensor_type', 'c__EA_rknn_matmul_layout',
-    'get_custom_op_func', 'get_format_string',
-    'get_matmul_type_string', 'get_qnt_type_string',
-    'get_type_string', 'int32_t',
-    'rknn_B_normal_layout_to_native_layout', 'rknn_context',
-    'rknn_core_mask', 'rknn_core_mask__enumvalues', 'rknn_create_mem',
-    'rknn_create_mem2', 'rknn_create_mem_from_fd',
-    'rknn_create_mem_from_mb_blk', 'rknn_create_mem_from_phys',
-    'rknn_custom_op', 'rknn_custom_op_attr', 'rknn_custom_op_context',
-    'rknn_custom_op_get_op_attr', 'rknn_custom_op_interal_context',
-    'rknn_custom_op_tensor', 'rknn_custom_string', 'rknn_destroy',
-    'rknn_destroy_mem', 'rknn_dup_context', 'rknn_gpu_op_context',
-    'rknn_init', 'rknn_init_extend', 'rknn_input',
-    'rknn_input_output_num', 'rknn_input_range', 'rknn_inputs_set',
-    'rknn_matmul_create', 'rknn_matmul_create_dynamic_shape',
-    'rknn_matmul_ctx', 'rknn_matmul_destroy',
-    'rknn_matmul_get_quant_params', 'rknn_matmul_info',
-    'rknn_matmul_io_attr', 'rknn_matmul_layout',
-    'rknn_matmul_layout__enumvalues', 'rknn_matmul_quant_type',
-    'rknn_matmul_quant_type__enumvalues', 'rknn_matmul_run',
-    'rknn_matmul_set_core_mask', 'rknn_matmul_set_dynamic_shape',
-    'rknn_matmul_set_io_mem', 'rknn_matmul_set_quant_params',
-    'rknn_matmul_shape', 'rknn_matmul_tensor_attr',
-    'rknn_matmul_type', 'rknn_matmul_type__enumvalues',
-    'rknn_mem_alloc_flags', 'rknn_mem_alloc_flags__enumvalues',
-    'rknn_mem_size', 'rknn_mem_sync', 'rknn_mem_sync_mode',
-    'rknn_mem_sync_mode__enumvalues', 'rknn_output',
-    'rknn_output_extend', 'rknn_outputs_get', 'rknn_outputs_release',
-    'rknn_perf_detail', 'rknn_perf_run', 'rknn_quant_params',
-    'rknn_query', 'rknn_query_cmd', 'rknn_query_cmd__enumvalues',
-    'rknn_register_custom_ops', 'rknn_run', 'rknn_run_extend',
-    'rknn_sdk_version', 'rknn_set_batch_core_num',
-    'rknn_set_core_mask', 'rknn_set_input_shape',
-    'rknn_set_input_shapes', 'rknn_set_internal_mem',
-    'rknn_set_io_mem', 'rknn_set_weight_mem', 'rknn_target_type',
-    'rknn_target_type__enumvalues', 'rknn_tensor_attr',
-    'rknn_tensor_format', 'rknn_tensor_format__enumvalues',
-    'rknn_tensor_mem', 'rknn_tensor_mem_flags',
-    'rknn_tensor_mem_flags__enumvalues', 'rknn_tensor_qnt_type',
-    'rknn_tensor_qnt_type__enumvalues', 'rknn_tensor_type',
-    'rknn_tensor_type__enumvalues', 'rknn_wait',
-    'struct__rknn_custom_op', 'struct__rknn_custom_op_attr',
-    'struct__rknn_custom_op_context', 'struct__rknn_custom_op_tensor',
-    'struct__rknn_custom_string', 'struct__rknn_gpu_op_context',
-    'struct__rknn_init_extend', 'struct__rknn_input',
-    'struct__rknn_input_output_num', 'struct__rknn_input_range',
-    'struct__rknn_matmul_io_attr', 'struct__rknn_matmul_shape',
-    'struct__rknn_matmul_tensor_attr', 'struct__rknn_mem_size',
-    'struct__rknn_output', 'struct__rknn_output_extend',
-    'struct__rknn_perf_detail', 'struct__rknn_perf_run',
-    'struct__rknn_quant_params', 'struct__rknn_run_extend',
-    'struct__rknn_sdk_version', 'struct__rknn_tensor_attr',
-    'struct__rknn_tensor_memory', 'struct_rknn_matmul_info_t',
-    'uint32_t', 'uint64_t']
+    ['DRM_CAP_ADDFB2_MODIFIERS', 'DRM_CAP_ASYNC_PAGE_FLIP',
+    'DRM_CAP_CRTC_IN_VBLANK_EVENT', 'DRM_CAP_CURSOR_HEIGHT',
+    'DRM_CAP_CURSOR_WIDTH', 'DRM_CAP_DUMB_BUFFER',
+    'DRM_CAP_DUMB_PREFERRED_DEPTH', 'DRM_CAP_DUMB_PREFER_SHADOW',
+    'DRM_CAP_PAGE_FLIP_TARGET', 'DRM_CAP_PRIME', 'DRM_CAP_SYNCOBJ',
+    'DRM_CAP_TIMESTAMP_MONOTONIC', 'DRM_CAP_VBLANK_HIGH_CRTC',
+    'DRM_CLIENT_CAP_ASPECT_RATIO', 'DRM_CLIENT_CAP_ATOMIC',
+    'DRM_CLIENT_CAP_STEREO_3D', 'DRM_CLIENT_CAP_UNIVERSAL_PLANES',
+    'DRM_CLIENT_CAP_WRITEBACK_CONNECTORS', 'DRM_COMMAND_BASE',
+    'DRM_COMMAND_END', 'DRM_CRTC_SEQUENCE_NEXT_ON_MISS',
+    'DRM_CRTC_SEQUENCE_RELATIVE', 'DRM_DRAWABLE_CLIPRECTS',
+    'DRM_EVENT_CRTC_SEQUENCE', 'DRM_EVENT_FLIP_COMPLETE',
+    'DRM_EVENT_VBLANK', 'DRM_IOCTL_AGP_ACQUIRE',
+    'DRM_IOCTL_AGP_RELEASE', 'DRM_IOCTL_BASE',
+    'DRM_IOCTL_DROP_MASTER', 'DRM_IOCTL_SET_MASTER', 'DRM_MAX_ORDER',
+    'DRM_MIN_ORDER', 'DRM_NAME', 'DRM_PRIME_CAP_EXPORT',
+    'DRM_PRIME_CAP_IMPORT', 'DRM_RAM_PERCENT',
+    'DRM_SYNCOBJ_CREATE_SIGNALED',
+    'DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE',
+    'DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE',
+    'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL',
+    'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT', 'RKNPU_ACTION',
+    'RKNPU_ACT_CLR_TOTAL_RW_AMOUNT', 'RKNPU_ACT_RESET',
+    'RKNPU_GET_BW_EXPECT', 'RKNPU_GET_BW_PRIORITY', 'RKNPU_GET_BW_TW',
+    'RKNPU_GET_DRV_VERSION', 'RKNPU_GET_DT_RD_AMOUNT',
+    'RKNPU_GET_DT_WR_AMOUNT', 'RKNPU_GET_FREE_SRAM_SIZE',
+    'RKNPU_GET_FREQ', 'RKNPU_GET_HW_VERSION', 'RKNPU_GET_IOMMU_EN',
+    'RKNPU_GET_TOTAL_RW_AMOUNT', 'RKNPU_GET_TOTAL_SRAM_SIZE',
+    'RKNPU_GET_VOLT', 'RKNPU_GET_WT_RD_AMOUNT', 'RKNPU_INT_CLEAR',
+    'RKNPU_IOCTL_H', 'RKNPU_IOC_MAGIC', 'RKNPU_JOB_BLOCK',
+    'RKNPU_JOB_FENCE_IN', 'RKNPU_JOB_FENCE_OUT', 'RKNPU_JOB_MASK',
+    'RKNPU_JOB_NONBLOCK', 'RKNPU_JOB_PC', 'RKNPU_JOB_PINGPONG',
+    'RKNPU_JOB_SLAVE', 'RKNPU_MEM_CACHEABLE', 'RKNPU_MEM_CONTIGUOUS',
+    'RKNPU_MEM_CREATE', 'RKNPU_MEM_DESTROY', 'RKNPU_MEM_IOMMU',
+    'RKNPU_MEM_KERNEL_MAPPING', 'RKNPU_MEM_MAP', 'RKNPU_MEM_MASK',
+    'RKNPU_MEM_NON_CACHEABLE', 'RKNPU_MEM_NON_CONTIGUOUS',
+    'RKNPU_MEM_NON_DMA32', 'RKNPU_MEM_SECURE', 'RKNPU_MEM_SYNC',
+    'RKNPU_MEM_SYNC_FROM_DEVICE', 'RKNPU_MEM_SYNC_MASK',
+    'RKNPU_MEM_SYNC_TO_DEVICE', 'RKNPU_MEM_TRY_ALLOC_SRAM',
+    'RKNPU_MEM_WRITE_COMBINE', 'RKNPU_MEM_ZEROING',
+    'RKNPU_OFFSET_CLR_ALL_RW_AMOUNT', 'RKNPU_OFFSET_DT_RD_AMOUNT',
+    'RKNPU_OFFSET_DT_WR_AMOUNT', 'RKNPU_OFFSET_ENABLE_MASK',
+    'RKNPU_OFFSET_INT_CLEAR', 'RKNPU_OFFSET_INT_MASK',
+    'RKNPU_OFFSET_INT_RAW_STATUS', 'RKNPU_OFFSET_INT_STATUS',
+    'RKNPU_OFFSET_PC_DATA_ADDR', 'RKNPU_OFFSET_PC_DATA_AMOUNT',
+    'RKNPU_OFFSET_PC_DMA_BASE_ADDR', 'RKNPU_OFFSET_PC_OP_EN',
+    'RKNPU_OFFSET_PC_TASK_CONTROL', 'RKNPU_OFFSET_PC_TASK_STATUS',
+    'RKNPU_OFFSET_VERSION', 'RKNPU_OFFSET_VERSION_NUM',
+    'RKNPU_OFFSET_WT_RD_AMOUNT', 'RKNPU_PC_DATA_EXTRA_AMOUNT',
+    'RKNPU_POWER_OFF', 'RKNPU_POWER_ON', 'RKNPU_SET_BW_EXPECT',
+    'RKNPU_SET_BW_PRIORITY', 'RKNPU_SET_BW_TW', 'RKNPU_SET_FREQ',
+    'RKNPU_SET_PROC_NICE', 'RKNPU_SET_VOLT', 'RKNPU_SUBMIT',
+    '_DRM_ADD_COMMAND', '_DRM_AGP', '_DRM_AGP_BUFFER',
+    '_DRM_CONSISTENT', '_DRM_CONTAINS_LOCK', '_DRM_CONTEXT_2DONLY',
+    '_DRM_CONTEXT_PRESERVED', '_DRM_DMA_BLOCK', '_DRM_DMA_LARGER_OK',
+    '_DRM_DMA_PRIORITY', '_DRM_DMA_SMALLER_OK', '_DRM_DMA_WAIT',
+    '_DRM_DMA_WHILE_LOCKED', '_DRM_DRIVER', '_DRM_FB_BUFFER',
+    '_DRM_FRAME_BUFFER', '_DRM_HALT_ALL_QUEUES',
+    '_DRM_HALT_CUR_QUEUES', '_DRM_H_', '_DRM_INST_HANDLER',
+    '_DRM_KERNEL', '_DRM_LOCKED', '_DRM_LOCK_CONT', '_DRM_LOCK_FLUSH',
+    '_DRM_LOCK_FLUSH_ALL', '_DRM_LOCK_HELD', '_DRM_LOCK_QUIESCENT',
+    '_DRM_LOCK_READY', '_DRM_PAGE_ALIGN', '_DRM_PCI_BUFFER_RO',
+    '_DRM_POST_MODESET', '_DRM_PRE_MODESET', '_DRM_READ_ONLY',
+    '_DRM_REGISTERS', '_DRM_REMOVABLE', '_DRM_RESTRICTED',
+    '_DRM_RM_COMMAND', '_DRM_SCATTER_GATHER', '_DRM_SG_BUFFER',
+    '_DRM_SHM', '_DRM_STAT_BYTE', '_DRM_STAT_CLOSES',
+    '_DRM_STAT_COUNT', '_DRM_STAT_DMA', '_DRM_STAT_IOCTLS',
+    '_DRM_STAT_IRQ', '_DRM_STAT_LOCK', '_DRM_STAT_LOCKS',
+    '_DRM_STAT_MISSED', '_DRM_STAT_OPENS', '_DRM_STAT_PRIMARY',
+    '_DRM_STAT_SECONDARY', '_DRM_STAT_SPECIAL', '_DRM_STAT_UNLOCKS',
+    '_DRM_STAT_VALUE', '_DRM_UNINST_HANDLER', '_DRM_VBLANK_ABSOLUTE',
+    '_DRM_VBLANK_EVENT', '_DRM_VBLANK_FLAGS_MASK', '_DRM_VBLANK_FLIP',
+    '_DRM_VBLANK_HIGH_CRTC_MASK', '_DRM_VBLANK_HIGH_CRTC_SHIFT',
+    '_DRM_VBLANK_NEXTONMISS', '_DRM_VBLANK_RELATIVE',
+    '_DRM_VBLANK_SECONDARY', '_DRM_VBLANK_SIGNAL',
+    '_DRM_VBLANK_TYPES_MASK', '_DRM_WRITE_COMBINING', '_IO', '_IOR',
+    '_IOW', '_IOWR', '__user', 'c__EA_drm_drawable_info_type_t',
+    'drm_agp_binding_t', 'drm_agp_buffer_t', 'drm_agp_info_t',
+    'drm_agp_mode_t', 'drm_auth_t', 'drm_block_t',
+    'drm_buf_desc_flags', 'drm_buf_desc_flags_t',
+    'drm_buf_desc_flags_t__enumvalues', 'drm_buf_desc_t',
+    'drm_buf_free_t', 'drm_buf_info_t', 'drm_buf_map_t',
+    'drm_buf_pub_t', 'drm_client_t', 'drm_clip_rect_t',
+    'drm_context_t', 'drm_control_func', 'drm_control_func_t',
+    'drm_control_func_t__enumvalues', 'drm_control_t',
+    'drm_ctx_flags', 'drm_ctx_flags_t', 'drm_ctx_flags_t__enumvalues',
+    'drm_ctx_priv_map_t', 'drm_ctx_res_t', 'drm_ctx_t',
+    'drm_dma_flags', 'drm_dma_flags_t', 'drm_dma_flags_t__enumvalues',
+    'drm_dma_t', 'drm_draw_t', 'drm_drawable_info_t',
+    'drm_drawable_info_type_t',
+    'drm_drawable_info_type_t__enumvalues', 'drm_drawable_t',
+    'drm_handle_t', 'drm_hw_lock_t', 'drm_irq_busid_t', 'drm_list_t',
+    'drm_lock_flags', 'drm_lock_flags_t',
+    'drm_lock_flags_t__enumvalues', 'drm_lock_t', 'drm_magic_t',
+    'drm_map_flags', 'drm_map_flags_t', 'drm_map_flags_t__enumvalues',
+    'drm_map_t', 'drm_map_type', 'drm_map_type_t',
+    'drm_map_type_t__enumvalues', 'drm_scatter_gather_t',
+    'drm_set_version_t', 'drm_stat_type', 'drm_stat_type_t',
+    'drm_stat_type_t__enumvalues', 'drm_stats_t', 'drm_tex_region_t',
+    'drm_unique_t', 'drm_update_draw_t', 'drm_vblank_seq_type',
+    'drm_vblank_seq_type_t', 'drm_vblank_seq_type_t__enumvalues',
+    'drm_version_t', 'drm_wait_vblank_t', 'e_rknpu_action',
+    'e_rknpu_job_mode', 'e_rknpu_mem_sync_mode', 'e_rknpu_mem_type',
+    'struct_drm_agp_binding', 'struct_drm_agp_buffer',
+    'struct_drm_agp_info', 'struct_drm_agp_mode', 'struct_drm_auth',
+    'struct_drm_block', 'struct_drm_buf_desc', 'struct_drm_buf_free',
+    'struct_drm_buf_info', 'struct_drm_buf_map', 'struct_drm_buf_pub',
+    'struct_drm_client', 'struct_drm_clip_rect', 'struct_drm_control',
+    'struct_drm_crtc_get_sequence', 'struct_drm_crtc_queue_sequence',
+    'struct_drm_ctx', 'struct_drm_ctx_priv_map', 'struct_drm_ctx_res',
+    'struct_drm_dma', 'struct_drm_draw', 'struct_drm_drawable_info',
+    'struct_drm_event', 'struct_drm_event_crtc_sequence',
+    'struct_drm_event_vblank', 'struct_drm_gem_close',
+    'struct_drm_gem_flink', 'struct_drm_gem_open',
+    'struct_drm_get_cap', 'struct_drm_hw_lock',
+    'struct_drm_irq_busid', 'struct_drm_list', 'struct_drm_lock',
+    'struct_drm_map', 'struct_drm_modeset_ctl',
+    'struct_drm_prime_handle', 'struct_drm_scatter_gather',
+    'struct_drm_set_client_cap', 'struct_drm_set_version',
+    'struct_drm_stats', 'struct_drm_stats_0',
+    'struct_drm_syncobj_array', 'struct_drm_syncobj_create',
+    'struct_drm_syncobj_destroy', 'struct_drm_syncobj_handle',
+    'struct_drm_syncobj_wait', 'struct_drm_tex_region',
+    'struct_drm_unique', 'struct_drm_update_draw',
+    'struct_drm_version', 'struct_drm_wait_vblank_reply',
+    'struct_drm_wait_vblank_request', 'struct_rknpu_action',
+    'struct_rknpu_mem_create', 'struct_rknpu_mem_destroy',
+    'struct_rknpu_mem_map', 'struct_rknpu_mem_sync',
+    'struct_rknpu_subcore_task', 'struct_rknpu_submit',
+    'struct_rknpu_task', 'union_drm_wait_vblank']

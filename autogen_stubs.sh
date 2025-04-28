@@ -95,10 +95,15 @@ generate_cuda() {
 }
 
 generate_rockchip() {
-  clang2py /usr/local/include/rknn_api.h /usr/local/include/rknn_custom_op.h /usr/local/include/rknn_matmul_api.h -o $BASE/rockchip.py -l /usr/lib/librknnrt.so
+  clang2py extra/rockchip/rknpu_ioctl.h extra/rockchip/drm.h -o $BASE/rockchip.py -k cdefstum
   fixup $BASE/rockchip.py
-  sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/rockchip.py
-  python3 -c "import tinygrad.runtime.autogen.rockchip"
+  sed -i "s\import ctypes\import ctypes, os\g" $BASE/rockchip.py
+  sed -i "s/import fcntl, functools/import functools/g" $BASE/rockchip.py
+  sed -i "/import functools/a from tinygrad.runtime.support.hcq import FileIOInterface" $BASE/rockchip.py
+  sed -i "s/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd, \*\*kwargs):/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:FileIOInterface, \*\*kwargs):/g" $BASE/rockchip.py
+  sed -i "s/fcntl.ioctl(__fd, (__idir<<30)/__fd.ioctl((__idir<<30)/g" $BASE/rockchip.py
+  python3 -c "import tinygrad.runtime.autogen.rockchip"  
+
 }
 
 generate_nvrtc() {
