@@ -1,111 +1,90 @@
 import platform
+from tinygrad.helpers import init_c_var, from_mv, init_c_struct_t, getenv
 from tinygrad.device import Compiled, Compiler, LRUAllocator, Renderer, Allocator
 from tinygrad.engine.jit import MultiGraphRunner
 from tinygrad.runtime.autogen import rockchip as rk
 import ctypes as ct 
-import os, mmap
+import os, mmap, functools
 import fcntl
-from tinygrad.runtime.support.hcq import HCQBuffer
 from typing import Any, cast, ClassVar
 from tinygrad.runtime.support.hcq import FileIOInterface
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, prod, fromimport
+from tinygrad.runtime.autogen import libc
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
-  def render(self, uops:list) -> str: return ""
+  def render(self, uops:list) -> str: 
+    print('renderer')
+    return ""
 
-class rknn_sdk_version(ct.Structure):
-    _fields_ = [("version", ct.c_char * 64)]
-    
+class RockchipBuffer:
+  def __init__(self, va_addr:int, fd:int, size:int, offset:int=0):
+    print('rockchip buffer')
+    self.va_addr, self.size, self.offset = va_addr, size, offset
 
-class RockchipProgram:
-  def __init__(self, name:str, lib:bytes): 
-   
-    pass
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
-    return 1e-4
 
 class RockchipDevice(Compiled):
-  def get_struct(self, argp, stype):
-    return ct.cast(ct.c_void_p(argp), ct.POINTER(stype)).contents
 
-
-  def __init__(self, device:str): 
-
-    # self.ctx = ct.c_ulong(0)
-    # self.ctx_ptr = ct.pointer(self.ctx)
-
+  def __init__(self, device:str=""):
+    print('rockchip device')
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
-    hw_version = rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, type=rk.RKNPU_GET_DRV_VERSION, flags=rk.RKNPU_GET_HW_VERSION)
-    # version = rk.DRM_IOCTL_VERSION(self.fd_ctl)
-    print("HW Version: ", hw_version.value)
-
-    # fd = os.open(f"/dev/dri/card1", os.O_RDWR)
+    self.dma_ctl = FileIOInterface(f"/dev/dma_heap/system", os.O_RDWR)
     
+    super().__init__(device, RockchipAllocator(self), RockchipRenderer(), Compiler(), functools.partial(RockchipProgram, self))
+
+
+class RockchipProgram:
+  def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
+    print('rockchip program')
+    self.dev, self.lib = dev, lib
+    MatmulKernelArray =  rk.struct_ggml_rknpu2_matmul_kernel * rk.GGML_RKNPU2_MAX_MATMUL_KERNELS
+    self.matmul_kernels = MatmulKernelArray()
+
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     
-    # Hook LIBC
-    # libc = ct.CDLL(ct.util.find_library("c"))
-    # processor = platform.processor()
-    # IOCTL_SYSCALL = {"aarch64": 0x1d, "x86_64":16}[processor]
+    print(self.matmul_kernels[0].matmul_info)
 
-    # print(fd_ctl)
+    print('call', global_size, local_size)
+    return 1e-4
 
-    # ret = fcntl.ioctl(fd, 3221775424, my_struct)
-    # print(my_struct.flags)
-    # print(my_struct.value)
-    # # hook ioctl
 
-    # fd = os.open("/dev/dri/card1", os.O_RDWR)
-    # # ret = ioctl(fd, DRM_IOCTL_VERSION, &dv);
-    # data = self.get_struct( rk.struct_rknpu_mem_create)
-
-    
-    # import fcntl
-    # # ret = libc.syscall(IOCTL_SYSCALL, ct.c_int(fd), rk.IOCTL_RKNPU_MEM_CREATE, data)
- 
-    
-    # # rk.DRM_IOCTL_RKNPU_ACTION(fd_ctl, type=rk.RKNPU_ACT_RESET, value = ct.addressof(my_struct), sizebytes=ct.sizeof(my_struct))
-
-    # with open('/root/tinygrad/extra/rockchip/mobilenet_v1.rknn', 'rb') as f:
-    #   file_data = f.read()
-    #   rk.rknn_init(self.ctx_ptr, ct.cast(ct.create_string_buffer(file_data + b'\0'), ct.c_char_p), len(file_data), 0, None)
-      
-    #   sdk_ver = rk.rknn_sdk_version()
-    #   rk.rknn_query(self.ctx, rk.RKNN_QUERY_SDK_VERSION, ct.byref(sdk_ver), ct.sizeof(sdk_ver))
-    #   print(f"SDK Version: {sdk_ver.api_version}")
-    #   rk.rknn_run(self.ctx, None)
-
-    super().__init__(device, RockchipAllocator(self), RockchipRenderer(), Compiler(), RockchipProgram, RockchipGraph)
-
-class RockchipTextureInfo:
-  def __init__(self, pitch:int, real_stride:int, desc:list[int], ibo:list[int]):
-    self.pitch, self.real_stride, self.desc, self.ibo = pitch, real_stride, desc, ibo
-
-class RockchipAllocator(LRUAllocator):
+class RockchipAllocator(Allocator):
   def __init__(self, dev:RockchipDevice):
     self.dev = dev
-    super().__init__()  
+    super().__init__()    
   dev = None
+
   def _alloc(self, size, options): 
-    print(size)
+    import os
+    print('alloc', size)    
+    # mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.dev.fd_ctl, size=size, flags=rk.RKNPU_MEM_NON_CACHEABLE)
+    # mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.dev.fd_ctl, handle=mem_create.handle, offset=0)
+    # va_addr = self.dev.fd_ctl.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset=mem_map.offset)
+    
+    #buf_data = rk.struct_dma_heap_allocation_data()
+    
+    # ct.memset(ct.byref(buf_data), 0, ct.sizeof(buf_data))
 
-    mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.dev.fd_ctl, size=size, flags= rk.RKNPU_MEM_NON_CACHEABLE)
-    mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.dev.fd_ctl, handle=mem_create.handle, offset=0)
-    va_addr = self.dev.fd_ctl.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, offset=mem_map.offset)
-    return HCQBuffer(va_addr=va_addr, size=size, meta=mem_map)
+    ret = rk.DMA_HEAP_IOCTL_ALLOC(self.dev.dma_ctl, len = size, fd_flags = os.O_CLOEXEC | os.O_RDWR)
+  
+    #self.dev.fd_ctl.mmap(None, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, buf_data.fd, 0)
+    va_addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, ret.fd, 0)
 
-  def _do_copy(self, src_addr, dest_addr, src_size, real_size, src_stride, dest_stride, dest_off=0, src_off=0):
-    while src_off < src_size:
-      ct.memmove(dest_addr+dest_off, src_addr+src_off, real_size)
-      src_off, dest_off = src_off+src_stride, dest_off+dest_stride
-
+    return RockchipBuffer(va_addr, ret.fd, size, offset=0)
+    pass
   def _copyin(self, dest, src:memoryview): 
-    stride, pitch = (src.nbytes, src.nbytes) if (ti:=cast(RockchipTextureInfo, dest.texture_info)) is None else (ti.real_stride, ti.pitch)
-    self._do_copy(mv_address(src), dest.va_addr, src.nbytes, stride, stride, pitch)
-
+    print('copyin')
+    # uint64_t flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW  
+    # print(my_uint64)
+    rk.DMA_BUF_IOCTL_SYNC(self.dev.dma_ctl, data =ct.c_uint64( rk.DMA_BUF_SYNC_START | rk.DMA_BUF_SYNC_RW))
+    
+    # ct.memmove(dest, from_mv(src), src.nbytes)
+    
   def _copyout(self, dest:memoryview, src): 
-    self.dev.synchronize()
-    stride, pitch = (src.size, src.size) if (ti:=cast(RockchipTextureInfo, src.texture_info)) is None else (ti.real_stride, ti.pitch)
-    self._do_copy(src.va_addr, mv_address(dest), src.size, stride, pitch, stride)
+    print('copyout')
+    rk.DMA_BUF_IOCTL_SYNC(self.dev.dma_ctl, data =ct.c_uint64( rk.DMA_BUF_SYNC_END | rk.DMA_BUF_SYNC_RW))
+    # rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.dev.fd_ctl, obj_addr=src, flags=rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    # ct.memmove(src, from_mv(dest), dest.nbytes)
+
 
   def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
     print('transfer')

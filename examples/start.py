@@ -1,3 +1,7 @@
 from tinygrad import Tensor
-rand = Tensor.rand(2, 3) # create a tensor of shape (2, 3) filled with random values from a uniform distribution
-print(rand.numpy())
+# rand = Tensor.rand(2, 3) # create a tensor of shape (2, 3) filled with random values from a uniform distribution
+t4 = Tensor([1, 2, 3, 4, 5])
+# t5 = (t4 + 1) * 2
+# t6 = (t5 * t4).relu().log_softmax()
+# print(t6.numpy())
+print(t4.numpy())

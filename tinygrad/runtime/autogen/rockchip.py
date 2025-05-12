@@ -2021,8 +2021,183 @@ struct_rknpu_action._fields_ = [
 
 DRM_IOCTL_RKNPU_ACTION = DRM_IOWR ( 0x40 + 0x00 , struct_rknpu_action ) # macro (from list)
 IOCTL_RKNPU_ACTION = RKNPU_IOWR ( 0x00 , struct_rknpu_action ) # macro (from list)
+DMA_HEAP_IOC_MAGIC = 'H' # macro
+DMA_BUF_SYNC_READ = (1<<0) # macro
+DMA_BUF_SYNC_WRITE = (2<<0) # macro
+DMA_BUF_SYNC_RW = ((1<<0)|(2<<0)) # macro
+DMA_BUF_SYNC_START = (0<<2) # macro
+DMA_BUF_SYNC_END = (1<<2) # macro
+DMA_BUF_BASE = 'b' # macro
+CMA_HEAP_SIZE = (1024*1024) # macro
+GGML_RKNPU2_MAX_MATMUL_KERNELS = 16 # macro
+class struct_ggml_sync_data_pack(Structure):
+    pass
+
+struct_ggml_sync_data_pack._pack_ = 1 # source:False
+struct_ggml_sync_data_pack._fields_ = [
+    ('data', ctypes.c_uint64),
+]
+
+DMA_BUF_IOCTL_SYNC = _IOW ( 'b' , 0 , struct_ggml_sync_data_pack ) # macro (from list)
+class struct_ggml_rknpu2_data_pack(Structure):
+    pass
+
+class struct__rknn_tensor_memory(Structure):
+    pass
+
+
+# values for enumeration '_rknn_tensor_type'
+_rknn_tensor_type__enumvalues = {
+    0: 'RKNN_TENSOR_FLOAT32',
+    1: 'RKNN_TENSOR_FLOAT16',
+    2: 'RKNN_TENSOR_INT8',
+    3: 'RKNN_TENSOR_UINT8',
+    4: 'RKNN_TENSOR_INT16',
+    5: 'RKNN_TENSOR_UINT16',
+    6: 'RKNN_TENSOR_INT32',
+    7: 'RKNN_TENSOR_UINT32',
+    8: 'RKNN_TENSOR_INT64',
+    9: 'RKNN_TENSOR_BOOL',
+    10: 'RKNN_TENSOR_INT4',
+    11: 'RKNN_TENSOR_BFLOAT16',
+    12: 'RKNN_TENSOR_TYPE_MAX',
+}
+RKNN_TENSOR_FLOAT32 = 0
+RKNN_TENSOR_FLOAT16 = 1
+RKNN_TENSOR_INT8 = 2
+RKNN_TENSOR_UINT8 = 3
+RKNN_TENSOR_INT16 = 4
+RKNN_TENSOR_UINT16 = 5
+RKNN_TENSOR_INT32 = 6
+RKNN_TENSOR_UINT32 = 7
+RKNN_TENSOR_INT64 = 8
+RKNN_TENSOR_BOOL = 9
+RKNN_TENSOR_INT4 = 10
+RKNN_TENSOR_BFLOAT16 = 11
+RKNN_TENSOR_TYPE_MAX = 12
+_rknn_tensor_type = ctypes.c_uint32 # enum
+struct_ggml_rknpu2_data_pack._pack_ = 1 # source:False
+struct_ggml_rknpu2_data_pack._fields_ = [
+    ('type', _rknn_tensor_type),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('ordered_data', ctypes.POINTER(None)),
+    ('initialized', ctypes.c_int32),
+    ('PADDING_1', ctypes.c_ubyte * 4),
+    ('B', ctypes.POINTER(struct__rknn_tensor_memory)),
+]
+
+struct__rknn_tensor_memory._pack_ = 1 # source:False
+struct__rknn_tensor_memory._fields_ = [
+    ('virt_addr', ctypes.POINTER(None)),
+    ('phys_addr', ctypes.c_uint64),
+    ('fd', ctypes.c_int32),
+    ('offset', ctypes.c_int32),
+    ('size', ctypes.c_uint32),
+    ('flags', ctypes.c_uint32),
+    ('priv_data', ctypes.POINTER(None)),
+]
+
+class struct_ggml_rknpu2_matmul_kernel(Structure):
+    pass
+
+class struct_rknn_matmul_info_t(Structure):
+    pass
+
+
+# values for enumeration '_rknn_matmul_type'
+_rknn_matmul_type__enumvalues = {
+    1: 'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
+    2: 'RKNN_INT8_MM_INT8_TO_INT32',
+    3: 'RKNN_INT8_MM_INT8_TO_INT8',
+    4: 'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
+    5: 'RKNN_FLOAT16_MM_INT8_TO_FLOAT32',
+    6: 'RKNN_FLOAT16_MM_INT8_TO_FLOAT16',
+    7: 'RKNN_FLOAT16_MM_INT4_TO_FLOAT32',
+    8: 'RKNN_FLOAT16_MM_INT4_TO_FLOAT16',
+    9: 'RKNN_INT8_MM_INT8_TO_FLOAT32',
+    10: 'RKNN_INT4_MM_INT4_TO_INT16',
+    11: 'RKNN_INT8_MM_INT4_TO_INT32',
+    12: 'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
+    15: 'RKNN_INT8_MM_INT4_TO_FLOAT16',
+}
+RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 = 1
+RKNN_INT8_MM_INT8_TO_INT32 = 2
+RKNN_INT8_MM_INT8_TO_INT8 = 3
+RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16 = 4
+RKNN_FLOAT16_MM_INT8_TO_FLOAT32 = 5
+RKNN_FLOAT16_MM_INT8_TO_FLOAT16 = 6
+RKNN_FLOAT16_MM_INT4_TO_FLOAT32 = 7
+RKNN_FLOAT16_MM_INT4_TO_FLOAT16 = 8
+RKNN_INT8_MM_INT8_TO_FLOAT32 = 9
+RKNN_INT4_MM_INT4_TO_INT16 = 10
+RKNN_INT8_MM_INT4_TO_INT32 = 11
+RKNN_FLOAT16_MM_INT4_TO_BFLOAT16 = 12
+RKNN_INT8_MM_INT4_TO_FLOAT16 = 15
+_rknn_matmul_type = ctypes.c_uint32 # enum
+struct_rknn_matmul_info_t._pack_ = 1 # source:False
+struct_rknn_matmul_info_t._fields_ = [
+    ('M', ctypes.c_int32),
+    ('K', ctypes.c_int32),
+    ('N', ctypes.c_int32),
+    ('type', _rknn_matmul_type),
+    ('B_layout', ctypes.c_int16),
+    ('B_quant_type', ctypes.c_int16),
+    ('AC_layout', ctypes.c_int16),
+    ('AC_quant_type', ctypes.c_int16),
+    ('iommu_domain_id', ctypes.c_int32),
+    ('group_size', ctypes.c_int16),
+    ('reserved', ctypes.c_byte * 34),
+]
+
+class struct__rknn_matmul_io_attr(Structure):
+    pass
+
+class struct__rknn_matmul_tensor_attr(Structure):
+    pass
+
+struct__rknn_matmul_tensor_attr._pack_ = 1 # source:False
+struct__rknn_matmul_tensor_attr._fields_ = [
+    ('name', ctypes.c_ubyte * 256),
+    ('n_dims', ctypes.c_uint32),
+    ('dims', ctypes.c_uint32 * 16),
+    ('size', ctypes.c_uint32),
+    ('type', _rknn_tensor_type),
+]
+
+struct__rknn_matmul_io_attr._pack_ = 1 # source:False
+struct__rknn_matmul_io_attr._fields_ = [
+    ('A', struct__rknn_matmul_tensor_attr),
+    ('B', struct__rknn_matmul_tensor_attr),
+    ('C', struct__rknn_matmul_tensor_attr),
+]
+
+struct_ggml_rknpu2_matmul_kernel._pack_ = 1 # source:False
+struct_ggml_rknpu2_matmul_kernel._fields_ = [
+    ('matmul_info', struct_rknn_matmul_info_t),
+    ('matmul_ctx', ctypes.c_uint64),
+    ('matmul_io_attr', struct__rknn_matmul_io_attr),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('A', ctypes.POINTER(struct__rknn_tensor_memory)),
+    ('C', ctypes.POINTER(struct__rknn_tensor_memory)),
+]
+
+class struct_dma_heap_allocation_data(Structure):
+    pass
+
+struct_dma_heap_allocation_data._pack_ = 1 # source:False
+struct_dma_heap_allocation_data._fields_ = [
+    ('len', ctypes.c_uint64),
+    ('fd', ctypes.c_uint32),
+    ('fd_flags', ctypes.c_uint32),
+    ('heap_flags', ctypes.c_uint64),
+]
+
+DMA_HEAP_IOCTL_ALLOC = _IOWR ( 'H' , 0x0 , struct_dma_heap_allocation_data ) # macro (from list)
 __all__ = \
-    ['DRM_CAP_ADDFB2_MODIFIERS', 'DRM_CAP_ASYNC_PAGE_FLIP',
+    ['CMA_HEAP_SIZE', 'DMA_BUF_BASE', 'DMA_BUF_SYNC_END',
+    'DMA_BUF_SYNC_READ', 'DMA_BUF_SYNC_RW', 'DMA_BUF_SYNC_START',
+    'DMA_BUF_SYNC_WRITE', 'DMA_HEAP_IOC_MAGIC',
+    'DRM_CAP_ADDFB2_MODIFIERS', 'DRM_CAP_ASYNC_PAGE_FLIP',
     'DRM_CAP_CRTC_IN_VBLANK_EVENT', 'DRM_CAP_CURSOR_HEIGHT',
     'DRM_CAP_CURSOR_WIDTH', 'DRM_CAP_DUMB_BUFFER',
     'DRM_CAP_DUMB_PREFERRED_DEPTH', 'DRM_CAP_DUMB_PREFER_SHADOW',
@@ -2125,6 +2300,21 @@ __all__ = \
     'DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE',
     'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL',
     'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT', 'FORMAT_BLOB_CURRENT',
+    'GGML_RKNPU2_MAX_MATMUL_KERNELS',
+    'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
+    'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
+    'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
+    'RKNN_FLOAT16_MM_INT4_TO_FLOAT16',
+    'RKNN_FLOAT16_MM_INT4_TO_FLOAT32',
+    'RKNN_FLOAT16_MM_INT8_TO_FLOAT16',
+    'RKNN_FLOAT16_MM_INT8_TO_FLOAT32', 'RKNN_INT4_MM_INT4_TO_INT16',
+    'RKNN_INT8_MM_INT4_TO_FLOAT16', 'RKNN_INT8_MM_INT4_TO_INT32',
+    'RKNN_INT8_MM_INT8_TO_FLOAT32', 'RKNN_INT8_MM_INT8_TO_INT32',
+    'RKNN_INT8_MM_INT8_TO_INT8', 'RKNN_TENSOR_BFLOAT16',
+    'RKNN_TENSOR_BOOL', 'RKNN_TENSOR_FLOAT16', 'RKNN_TENSOR_FLOAT32',
+    'RKNN_TENSOR_INT16', 'RKNN_TENSOR_INT32', 'RKNN_TENSOR_INT4',
+    'RKNN_TENSOR_INT64', 'RKNN_TENSOR_INT8', 'RKNN_TENSOR_TYPE_MAX',
+    'RKNN_TENSOR_UINT16', 'RKNN_TENSOR_UINT32', 'RKNN_TENSOR_UINT8',
     'RKNPU_ACTION', 'RKNPU_ACT_CLR_TOTAL_RW_AMOUNT',
     'RKNPU_ACT_RESET', 'RKNPU_GET_BW_EXPECT', 'RKNPU_GET_BW_PRIORITY',
     'RKNPU_GET_BW_TW', 'RKNPU_GET_DRV_VERSION',
@@ -2181,7 +2371,8 @@ __all__ = \
     '_DRM_VBLANK_NEXTONMISS', '_DRM_VBLANK_RELATIVE',
     '_DRM_VBLANK_SECONDARY', '_DRM_VBLANK_SIGNAL',
     '_DRM_VBLANK_TYPES_MASK', '_DRM_WRITE_COMBINING', '_IO', '_IOR',
-    '_IOW', '_IOWR', '__user', 'c__EA_drm_drawable_info_type_t',
+    '_IOW', '_IOWR', '__user', '_rknn_matmul_type',
+    '_rknn_tensor_type', 'c__EA_drm_drawable_info_type_t',
     'drm_agp_binding_t', 'drm_agp_buffer_t', 'drm_agp_info_t',
     'drm_agp_mode_t', 'drm_auth_t', 'drm_block_t',
     'drm_buf_desc_flags', 'drm_buf_desc_flags_t',
@@ -2209,6 +2400,8 @@ __all__ = \
     'drm_vblank_seq_type_t__enumvalues', 'drm_version_t',
     'drm_wait_vblank_t', 'e_rknpu_action', 'e_rknpu_job_mode',
     'e_rknpu_mem_sync_mode', 'e_rknpu_mem_type',
+    'struct__rknn_matmul_io_attr', 'struct__rknn_matmul_tensor_attr',
+    'struct__rknn_tensor_memory', 'struct_dma_heap_allocation_data',
     'struct_drm_agp_binding', 'struct_drm_agp_buffer',
     'struct_drm_agp_info', 'struct_drm_agp_mode', 'struct_drm_auth',
     'struct_drm_block', 'struct_drm_buf_desc', 'struct_drm_buf_free',
@@ -2251,7 +2444,9 @@ __all__ = \
     'struct_drm_syncobj_wait', 'struct_drm_tex_region',
     'struct_drm_unique', 'struct_drm_update_draw',
     'struct_drm_version', 'struct_drm_wait_vblank_reply',
-    'struct_drm_wait_vblank_request', 'struct_rknpu_action',
+    'struct_drm_wait_vblank_request', 'struct_ggml_rknpu2_data_pack',
+    'struct_ggml_rknpu2_matmul_kernel', 'struct_ggml_sync_data_pack',
+    'struct_rknn_matmul_info_t', 'struct_rknpu_action',
     'struct_rknpu_mem_create', 'struct_rknpu_mem_destroy',
     'struct_rknpu_mem_map', 'struct_rknpu_mem_sync',
     'struct_rknpu_subcore_task', 'struct_rknpu_submit',
