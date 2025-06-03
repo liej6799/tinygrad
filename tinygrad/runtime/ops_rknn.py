@@ -21,12 +21,29 @@ class RKNNBuffer:
   def __init__(self, buf:Any, virt_addr:int, size:int, offset:int=0):
     self.buf, self.virt_addr, self.size, self.offset = buf, virt_addr, size, offset
 
-
 class RKNNDevice(Compiled):
 
   def __init__(self, device:str="", ctx=None):
     print('RKNN device')
     self.ctx = ct.c_ulong()
+
+    ROW_A = 1
+    COL_A = 32
+    COL_B = 32
+
+    info = rknn.struct_rknn_matmul_info_t()
+    ct.memset(ct.byref(info), 0, ct.sizeof(rknn.struct_rknn_matmul_info_t))
+    info.M = ROW_A
+    info.K = COL_A
+    info.N = COL_B
+    info.type = rk.RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32
+    info.B_layout = 0
+    info.AC_layout = 0
+
+    self.io_attr = rknn.struct__rknn_matmul_io_attr()
+    ct.memset(ct.byref(self.io_attr), 0, ct.sizeof(rknn.struct__rknn_matmul_io_attr))
+    rknn.rknn_matmul_create(self.ctx, info, self.io_attr)
+    rknn.rknn_matmul_set_core_mask(self.ctx, rknn.RKNN_NPU_CORE_0_1_2)
 
     super().__init__(device, RKNNAllocator(self), RKNNRenderer(), Compiler(), functools.partial(RKNNProgram, self))
 
@@ -55,18 +72,11 @@ class RKNNAllocator(Allocator):
   def _alloc(self, size, options): 
     buf = rknn.rknn_create_mem(self.dev.ctx, size)
     return RKNNBuffer(buf, buf.contents.virt_addr, size)  # Placeholder for actual buffer allocation logic)
-    pass
-  def _copyin(self, dest:RKNNBuffer, src:memoryview): 
+
+  def _copyin(self, dest, src:memoryview): 
     ct.memmove(dest.virt_addr, from_mv(src), src.nbytes)
     
-  def _copyout(self, dest:memoryview, src:RKNNBuffer): 
+  def _copyout(self, dest:memoryview, src): 
     ct.memmove(from_mv(src), dest.virt_addr, dest.size)
 
-
-  def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
-    print('transfer')
-    pass    
-
-class RKNNGraph(MultiGraphRunner):
-  def __call__(self, input_rawbuffers, var_vals, wait=False) -> float|None: return 1e-3
 
