@@ -21,6 +21,7 @@ class RKNNBuffer:
   def __init__(self, buf:Any, virt_addr:int, size:int, offset:int=0):
     self.buf, self.virt_addr, self.size, self.offset = buf, virt_addr, size, offset
 
+
 class RKNNDevice(Compiled):
 
   def __init__(self, device:str="", ctx=None):
@@ -30,6 +31,7 @@ class RKNNDevice(Compiled):
     ROW_A = 1
     COL_A = 32
     COL_B = 32
+
 
     info = rknn.struct_rknn_matmul_info_t()
     ct.memset(ct.byref(info), 0, ct.sizeof(rknn.struct_rknn_matmul_info_t))
@@ -68,15 +70,22 @@ class RKNNAllocator(Allocator):
     self.dev = dev
     super().__init__()    
   dev = None
-
+  def _as_buffer(self, src:RKNNBuffer) -> memoryview: return to_mv(src.virt_addr, src.size)
   def _alloc(self, size, options): 
     buf = rknn.rknn_create_mem(self.dev.ctx, size)
     return RKNNBuffer(buf, buf.contents.virt_addr, size)  # Placeholder for actual buffer allocation logic)
-
-  def _copyin(self, dest, src:memoryview): 
+    pass
+  def _copyin(self, dest:RKNNBuffer, src:memoryview): 
     ct.memmove(dest.virt_addr, from_mv(src), src.nbytes)
     
-  def _copyout(self, dest:memoryview, src): 
+  def _copyout(self, dest:memoryview, src:RKNNBuffer): 
     ct.memmove(from_mv(src), dest.virt_addr, dest.size)
 
+
+  def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
+    print('transfer')
+    pass    
+
+class RKNNGraph(MultiGraphRunner):
+  def __call__(self, input_rawbuffers, var_vals, wait=False) -> float|None: return 1e-3
 
