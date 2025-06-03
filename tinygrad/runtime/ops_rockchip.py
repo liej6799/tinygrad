@@ -22,6 +22,7 @@ class RockchipBuffer:
     self.va_addr, self.size, self.offset = va_addr, size, offset
 
 
+
 class RockchipDevice(Compiled):
 
   def __init__(self, device:str=""):

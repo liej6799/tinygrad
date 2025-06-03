@@ -102,7 +102,7 @@ class DSPAllocator(Allocator):
   def _alloc(self, size:int, options:BufferSpec):
     b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
     share_info = qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)
-    va_addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, share_info.fd, 0)
+    va_addr = ƒ.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, share_info.fd, 0)
     return DSPBuffer(va_addr, size, share_info, offset=0)
 
   def _free(self, opaque:DSPBuffer, options:BufferSpec):
