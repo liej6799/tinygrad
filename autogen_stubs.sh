@@ -95,7 +95,7 @@ generate_cuda() {
 }
 
 generate_rockchip() {
-  clang2py  extra/rockchip/drm_mode.h extra/rockchip/drm.h extra/rockchip/rknpu_ioctl.h extra/rockchip/ggml_rknpu.h -o $BASE/rockchip.py -k cdefstum 
+  clang2py  extra/rockchip/drm_mode.h extra/rockchip/drm.h extra/rockchip/rknpu_ioctl.h extra/rockchip/ggml_rknpu.h extra/rockchip/npu_cna.h extra/rockchip/npu_dpu.h extra/rockchip/npu_hw.h -o $BASE/rockchip.py -k cdefstum 
   fixup $BASE/rockchip.py
   sed -i "s\import ctypes\import ctypes, os\g" $BASE/rockchip.py
   sed -i "s/import fcntl, functools/import functools/g" $BASE/rockchip.py

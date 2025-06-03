@@ -2193,10 +2193,339 @@ struct_dma_heap_allocation_data._fields_ = [
 ]
 
 DMA_HEAP_IOCTL_ALLOC = _IOWR ( 'H' , 0x0 , struct_dma_heap_allocation_data ) # macro (from list)
+NPU_CNA_H = True # macro
+class struct_npu_cna_desc(Structure):
+    pass
+
+struct_npu_cna_desc._pack_ = 1 # source:False
+struct_npu_cna_desc._fields_ = [
+    ('enable', ctypes.c_ubyte),
+    ('conv_mode', ctypes.c_ubyte),
+    ('in_precision', ctypes.c_ubyte),
+    ('proc_precision', ctypes.c_ubyte),
+    ('kernel_groups', ctypes.c_ubyte),
+    ('PADDING_0', ctypes.c_ubyte),
+    ('feature_grains', ctypes.c_uint16),
+    ('conv_y_stride', ctypes.c_ubyte),
+    ('conv_x_stride', ctypes.c_ubyte),
+    ('datain_width', ctypes.c_uint16),
+    ('datain_height', ctypes.c_uint16),
+    ('datain_channel', ctypes.c_uint16),
+    ('dataout_width', ctypes.c_uint16),
+    ('PADDING_1', ctypes.c_ubyte * 2),
+    ('dataout_atomics', ctypes.c_uint32),
+    ('weight_bytes', ctypes.c_uint32),
+    ('weight_bytes_per_kernel', ctypes.c_uint32),
+    ('weight_width', ctypes.c_ubyte),
+    ('weight_height', ctypes.c_ubyte),
+    ('weight_kernels', ctypes.c_uint16),
+    ('weight_bank', ctypes.c_ubyte),
+    ('data_bank', ctypes.c_ubyte),
+    ('data_entries', ctypes.c_uint16),
+    ('data_sign', ctypes.c_ubyte),
+    ('cvt_type', ctypes.c_ubyte),
+    ('cvt_bypass', ctypes.c_ubyte),
+    ('PADDING_2', ctypes.c_ubyte),
+    ('cvt_scale0', ctypes.c_uint16),
+    ('cvt_scale1', ctypes.c_uint16),
+    ('cvt_scale2', ctypes.c_uint16),
+    ('cvt_scale3', ctypes.c_uint16),
+    ('fc_skip_en', ctypes.c_ubyte),
+    ('PADDING_3', ctypes.c_ubyte),
+    ('data_offset', ctypes.c_uint16),
+    ('pad_left', ctypes.c_ubyte),
+    ('pad_top', ctypes.c_ubyte),
+    ('PADDING_4', ctypes.c_ubyte * 2),
+    ('feature_base_addr', ctypes.c_uint32),
+    ('weight_offset', ctypes.c_uint16),
+    ('weight_burst_len', ctypes.c_ubyte),
+    ('data_burst_len', ctypes.c_ubyte),
+    ('line_stride', ctypes.c_uint32),
+    ('surf_stride', ctypes.c_int32),
+    ('dma_width', ctypes.c_uint16),
+    ('dma_height', ctypes.c_uint16),
+    ('dma_channel', ctypes.c_uint16),
+    ('PADDING_5', ctypes.c_ubyte * 2),
+    ('decompress_addr0', ctypes.c_uint32),
+    ('dataout_height', ctypes.c_uint16),
+    ('PADDING_6', ctypes.c_ubyte * 2),
+]
+
+npu_cna_desc = struct_npu_cna_desc
+class struct_npu_core_desc(Structure):
+    pass
+
+struct_npu_core_desc._pack_ = 1 # source:False
+struct_npu_core_desc._fields_ = [
+    ('proc_precision', ctypes.c_ubyte),
+    ('qd_en', ctypes.c_ubyte),
+    ('dataout_height', ctypes.c_uint16),
+    ('dataout_width', ctypes.c_uint16),
+    ('dataout_channel', ctypes.c_uint16),
+]
+
+npu_core_desc = struct_npu_core_desc
+class struct_nup_pc_desc(Structure):
+    pass
+
+struct_nup_pc_desc._pack_ = 1 # source:False
+struct_nup_pc_desc._fields_ = [
+    ('pc_source_addr', ctypes.c_uint32),
+    ('pc_data_amount', ctypes.c_uint32),
+]
+
+npu_pc_desc = struct_nup_pc_desc
+class struct_npu_cna_core_task(Structure):
+    pass
+
+struct_npu_cna_core_task._pack_ = 1 # source:False
+struct_npu_cna_core_task._fields_ = [
+    ('ops', ctypes.c_uint64 * 112),
+]
+
+npu_cna_core_task = struct_npu_cna_core_task
+NPU_DPU_H = True # macro
+class struct_npu_dpu_desc(Structure):
+    pass
+
+struct_npu_dpu_desc._pack_ = 1 # source:False
+struct_npu_dpu_desc._fields_ = [
+    ('burst_len', ctypes.c_ubyte),
+    ('conv_mode', ctypes.c_ubyte),
+    ('output_mode', ctypes.c_ubyte),
+    ('flying_mode', ctypes.c_ubyte),
+    ('out_precision', ctypes.c_ubyte),
+    ('in_precision', ctypes.c_ubyte),
+    ('proc_precision', ctypes.c_ubyte),
+    ('PADDING_0', ctypes.c_ubyte),
+    ('dst_base_addr', ctypes.c_uint32),
+    ('dst_surf_stride', ctypes.c_uint32),
+    ('width', ctypes.c_uint16),
+    ('height', ctypes.c_uint16),
+    ('channel', ctypes.c_uint16),
+    ('bs_bypass', ctypes.c_ubyte),
+    ('bs_alu_bypass', ctypes.c_ubyte),
+    ('bs_mul_bypass', ctypes.c_ubyte),
+    ('bs_relu_bypass', ctypes.c_ubyte),
+    ('od_bypass', ctypes.c_ubyte),
+    ('size_e_2', ctypes.c_ubyte),
+    ('size_e_1', ctypes.c_ubyte),
+    ('size_e_0', ctypes.c_ubyte),
+    ('channel_wdma', ctypes.c_uint16),
+    ('height_wdma', ctypes.c_uint16),
+    ('width_wdma', ctypes.c_uint16),
+    ('bn_relu_bypass', ctypes.c_ubyte),
+    ('bn_mul_bypass', ctypes.c_ubyte),
+    ('bn_alu_bypass', ctypes.c_ubyte),
+    ('bn_bypass', ctypes.c_ubyte),
+    ('ew_bypass', ctypes.c_ubyte),
+    ('ew_op_bypass', ctypes.c_ubyte),
+    ('ew_lut_bypass', ctypes.c_ubyte),
+    ('ew_op_cvt_bypass', ctypes.c_ubyte),
+    ('ew_relu_bypass', ctypes.c_ubyte),
+    ('fp32tofp16_en', ctypes.c_ubyte),
+    ('out_cvt_scale', ctypes.c_uint16),
+    ('surf_add', ctypes.c_uint32),
+]
+
+npu_dpu_desc = struct_npu_dpu_desc
+NPU_HW_H = True # macro
+PC_OPERATION_ENABLE = 0x0008 # macro
+PC_BASE_ADDRESS = 0x0010 # macro
+PC_REGISTER_AMOUNTS = 0x0014 # macro
+CNA_S_POINTER = 0x1004 # macro
+CNA_CONV_CON1 = 0x100C # macro
+CNA_CONV_CON2 = 0x1010 # macro
+CNA_CONV_CON3 = 0x1014 # macro
+CNA_DATA_SIZE0 = 0x1020 # macro
+CNA_DATA_SIZE1 = 0x1024 # macro
+CNA_DATA_SIZE2 = 0x1028 # macro
+CNA_DATA_SIZE3 = 0x102C # macro
+CNA_WEIGHT_SIZE0 = 0x1030 # macro
+CNA_WEIGHT_SIZE1 = 0x1034 # macro
+CNA_WEIGHT_SIZE2 = 0x1038 # macro
+CNA_CBUF_CON0 = 0x1040 # macro
+CNA_CBUF_CON1 = 0x1044 # macro
+CNA_CVT_CON0 = 0x104C # macro
+CNA_CVT_CON1 = 0x1050 # macro
+CNA_CVT_CON2 = 0x1054 # macro
+CNA_CVT_CON3 = 0x1058 # macro
+CNA_CVT_CON4 = 0x105C # macro
+CNA_FC_CON0 = 0x1060 # macro
+CNA_FC_CON1 = 0x1064 # macro
+CNA_PAD_CON0 = 0x1068 # macro
+CNA_FEATURE_DATA_ADDR = 0x1070 # macro
+CNA_FC_CON2 = 0x1074 # macro
+CNA_DMA_CON0 = 0x1078 # macro
+CNA_DMA_CON1 = 0x107C # macro
+CNA_DMA_CON2 = 0x1080 # macro
+CNA_FC_DATA_SIZE0 = 0x1084 # macro
+CNA_FC_DATA_SIZE1 = 0x1088 # macro
+CNA_DCOMP_CTRL = 0x1100 # macro
+CNA_DCOMP_REGNUM = 0x1104 # macro
+CNA_DCOMP_ADDR0 = 0x1110 # macro
+CNA_DCOMP_AMOUNT = 0x1140 # macro
+CNA_DCOMP_AMOUNT1 = 0x1144 # macro
+CNA_DCOMP_AMOUNT2 = 0x1148 # macro
+CNA_DCOMP_AMOUNT3 = 0x114C # macro
+CNA_DCOMP_AMOUNT4 = 0x1150 # macro
+CNA_DCOMP_AMOUNT5 = 0x1154 # macro
+CNA_DCOMP_AMOUNT6 = 0x1158 # macro
+CNA_DCOMP_AMOUNT7 = 0x115C # macro
+CNA_DCOMP_AMOUNT8 = 0x1160 # macro
+CNA_DCOMP_AMOUNT9 = 0x1164 # macro
+CNA_DCOMP_AMOUNT10 = 0x1168 # macro
+CNA_DCOMP_AMOUNT11 = 0x116C # macro
+CNA_DCOMP_AMOUNT12 = 0x1170 # macro
+CNA_DCOMP_AMOUNT13 = 0x1174 # macro
+CNA_DCOMP_AMOUNT14 = 0x1178 # macro
+CNA_DCOMP_AMOUNT15 = 0x117C # macro
+CNA_CVT_CON5 = 0x1180 # macro
+CNA_PAD_CON1 = 0x1184 # macro
+CORE_S_POINTER = 0x3004 # macro
+CORE_MISC_CFG = 0x3010 # macro
+CORE_DATAOUT_SIZE_0 = 0x3014 # macro
+CORE_DATAOUT_SIZE_1 = 0x3018 # macro
+CORE_CLIP_TRUNCATE = 0x301C # macro
+CORE_3030 = 0x3030 # macro
+DPU_S_POINTER = 0x4004 # macro
+DPU_FEATURE_MODE_CFG = 0x400C # macro
+DPU_DATA_FORMAT = 0x4010 # macro
+DPU_OFFSET_PEND = 0x4014 # macro
+DPU_DST_BASE_ADD = 0x4020 # macro
+DPU_DST_SURF_STRIDE = 0x4024 # macro
+DPU_DATA_CUBE_WIDTH = 0x4030 # macro
+DPU_DATA_CUBE_HEIGHT = 0x4034 # macro
+DPU_DATA_CUBE_NOTCH_ADDR = 0x4038 # macro
+DPU_DATA_CUBE_CHANNEL = 0x403C # macro
+DPU_BS_CFG = 0x4040 # macro
+DPU_BS_ALU_CFG = 0x4044 # macro
+DPU_BS_MUL_CFG = 0x4048 # macro
+DPU_BS_RELUX_CMP_VALUE = 0x404C # macro
+DPU_BS_OW_CFG = 0x4050 # macro
+DPU_BS_OW_OP = 0x4054 # macro
+DPU_WDMA_SIZE_0 = 0x4058 # macro
+DPU_WDMA_SIZE_1 = 0x405C # macro
+DPU_BN_CFG = 0x4060 # macro
+DPU_BN_ALU_CFG = 0x4064 # macro
+DPU_BN_MUL_CFG = 0x4068 # macro
+DPU_BN_RELUX_CMP_VALUE = 0x406C # macro
+DPU_EW_CFG = 0x4070 # macro
+DPU_EW_CVT_OFFSET_VALUE = 0x4074 # macro
+DPU_EW_CVT_SCALE_VALUE = 0x4078 # macro
+DPU_EW_RELUX_CMP_VALUE = 0x407C # macro
+DPU_OUT_CVT_OFFSET = 0x4080 # macro
+DPU_OUT_CVT_SCALE = 0x4084 # macro
+DPU_OUT_CVT_SHIFT = 0x4088 # macro
+DPU_EW_OP_VALUE_0 = 0x4090 # macro
+DPU_EW_OP_VALUE_1 = 0x4094 # macro
+DPU_EW_OP_VALUE_2 = 0x4098 # macro
+DPU_EW_OP_VALUE_3 = 0x409C # macro
+DPU_EW_OP_VALUE_4 = 0x40A0 # macro
+DPU_EW_OP_VALUE_5 = 0x40A4 # macro
+DPU_EW_OP_VALUE_6 = 0x40A8 # macro
+DPU_EW_OP_VALUE_7 = 0x40AC # macro
+DPU_SURFACE_ADD = 0x40C0 # macro
+DPU_40C4 = 0x40C4 # macro
+DPU_LUT_ACCESS_CFG = 0x4100 # macro
+DPU_LUT_ACCESS_DATA = 0x4104 # macro
+DPU_LUT_CFG = 0x4108 # macro
+DPU_LUT_INFO = 0x410C # macro
+DPU_LUT_LE_START = 0x4110 # macro
+DPU_LUT_LE_END = 0x4114 # macro
+DPU_LUT_LO_START = 0x4118 # macro
+DPU_LUT_LO_END = 0x411C # macro
+DPU_LUT_LE_SLOPE_SCALE = 0x4120 # macro
+DPU_LUT_LE_SLOPE_SHIFT = 0x4124 # macro
+DPU_LUT_LO_SLOPE_SCALE = 0x4128 # macro
+DPU_LUT_LO_SLOPE_SHIFT = 0x412C # macro
+BLOCK_PC = 0x0100 # macro
+BLOCK_CNA = 0x0200 # macro
+BLOCK_CORE = 0x0800 # macro
+BLOCK_DPU = 0x1000 # macro
+BLOCK_DPU_RDMA = 0x2000 # macro
+BLOCK_PPU = 0x4000 # macro
+BLOCK_PPU_RDMA = 0x8000 # macro
+PC_OP_01 = 0x01 # macro
+PC_OP_40 = 0x40 # macro
+PC_OP_ENABLE = 0x80 # macro
+OP_REG_PC = (0x0100|0x01) # macro
+OP_REG_CNA = (0x0200|0x01) # macro
+OP_REG_CORE = (0x0800|0x01) # macro
+OP_REG_DPU = (0x1000|0x01) # macro
+OP_40 = (0x40|0x01) # macro
+OP_ENABLE = (0x80|0x01) # macro
+OP_NONE = 0x0 # macro
+PC_ENABLE = 0x01 # macro
+PC_ENABLE_CNA = 0x04 # macro
+PC_ENABLE_DPU = 0x08 # macro
+PC_ENABLE_PPU = 0x10 # macro
+# def NPUOP(op, value, reg):  # macro
+#    return (((uint64_t)(op&0xffff))<<48)|(((uint64_t)(value&0xffffffff))<<16)|(uint64_t)(reg&0xffff)
+NPU_CBUF_BANK_SIZE = 32768 # macro
+NPU_CBUF_BANKS = 12 # macro
+
+# values for enumeration 'c__Ea_direct_convolution'
+c__Ea_direct_convolution__enumvalues = {
+    0: 'direct_convolution',
+}
+direct_convolution = 0
+c__Ea_direct_convolution = ctypes.c_uint32 # enum
+
+# values for enumeration 'c__Ea_precision_int8'
+c__Ea_precision_int8__enumvalues = {
+    0: 'precision_int8',
+    2: 'precision_float16',
+    4: 'precision_int32',
+    5: 'precision_float32',
+}
+precision_int8 = 0
+precision_float16 = 2
+precision_int32 = 4
+precision_float32 = 5
+c__Ea_precision_int8 = ctypes.c_uint32 # enum
 __all__ = \
-    ['CMA_HEAP_SIZE', 'DMA_BUF_BASE', 'DMA_BUF_SYNC_END',
+    ['BLOCK_CNA', 'BLOCK_CORE', 'BLOCK_DPU', 'BLOCK_DPU_RDMA',
+    'BLOCK_PC', 'BLOCK_PPU', 'BLOCK_PPU_RDMA', 'CMA_HEAP_SIZE',
+    'CNA_CBUF_CON0', 'CNA_CBUF_CON1', 'CNA_CONV_CON1',
+    'CNA_CONV_CON2', 'CNA_CONV_CON3', 'CNA_CVT_CON0', 'CNA_CVT_CON1',
+    'CNA_CVT_CON2', 'CNA_CVT_CON3', 'CNA_CVT_CON4', 'CNA_CVT_CON5',
+    'CNA_DATA_SIZE0', 'CNA_DATA_SIZE1', 'CNA_DATA_SIZE2',
+    'CNA_DATA_SIZE3', 'CNA_DCOMP_ADDR0', 'CNA_DCOMP_AMOUNT',
+    'CNA_DCOMP_AMOUNT1', 'CNA_DCOMP_AMOUNT10', 'CNA_DCOMP_AMOUNT11',
+    'CNA_DCOMP_AMOUNT12', 'CNA_DCOMP_AMOUNT13', 'CNA_DCOMP_AMOUNT14',
+    'CNA_DCOMP_AMOUNT15', 'CNA_DCOMP_AMOUNT2', 'CNA_DCOMP_AMOUNT3',
+    'CNA_DCOMP_AMOUNT4', 'CNA_DCOMP_AMOUNT5', 'CNA_DCOMP_AMOUNT6',
+    'CNA_DCOMP_AMOUNT7', 'CNA_DCOMP_AMOUNT8', 'CNA_DCOMP_AMOUNT9',
+    'CNA_DCOMP_CTRL', 'CNA_DCOMP_REGNUM', 'CNA_DMA_CON0',
+    'CNA_DMA_CON1', 'CNA_DMA_CON2', 'CNA_FC_CON0', 'CNA_FC_CON1',
+    'CNA_FC_CON2', 'CNA_FC_DATA_SIZE0', 'CNA_FC_DATA_SIZE1',
+    'CNA_FEATURE_DATA_ADDR', 'CNA_PAD_CON0', 'CNA_PAD_CON1',
+    'CNA_S_POINTER', 'CNA_WEIGHT_SIZE0', 'CNA_WEIGHT_SIZE1',
+    'CNA_WEIGHT_SIZE2', 'CORE_3030', 'CORE_CLIP_TRUNCATE',
+    'CORE_DATAOUT_SIZE_0', 'CORE_DATAOUT_SIZE_1', 'CORE_MISC_CFG',
+    'CORE_S_POINTER', 'DMA_BUF_BASE', 'DMA_BUF_SYNC_END',
     'DMA_BUF_SYNC_READ', 'DMA_BUF_SYNC_RW', 'DMA_BUF_SYNC_START',
-    'DMA_BUF_SYNC_WRITE', 'DMA_HEAP_IOC_MAGIC',
+    'DMA_BUF_SYNC_WRITE', 'DMA_HEAP_IOC_MAGIC', 'DPU_40C4',
+    'DPU_BN_ALU_CFG', 'DPU_BN_CFG', 'DPU_BN_MUL_CFG',
+    'DPU_BN_RELUX_CMP_VALUE', 'DPU_BS_ALU_CFG', 'DPU_BS_CFG',
+    'DPU_BS_MUL_CFG', 'DPU_BS_OW_CFG', 'DPU_BS_OW_OP',
+    'DPU_BS_RELUX_CMP_VALUE', 'DPU_DATA_CUBE_CHANNEL',
+    'DPU_DATA_CUBE_HEIGHT', 'DPU_DATA_CUBE_NOTCH_ADDR',
+    'DPU_DATA_CUBE_WIDTH', 'DPU_DATA_FORMAT', 'DPU_DST_BASE_ADD',
+    'DPU_DST_SURF_STRIDE', 'DPU_EW_CFG', 'DPU_EW_CVT_OFFSET_VALUE',
+    'DPU_EW_CVT_SCALE_VALUE', 'DPU_EW_OP_VALUE_0',
+    'DPU_EW_OP_VALUE_1', 'DPU_EW_OP_VALUE_2', 'DPU_EW_OP_VALUE_3',
+    'DPU_EW_OP_VALUE_4', 'DPU_EW_OP_VALUE_5', 'DPU_EW_OP_VALUE_6',
+    'DPU_EW_OP_VALUE_7', 'DPU_EW_RELUX_CMP_VALUE',
+    'DPU_FEATURE_MODE_CFG', 'DPU_LUT_ACCESS_CFG',
+    'DPU_LUT_ACCESS_DATA', 'DPU_LUT_CFG', 'DPU_LUT_INFO',
+    'DPU_LUT_LE_END', 'DPU_LUT_LE_SLOPE_SCALE',
+    'DPU_LUT_LE_SLOPE_SHIFT', 'DPU_LUT_LE_START', 'DPU_LUT_LO_END',
+    'DPU_LUT_LO_SLOPE_SCALE', 'DPU_LUT_LO_SLOPE_SHIFT',
+    'DPU_LUT_LO_START', 'DPU_OFFSET_PEND', 'DPU_OUT_CVT_OFFSET',
+    'DPU_OUT_CVT_SCALE', 'DPU_OUT_CVT_SHIFT', 'DPU_SURFACE_ADD',
+    'DPU_S_POINTER', 'DPU_WDMA_SIZE_0', 'DPU_WDMA_SIZE_1',
     'DRM_CAP_ADDFB2_MODIFIERS', 'DRM_CAP_ASYNC_PAGE_FLIP',
     'DRM_CAP_CRTC_IN_VBLANK_EVENT', 'DRM_CAP_CURSOR_HEIGHT',
     'DRM_CAP_CURSOR_WIDTH', 'DRM_CAP_DUMB_BUFFER',
@@ -2300,8 +2629,13 @@ __all__ = \
     'DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE',
     'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL',
     'DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT', 'FORMAT_BLOB_CURRENT',
-    'GGML_RKNPU2_MAX_MATMUL_KERNELS',
-    'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
+    'GGML_RKNPU2_MAX_MATMUL_KERNELS', 'NPU_CBUF_BANKS',
+    'NPU_CBUF_BANK_SIZE', 'NPU_CNA_H', 'NPU_DPU_H', 'NPU_HW_H',
+    'OP_40', 'OP_ENABLE', 'OP_NONE', 'OP_REG_CNA', 'OP_REG_CORE',
+    'OP_REG_DPU', 'OP_REG_PC', 'PC_BASE_ADDRESS', 'PC_ENABLE',
+    'PC_ENABLE_CNA', 'PC_ENABLE_DPU', 'PC_ENABLE_PPU',
+    'PC_OPERATION_ENABLE', 'PC_OP_01', 'PC_OP_40', 'PC_OP_ENABLE',
+    'PC_REGISTER_AMOUNTS', 'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
     'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
     'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
     'RKNN_FLOAT16_MM_INT4_TO_FLOAT16',
@@ -2373,8 +2707,9 @@ __all__ = \
     '_DRM_VBLANK_TYPES_MASK', '_DRM_WRITE_COMBINING', '_IO', '_IOR',
     '_IOW', '_IOWR', '__user', '_rknn_matmul_type',
     '_rknn_tensor_type', 'c__EA_drm_drawable_info_type_t',
-    'drm_agp_binding_t', 'drm_agp_buffer_t', 'drm_agp_info_t',
-    'drm_agp_mode_t', 'drm_auth_t', 'drm_block_t',
+    'c__Ea_direct_convolution', 'c__Ea_precision_int8',
+    'direct_convolution', 'drm_agp_binding_t', 'drm_agp_buffer_t',
+    'drm_agp_info_t', 'drm_agp_mode_t', 'drm_auth_t', 'drm_block_t',
     'drm_buf_desc_flags', 'drm_buf_desc_flags_t',
     'drm_buf_desc_flags_t__enumvalues', 'drm_buf_desc_t',
     'drm_buf_free_t', 'drm_buf_info_t', 'drm_buf_map_t',
@@ -2399,12 +2734,15 @@ __all__ = \
     'drm_vblank_seq_type', 'drm_vblank_seq_type_t',
     'drm_vblank_seq_type_t__enumvalues', 'drm_version_t',
     'drm_wait_vblank_t', 'e_rknpu_action', 'e_rknpu_job_mode',
-    'e_rknpu_mem_sync_mode', 'e_rknpu_mem_type',
-    'struct__rknn_matmul_io_attr', 'struct__rknn_matmul_tensor_attr',
-    'struct__rknn_tensor_memory', 'struct_dma_heap_allocation_data',
-    'struct_drm_agp_binding', 'struct_drm_agp_buffer',
-    'struct_drm_agp_info', 'struct_drm_agp_mode', 'struct_drm_auth',
-    'struct_drm_block', 'struct_drm_buf_desc', 'struct_drm_buf_free',
+    'e_rknpu_mem_sync_mode', 'e_rknpu_mem_type', 'npu_cna_core_task',
+    'npu_cna_desc', 'npu_core_desc', 'npu_dpu_desc', 'npu_pc_desc',
+    'precision_float16', 'precision_float32', 'precision_int32',
+    'precision_int8', 'struct__rknn_matmul_io_attr',
+    'struct__rknn_matmul_tensor_attr', 'struct__rknn_tensor_memory',
+    'struct_dma_heap_allocation_data', 'struct_drm_agp_binding',
+    'struct_drm_agp_buffer', 'struct_drm_agp_info',
+    'struct_drm_agp_mode', 'struct_drm_auth', 'struct_drm_block',
+    'struct_drm_buf_desc', 'struct_drm_buf_free',
     'struct_drm_buf_info', 'struct_drm_buf_map', 'struct_drm_buf_pub',
     'struct_drm_client', 'struct_drm_clip_rect',
     'struct_drm_color_ctm', 'struct_drm_color_lut',
@@ -2446,8 +2784,11 @@ __all__ = \
     'struct_drm_version', 'struct_drm_wait_vblank_reply',
     'struct_drm_wait_vblank_request', 'struct_ggml_rknpu2_data_pack',
     'struct_ggml_rknpu2_matmul_kernel', 'struct_ggml_sync_data_pack',
-    'struct_rknn_matmul_info_t', 'struct_rknpu_action',
-    'struct_rknpu_mem_create', 'struct_rknpu_mem_destroy',
-    'struct_rknpu_mem_map', 'struct_rknpu_mem_sync',
-    'struct_rknpu_subcore_task', 'struct_rknpu_submit',
-    'struct_rknpu_task', 'union_drm_wait_vblank']
+    'struct_npu_cna_core_task', 'struct_npu_cna_desc',
+    'struct_npu_core_desc', 'struct_npu_dpu_desc',
+    'struct_nup_pc_desc', 'struct_rknn_matmul_info_t',
+    'struct_rknpu_action', 'struct_rknpu_mem_create',
+    'struct_rknpu_mem_destroy', 'struct_rknpu_mem_map',
+    'struct_rknpu_mem_sync', 'struct_rknpu_subcore_task',
+    'struct_rknpu_submit', 'struct_rknpu_task',
+    'union_drm_wait_vblank']
