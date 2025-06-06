@@ -569,7 +569,7 @@ except AttributeError:
 try:
     rknn_inputs_set = _libraries['librknnrt.so'].rknn_inputs_set
     rknn_inputs_set.restype = ctypes.c_int32
-    rknn_inputs_set.argtypes = [rknn_context, uint32_t, struct__rknn_input * 0]
+    rknn_inputs_set.argtypes = [rknn_context, uint32_t, struct__rknn_input * 2]
 except AttributeError:
     pass
 try:

@@ -73,6 +73,20 @@ class RKNNDevice(Compiled):
 
     print('RKNN device')
     self.ctx = ct.c_ulong()
+    self.custom_ctx = ct.c_ulong()
+    #/root/dev/tinygrad/extra/rockchip/mobilenet_v1.rknn
+
+    py_str = '/root/dev/tinygrad/extra/rockchip/dual_residual_custom.rknn'
+
+    # Convert to bytes
+    byte_str = py_str.encode('utf-8')
+
+    # Create c_char_p
+    c_str = ctypes.c_char_p(byte_str)
+
+
+    rknn.rknn_init(self.custom_ctx, c_str, 0, 0, None)
+
     ROW_A = 1
     COL_A = 32
     COL_B = 32
@@ -98,6 +112,8 @@ class RKNNDevice(Compiled):
 
 class RKNNProgram:
   def __init__(self, dev:RKNNDevice, name:str, lib:bytes):
+    print('name', name) 
+    self.dev = dev
 
     from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
     # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
@@ -105,11 +121,30 @@ class RKNNProgram:
     self.mem = mmap(-1, len(lib), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
     self.mem.write(lib)
 
+
     custom_op = (rknn.rknn_custom_op * 1)()
     ct.memset(ct.byref(custom_op), 0, ct.sizeof(rknn.rknn_custom_op))   
 
-    print('name', name) 
-    self.dev = dev
+    print('size: ',  ct.sizeof(rknn.rknn_tensor_attr))
+
+    io_num = rknn.rknn_input_output_num()
+    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
+
+    custom_string = rknn.rknn_custom_string()
+    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_CUSTOM_STRING, ct.byref(custom_string), ct.sizeof(custom_string))
+    print(custom_string)
+
+    input_attrs= (rknn.rknn_tensor_attr * io_num.n_input)()
+    ct.memset(input_attrs, 0, io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
+
+    inputs = (rknn.rknn_input * io_num.n_input)()
+    ct.memset(inputs, 0, io_num.n_input * ct.sizeof(rknn.rknn_input))
+
+
+    for i in range(io_num.n_input):
+      input_attrs[i].index = i
+      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+    
     # Copy string into op_type buffer
     dest_ptr = ct.cast(custom_op[0].op_type, ct.c_char_p)
     libc.strncpy(dest_ptr, b"compute_custom_sigmoid_float32", 256 - 1)
@@ -120,9 +155,23 @@ class RKNNProgram:
     print('name', name)
     self.fxn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(rknn.struct__rknn_custom_op_context), ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32)(mv_address(self.mem))
     custom_op[0].compute = self.fxn
-    rknn.rknn_register_custom_ops(self.dev.ctx, custom_op, 1)
-  
+    reg_custom_op = rknn.rknn_register_custom_ops(self.dev.custom_ctx, custom_op, 1)
 
+    print('reg_custom_op', reg_custom_op)
+
+    # try input fake data
+    input_data = (ct.c_void_p * io_num.n_input)()
+
+
+    for i in range(io_num.n_input):
+      inputs[i].index = i
+      inputs[i].pass_through = 0
+      inputs[i].type = rk.RKNN_TENSOR_FLOAT16
+      inputs[i].fmt = input_attrs[i].fmt
+      inputs[i].size = input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
+      inputs[i].buf = input_data[i]
+
+    ret = rknn.rknn_inputs_set(self.dev.custom_ctx, io_num.n_input, inputs)
   
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     # print([i.malloc for i in bufs])
