@@ -437,10 +437,12 @@ _rknn_mem_alloc_flags__enumvalues = {
     0: 'RKNN_FLAG_MEMORY_FLAGS_DEFAULT',
     1: 'RKNN_FLAG_MEMORY_CACHEABLE',
     2: 'RKNN_FLAG_MEMORY_NON_CACHEABLE',
+    4: 'RKNN_FLAG_MEMORY_TRY_ALLOC_SRAM',
 }
 RKNN_FLAG_MEMORY_FLAGS_DEFAULT = 0
 RKNN_FLAG_MEMORY_CACHEABLE = 1
 RKNN_FLAG_MEMORY_NON_CACHEABLE = 2
+RKNN_FLAG_MEMORY_TRY_ALLOC_SRAM = 4
 _rknn_mem_alloc_flags = ctypes.c_uint32 # enum
 rknn_mem_alloc_flags = _rknn_mem_alloc_flags
 rknn_mem_alloc_flags__enumvalues = _rknn_mem_alloc_flags__enumvalues
@@ -730,6 +732,7 @@ _rknn_matmul_type__enumvalues = {
     10: 'RKNN_INT4_MM_INT4_TO_INT16',
     11: 'RKNN_INT8_MM_INT4_TO_INT32',
     12: 'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
+    15: 'RKNN_INT8_MM_INT4_TO_FLOAT16',
 }
 RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 = 1
 RKNN_INT8_MM_INT8_TO_INT32 = 2
@@ -743,6 +746,7 @@ RKNN_INT8_MM_INT8_TO_FLOAT32 = 9
 RKNN_INT4_MM_INT4_TO_INT16 = 10
 RKNN_INT8_MM_INT4_TO_INT32 = 11
 RKNN_FLOAT16_MM_INT4_TO_BFLOAT16 = 12
+RKNN_INT8_MM_INT4_TO_FLOAT16 = 15
 _rknn_matmul_type = ctypes.c_uint32 # enum
 rknn_matmul_type = _rknn_matmul_type
 rknn_matmul_type__enumvalues = _rknn_matmul_type__enumvalues
@@ -877,9 +881,102 @@ try:
     rknn_B_normal_layout_to_native_layout.argtypes = [ctypes.POINTER(None), ctypes.POINTER(None), ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(struct_rknn_matmul_info_t)]
 except AttributeError:
     pass
+rknn_custom_op_interal_context = ctypes.c_uint64
+
+# values for enumeration '_rknn_target_type'
+_rknn_target_type__enumvalues = {
+    1: 'RKNN_TARGET_TYPE_CPU',
+    2: 'RKNN_TARGET_TYPE_GPU',
+    3: 'RKNN_TARGET_TYPE_MAX',
+}
+RKNN_TARGET_TYPE_CPU = 1
+RKNN_TARGET_TYPE_GPU = 2
+RKNN_TARGET_TYPE_MAX = 3
+_rknn_target_type = ctypes.c_uint32 # enum
+rknn_target_type = _rknn_target_type
+rknn_target_type__enumvalues = _rknn_target_type__enumvalues
+class struct__rknn_gpu_op_context(Structure):
+    pass
+
+struct__rknn_gpu_op_context._pack_ = 1 # source:False
+struct__rknn_gpu_op_context._fields_ = [
+    ('cl_context', ctypes.POINTER(None)),
+    ('cl_command_queue', ctypes.POINTER(None)),
+    ('cl_kernel', ctypes.POINTER(None)),
+]
+
+rknn_gpu_op_context = struct__rknn_gpu_op_context
+class struct__rknn_custom_op_context(Structure):
+    pass
+
+struct__rknn_custom_op_context._pack_ = 1 # source:False
+struct__rknn_custom_op_context._fields_ = [
+    ('target', rknn_target_type),
+    ('PADDING_0', ctypes.c_ubyte * 4),
+    ('internal_ctx', ctypes.c_uint64),
+    ('gpu_ctx', rknn_gpu_op_context),
+    ('priv_data', ctypes.POINTER(None)),
+]
+
+rknn_custom_op_context = struct__rknn_custom_op_context
+class struct__rknn_custom_op_tensor(Structure):
+    _pack_ = 1 # source:False
+    _fields_ = [
+    ('attr', rknn_tensor_attr),
+    ('mem', rknn_tensor_mem),
+     ]
+
+rknn_custom_op_tensor = struct__rknn_custom_op_tensor
+class struct__rknn_custom_op_attr(Structure):
+    pass
+
+struct__rknn_custom_op_attr._pack_ = 1 # source:False
+struct__rknn_custom_op_attr._fields_ = [
+    ('name', ctypes.c_ubyte * 256),
+    ('dtype', rknn_tensor_type),
+    ('n_elems', ctypes.c_uint32),
+    ('data', ctypes.POINTER(None)),
+]
+
+rknn_custom_op_attr = struct__rknn_custom_op_attr
+class struct__rknn_custom_op(Structure):
+    pass
+
+struct__rknn_custom_op._pack_ = 1 # source:False
+struct__rknn_custom_op._fields_ = [
+    ('version', ctypes.c_uint32),
+    ('target', rknn_target_type),
+    ('op_type', ctypes.c_ubyte * 256),
+    ('cl_kernel_name', ctypes.c_ubyte * 256),
+    ('cl_kernel_source', ctypes.POINTER(ctypes.c_ubyte)),
+    ('cl_source_size', ctypes.c_uint64),
+    ('cl_build_options', ctypes.c_ubyte * 256),
+    ('init', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
+    ('prepare', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
+    ('compute', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
+    
+    ('compute_native', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(struct__rknn_custom_op_tensor), ctypes.c_uint32)),
+    ('destroy', ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(struct__rknn_custom_op_context))),
+]
+
+rknn_custom_op = struct__rknn_custom_op
+get_custom_op_func = ctypes.CFUNCTYPE(ctypes.POINTER(struct__rknn_custom_op))
+try:
+    rknn_register_custom_ops = _libraries['librknnrt.so'].rknn_register_custom_ops
+    rknn_register_custom_ops.restype = ctypes.c_int32
+    rknn_register_custom_ops.argtypes = [rknn_context, ctypes.POINTER(struct__rknn_custom_op), uint32_t]
+except AttributeError:
+    pass
+try:
+    rknn_custom_op_get_op_attr = _libraries['librknnrt.so'].rknn_custom_op_get_op_attr
+    rknn_custom_op_get_op_attr.restype = None
+    rknn_custom_op_get_op_attr.argtypes = [ctypes.POINTER(struct__rknn_custom_op_context), ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(struct__rknn_custom_op_attr)]
+except AttributeError:
+    pass
 __all__ = \
     ['RKNN_FLAG_MEMORY_CACHEABLE', 'RKNN_FLAG_MEMORY_FLAGS_DEFAULT',
     'RKNN_FLAG_MEMORY_NON_CACHEABLE',
+    'RKNN_FLAG_MEMORY_TRY_ALLOC_SRAM',
     'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16',
     'RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32',
     'RKNN_FLOAT16_MM_INT4_TO_BFLOAT16',
@@ -887,15 +984,15 @@ __all__ = \
     'RKNN_FLOAT16_MM_INT4_TO_FLOAT32',
     'RKNN_FLOAT16_MM_INT8_TO_FLOAT16',
     'RKNN_FLOAT16_MM_INT8_TO_FLOAT32', 'RKNN_INT4_MM_INT4_TO_INT16',
-    'RKNN_INT8_MM_INT4_TO_INT32', 'RKNN_INT8_MM_INT8_TO_FLOAT32',
-    'RKNN_INT8_MM_INT8_TO_INT32', 'RKNN_INT8_MM_INT8_TO_INT8',
-    'RKNN_MEMORY_SYNC_BIDIRECTIONAL', 'RKNN_MEMORY_SYNC_FROM_DEVICE',
-    'RKNN_MEMORY_SYNC_TO_DEVICE', 'RKNN_MM_LAYOUT_NATIVE',
-    'RKNN_MM_LAYOUT_NORM', 'RKNN_MM_LAYOUT_TP_NORM',
-    'RKNN_NPU_CORE_0', 'RKNN_NPU_CORE_0_1', 'RKNN_NPU_CORE_0_1_2',
-    'RKNN_NPU_CORE_1', 'RKNN_NPU_CORE_2', 'RKNN_NPU_CORE_ALL',
-    'RKNN_NPU_CORE_AUTO', 'RKNN_NPU_CORE_UNDEFINED',
-    'RKNN_QUANT_TYPE_PER_CHANNEL_ASYM',
+    'RKNN_INT8_MM_INT4_TO_FLOAT16', 'RKNN_INT8_MM_INT4_TO_INT32',
+    'RKNN_INT8_MM_INT8_TO_FLOAT32', 'RKNN_INT8_MM_INT8_TO_INT32',
+    'RKNN_INT8_MM_INT8_TO_INT8', 'RKNN_MEMORY_SYNC_BIDIRECTIONAL',
+    'RKNN_MEMORY_SYNC_FROM_DEVICE', 'RKNN_MEMORY_SYNC_TO_DEVICE',
+    'RKNN_MM_LAYOUT_NATIVE', 'RKNN_MM_LAYOUT_NORM',
+    'RKNN_MM_LAYOUT_TP_NORM', 'RKNN_NPU_CORE_0', 'RKNN_NPU_CORE_0_1',
+    'RKNN_NPU_CORE_0_1_2', 'RKNN_NPU_CORE_1', 'RKNN_NPU_CORE_2',
+    'RKNN_NPU_CORE_ALL', 'RKNN_NPU_CORE_AUTO',
+    'RKNN_NPU_CORE_UNDEFINED', 'RKNN_QUANT_TYPE_PER_CHANNEL_ASYM',
     'RKNN_QUANT_TYPE_PER_CHANNEL_SYM',
     'RKNN_QUANT_TYPE_PER_GROUP_ASYM', 'RKNN_QUANT_TYPE_PER_GROUP_SYM',
     'RKNN_QUANT_TYPE_PER_LAYER_ASYM', 'RKNN_QUANT_TYPE_PER_LAYER_SYM',
@@ -912,11 +1009,13 @@ __all__ = \
     'RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR',
     'RKNN_QUERY_NATIVE_OUTPUT_ATTR', 'RKNN_QUERY_OUTPUT_ATTR',
     'RKNN_QUERY_PERF_DETAIL', 'RKNN_QUERY_PERF_RUN',
-    'RKNN_QUERY_SDK_VERSION', 'RKNN_TENSOR_BFLOAT16',
-    'RKNN_TENSOR_BOOL', 'RKNN_TENSOR_FLOAT16', 'RKNN_TENSOR_FLOAT32',
-    'RKNN_TENSOR_FORMAT_MAX', 'RKNN_TENSOR_INT16',
-    'RKNN_TENSOR_INT32', 'RKNN_TENSOR_INT4', 'RKNN_TENSOR_INT64',
-    'RKNN_TENSOR_INT8', 'RKNN_TENSOR_MEMORY_FLAGS_ALLOC_INSIDE',
+    'RKNN_QUERY_SDK_VERSION', 'RKNN_TARGET_TYPE_CPU',
+    'RKNN_TARGET_TYPE_GPU', 'RKNN_TARGET_TYPE_MAX',
+    'RKNN_TENSOR_BFLOAT16', 'RKNN_TENSOR_BOOL', 'RKNN_TENSOR_FLOAT16',
+    'RKNN_TENSOR_FLOAT32', 'RKNN_TENSOR_FORMAT_MAX',
+    'RKNN_TENSOR_INT16', 'RKNN_TENSOR_INT32', 'RKNN_TENSOR_INT4',
+    'RKNN_TENSOR_INT64', 'RKNN_TENSOR_INT8',
+    'RKNN_TENSOR_MEMORY_FLAGS_ALLOC_INSIDE',
     'RKNN_TENSOR_MEMORY_FLAGS_FROM_FD',
     'RKNN_TENSOR_MEMORY_FLAGS_FROM_PHYS',
     'RKNN_TENSOR_MEMORY_FLAGS_UNKNOWN', 'RKNN_TENSOR_NC1HWC2',
@@ -928,17 +1027,21 @@ __all__ = \
     'RKNN_TENSOR_UNDEFINED', '_rknn_core_mask',
     '_rknn_matmul_quant_type', '_rknn_matmul_type',
     '_rknn_mem_alloc_flags', '_rknn_mem_sync_mode', '_rknn_query_cmd',
-    '_rknn_tensor_format', '_rknn_tensor_mem_flags',
-    '_rknn_tensor_qnt_type', '_rknn_tensor_type',
-    'c__EA_rknn_matmul_layout', 'get_format_string',
+    '_rknn_target_type', '_rknn_tensor_format',
+    '_rknn_tensor_mem_flags', '_rknn_tensor_qnt_type',
+    '_rknn_tensor_type', 'c__EA_rknn_matmul_layout',
+    'get_custom_op_func', 'get_format_string',
     'get_matmul_type_string', 'get_qnt_type_string',
     'get_type_string', 'int32_t',
     'rknn_B_normal_layout_to_native_layout', 'rknn_context',
     'rknn_core_mask', 'rknn_core_mask__enumvalues', 'rknn_create_mem',
     'rknn_create_mem2', 'rknn_create_mem_from_fd',
     'rknn_create_mem_from_mb_blk', 'rknn_create_mem_from_phys',
-    'rknn_custom_string', 'rknn_destroy', 'rknn_destroy_mem',
-    'rknn_dup_context', 'rknn_init', 'rknn_init_extend', 'rknn_input',
+    'rknn_custom_op', 'rknn_custom_op_attr', 'rknn_custom_op_context',
+    'rknn_custom_op_get_op_attr', 'rknn_custom_op_interal_context',
+    'rknn_custom_op_tensor', 'rknn_custom_string', 'rknn_destroy',
+    'rknn_destroy_mem', 'rknn_dup_context', 'rknn_gpu_op_context',
+    'rknn_init', 'rknn_init_extend', 'rknn_input',
     'rknn_input_output_num', 'rknn_input_range', 'rknn_inputs_set',
     'rknn_matmul_create', 'rknn_matmul_create_dynamic_shape',
     'rknn_matmul_ctx', 'rknn_matmul_destroy',
@@ -956,22 +1059,27 @@ __all__ = \
     'rknn_output_extend', 'rknn_outputs_get', 'rknn_outputs_release',
     'rknn_perf_detail', 'rknn_perf_run', 'rknn_quant_params',
     'rknn_query', 'rknn_query_cmd', 'rknn_query_cmd__enumvalues',
-    'rknn_run', 'rknn_run_extend', 'rknn_sdk_version',
-    'rknn_set_batch_core_num', 'rknn_set_core_mask',
-    'rknn_set_input_shape', 'rknn_set_input_shapes',
-    'rknn_set_internal_mem', 'rknn_set_io_mem', 'rknn_set_weight_mem',
-    'rknn_tensor_attr', 'rknn_tensor_format',
-    'rknn_tensor_format__enumvalues', 'rknn_tensor_mem',
-    'rknn_tensor_mem_flags', 'rknn_tensor_mem_flags__enumvalues',
-    'rknn_tensor_qnt_type', 'rknn_tensor_qnt_type__enumvalues',
-    'rknn_tensor_type', 'rknn_tensor_type__enumvalues', 'rknn_wait',
-    'struct__rknn_custom_string', 'struct__rknn_init_extend',
-    'struct__rknn_input', 'struct__rknn_input_output_num',
-    'struct__rknn_input_range', 'struct__rknn_matmul_io_attr',
-    'struct__rknn_matmul_shape', 'struct__rknn_matmul_tensor_attr',
-    'struct__rknn_mem_size', 'struct__rknn_output',
-    'struct__rknn_output_extend', 'struct__rknn_perf_detail',
-    'struct__rknn_perf_run', 'struct__rknn_quant_params',
-    'struct__rknn_run_extend', 'struct__rknn_sdk_version',
-    'struct__rknn_tensor_attr', 'struct__rknn_tensor_memory',
-    'struct_rknn_matmul_info_t', 'uint32_t', 'uint64_t']
+    'rknn_register_custom_ops', 'rknn_run', 'rknn_run_extend',
+    'rknn_sdk_version', 'rknn_set_batch_core_num',
+    'rknn_set_core_mask', 'rknn_set_input_shape',
+    'rknn_set_input_shapes', 'rknn_set_internal_mem',
+    'rknn_set_io_mem', 'rknn_set_weight_mem', 'rknn_target_type',
+    'rknn_target_type__enumvalues', 'rknn_tensor_attr',
+    'rknn_tensor_format', 'rknn_tensor_format__enumvalues',
+    'rknn_tensor_mem', 'rknn_tensor_mem_flags',
+    'rknn_tensor_mem_flags__enumvalues', 'rknn_tensor_qnt_type',
+    'rknn_tensor_qnt_type__enumvalues', 'rknn_tensor_type',
+    'rknn_tensor_type__enumvalues', 'rknn_wait',
+    'struct__rknn_custom_op', 'struct__rknn_custom_op_attr',
+    'struct__rknn_custom_op_context', 'struct__rknn_custom_op_tensor',
+    'struct__rknn_custom_string', 'struct__rknn_gpu_op_context',
+    'struct__rknn_init_extend', 'struct__rknn_input',
+    'struct__rknn_input_output_num', 'struct__rknn_input_range',
+    'struct__rknn_matmul_io_attr', 'struct__rknn_matmul_shape',
+    'struct__rknn_matmul_tensor_attr', 'struct__rknn_mem_size',
+    'struct__rknn_output', 'struct__rknn_output_extend',
+    'struct__rknn_perf_detail', 'struct__rknn_perf_run',
+    'struct__rknn_quant_params', 'struct__rknn_run_extend',
+    'struct__rknn_sdk_version', 'struct__rknn_tensor_attr',
+    'struct__rknn_tensor_memory', 'struct_rknn_matmul_info_t',
+    'uint32_t', 'uint64_t']

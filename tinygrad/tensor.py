@@ -3381,6 +3381,7 @@ class Tensor(SimpleMathTrait):
     print(t.add(Tensor([[2.0], [3.5]])).numpy())
     ```
     """
+    print('add')
     return self._apply_broadcasted_uop(UOp.add, x, reverse)
 
   def sub(self, x:Tensor|ConstType, reverse=False) -> Tensor:

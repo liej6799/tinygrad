@@ -9,28 +9,74 @@ import os, mmap, functools
 import fcntl
 from typing import Any, cast, ClassVar
 from tinygrad.runtime.support.hcq import FileIOInterface
-from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, prod, fromimport
+from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, prod, fromimport, OSX
 from tinygrad.runtime.autogen import libc
-class RKNNRenderer(Renderer):
+from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, FileIOInterface
+from tinygrad.helpers import from_mv, getenv, round_up, mv_address, to_mv, cpu_objdump, DEBUG
+import ctypes, os, mmap, tempfile, pathlib, array, functools, threading, contextlib, sys, subprocess, struct
+from tinygrad.renderer.cstyle import ClangRenderer
+from tinygrad.ops import Ops, UOp
+from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite, extra_pm
+import time
+import pickle, base64, itertools, time, struct, sys
+from tinygrad.device import Compiled, Compiler, MallocAllocator, CPUProgram
+from tinygrad.runtime.ops_cpu import ClangJITCompiler
+
+
+class ClangCompiler(Compiler):
+  def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
+    self.args = ['-shared'] if args is None else args
+    self.objdump_tool = objdump_tool
+    super().__init__(cachekey)
+
+  def compile(self, src:str) -> bytes:
+    # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
+    with tempfile.NamedTemporaryFile(delete=True) as output_file:
+      subprocess.check_output([getenv("CC", 'clang'), *self.args, '-O2', '-Wall', '-Werror', '-x', 'c', '-fPIC', '-ffreestanding',
+                               '-', '-o', str(output_file.name)], input=src.encode('utf-8'))
+      print('output_file', output_file)
+      return pathlib.Path(output_file.name).read_bytes()
+
+  def disassemble(self, lib:bytes): return cpu_objdump(lib, self.objdump_tool)
+  
+class RKNNCompiler(Compiler):
+  def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
+    self.args = ['-shared'] if args is None else args
+    self.objdump_tool = objdump_tool
+    super().__init__(cachekey)
+
+  def compile(self, src:str) -> bytes:
+    # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
+    with tempfile.NamedTemporaryFile(delete=True) as output_file:
+      subprocess.check_output([getenv("CC", 'clang'), *self.args, '-O2', '-Wall', '-Werror', '-x', 'c', '-fPIC', '-L/usr/lib/librknnrt.so', '-lstdc++', '-o', str(output_file.name)], input=src.encode('utf-8'))
+      return pathlib.Path(output_file.name).read_bytes()
+
+  def disassemble(self, lib:bytes): return cpu_objdump(lib, self.objdump_tool)
+
+
+class RKNNRenderer(ClangRenderer):
   device = "RKNN"
-  def render(self, uops:list) -> str: 
-    print('renderer')
-    return ""
 
 class RKNNBuffer:
-  def __init__(self, buf:Any, virt_addr:int, size:int, offset:int=0):
-    self.buf, self.virt_addr, self.size, self.offset = buf, virt_addr, size, offset
+  def __init__(self, buf:Any, virt_addr:int, size:int, malloc, offset:int=0):
+    self.buf, self.virt_addr, self.size, self.malloc, self.offset = buf, virt_addr, size, malloc, offset
+
+
 
 
 class RKNNDevice(Compiled):
+  devices: ClassVar[list[HCQCompiled]] = []
+  signal_pages: ClassVar[list[Any]] = []
+  signal_pool: ClassVar[list[int]] = []
+  
+  def __init__(self, device:str=""):
 
-  def __init__(self, device:str="", ctx=None):
     print('RKNN device')
     self.ctx = ct.c_ulong()
-
     ROW_A = 1
     COL_A = 32
     COL_B = 32
+
 
 
     info = rknn.struct_rknn_matmul_info_t()
@@ -47,22 +93,54 @@ class RKNNDevice(Compiled):
     rknn.rknn_matmul_create(self.ctx, info, self.io_attr)
     rknn.rknn_matmul_set_core_mask(self.ctx, rknn.RKNN_NPU_CORE_0_1_2)
 
-    super().__init__(device, RKNNAllocator(self), RKNNRenderer(), Compiler(), functools.partial(RKNNProgram, self))
+    super().__init__(device, RKNNAllocator(self), RKNNRenderer(), ClangCompiler(),  functools.partial(RKNNProgram, self))
 
 
 class RKNNProgram:
   def __init__(self, dev:RKNNDevice, name:str, lib:bytes):
-    print('rknn program')
 
-    MatmulKernelArray =  rk.struct_ggml_rknpu2_matmul_kernel * rk.GGML_RKNPU2_MAX_MATMUL_KERNELS
-    self.matmul_kernels = MatmulKernelArray()
+    from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
+    # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
+    # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
+    self.mem = mmap(-1, len(lib), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
+    self.mem.write(lib)
 
+    custom_op = (rknn.rknn_custom_op * 1)()
+    ct.memset(ct.byref(custom_op), 0, ct.sizeof(rknn.rknn_custom_op))   
+
+    print('name', name) 
+    self.dev = dev
+    # Copy string into op_type buffer
+    dest_ptr = ct.cast(custom_op[0].op_type, ct.c_char_p)
+    libc.strncpy(dest_ptr, b"compute_custom_sigmoid_float32", 256 - 1)
+    custom_op[0].version = 1
+    custom_op[0].target  = rknn.RKNN_TARGET_TYPE_CPU
+    liba = ClangJITCompiler().compile("void add(int *out, int *a, int *b) { out[0] = a[0] + b[0]; }")
+    print('liba', liba)
+    print('name', name)
+    self.fxn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(rknn.struct__rknn_custom_op_context), ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32)(mv_address(self.mem))
+    custom_op[0].compute = self.fxn
+    rknn.rknn_register_custom_ops(self.dev.ctx, custom_op, 1)
+  
+
+  
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+    # print([i.malloc for i in bufs])
+    # args = list([i.malloc for i in bufs]) 
+    # print('args: ', args)
+    # print("run cpu", self.fxn)
+    # print(self.fxn(*args))
+    # args = list(bufs) 
+    # print('args: ', args)
+    # print("run cpu", self.fxn)
+    # print(self.fxn(*bufs))
     
-    print(self.matmul_kernels[0].matmul_info)
 
-    print('call', global_size, local_size)
-    return 1e-4
+    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[2].buf, self.dev.io_attr.A)
+    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[1].buf, self.dev.io_attr.B)
+    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[0].buf, self.dev.io_attr.C)
+    rknn.rknn_matmul_run(self.dev.ctx)
+
 
 
 class RKNNAllocator(Allocator):
@@ -71,16 +149,26 @@ class RKNNAllocator(Allocator):
     super().__init__()    
   dev = None
   def _as_buffer(self, src:RKNNBuffer) -> memoryview: return to_mv(src.virt_addr, src.size)
+  def _alloc_aligned(self, size:int, alignment:int):
+    buffer = (ctypes.c_uint8 * (size + alignment))()
+    offset = round_up(ctypes.addressof(buffer), alignment) - ctypes.addressof(buffer)
+    return (ctypes.c_uint8 * size).from_buffer(buffer, offset)
   def _alloc(self, size, options): 
     buf = rknn.rknn_create_mem(self.dev.ctx, size)
-    return RKNNBuffer(buf, buf.contents.virt_addr, size)  # Placeholder for actual buffer allocation logic)
-    pass
+    alignment = 0x1000 if size >= 0x1000 else 0x20
+    malloc = (ctypes.c_uint8 * size).from_address(options.external_ptr) if options.external_ptr else self._alloc_aligned(size, alignment)
+
+    print(buf)
+
+    return RKNNBuffer(buf, buf.contents.virt_addr, size, malloc)  # Placeholder for actual buffer allocation logic)
+    
   def _copyin(self, dest:RKNNBuffer, src:memoryview): 
+    print('copyin')
     ct.memmove(dest.virt_addr, from_mv(src), src.nbytes)
     
   def _copyout(self, dest:memoryview, src:RKNNBuffer): 
+    print('copyout')
     ct.memmove(from_mv(src), dest.virt_addr, dest.size)
-
 
   def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
     print('transfer')

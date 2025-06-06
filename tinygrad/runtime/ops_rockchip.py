@@ -33,17 +33,12 @@ class RockchipDevice(Compiled):
     super().__init__(device, RockchipAllocator(self), RockchipRenderer(), Compiler(), functools.partial(RockchipProgram, self))
 
 
-class RockchipProgram:
-  def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
+class RockchipProgram(Compiled):
+  def __init__(self, dev:MetalDevice, name:str, lib:bytes):
     print('rockchip program')
-    self.dev, self.lib = dev, lib
-    MatmulKernelArray =  rk.struct_ggml_rknpu2_matmul_kernel * rk.GGML_RKNPU2_MAX_MATMUL_KERNELS
-    self.matmul_kernels = MatmulKernelArray()
+    self.dev, self.name, self.lib = dev, name, lib
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
-    
-    print(self.matmul_kernels[0].matmul_info)
-
     print('call', global_size, local_size)
     return 1e-4
 

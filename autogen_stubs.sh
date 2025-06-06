@@ -106,7 +106,7 @@ generate_rockchip() {
 }
 
 generate_rknn() {
-  clang2py /usr/local/include/include/rknn_api.h /usr/local/include/include/rknn_matmul_api.h -o $BASE/rknn.py -l /usr/lib/librknnrt.so
+  clang2py /usr/local/include/include/rknn_api.h /usr/local/include/include/rknn_matmul_api.h extra/rockchip/rknn_custom_op.h -o $BASE/rknn.py -l /usr/lib/librknnrt.so
   sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/rknn.py
   fixup $BASE/rknn.py
   python3 -c "import tinygrad.runtime.autogen.rknn"

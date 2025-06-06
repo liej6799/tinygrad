@@ -118,7 +118,7 @@ class DSPAllocator(Allocator):
 
 class ClangCompiler(Compiler):
   def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
-    self.args = ['-shared', '-march=native'] if args is None else args
+    self.args = ['-shared'] if args is None else args
     self.objdump_tool = objdump_tool
     super().__init__(cachekey)
 
