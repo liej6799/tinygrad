@@ -33,33 +33,17 @@ rknnalloc._copyin(b, memoryview(bytearray(B)))
 
 compiler = device.compiler
 prog = RKNNProgram(device, "compute_custom_sigmoid_float32", compiler.compile("""
+#include <stdio.h>
 #include "rknn_api.h"
 #include "rknn_custom_op.h"
 
 #include <math.h>
 
+
 int compute_custom_sigmoid_float32(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
-    unsigned char*      in_ptr   = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
-    unsigned char*      out_ptr  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
-    const float*        in_data  = (const float*)in_ptr;
-    float*              out_data = (float*)out_ptr;
 
-    // kernel implemetation for custom sigmoid cpu op
-    {
-        int inside  = 1;
-
-        for (int i = 0; i < inputs[0].attr.n_dims; i++) {
-            inside *= inputs[0].attr.dims[i];
-        }
-
-        for (int y = 0; y < inside; y++) {
-            const float* src_y    = in_data  + y;
-            float*       dst_y    = out_data + y;
-            dst_y[0] = 1 / (1 + exp(-src_y[0]));
-        }
-    }
     return 0;
 }
 """))

@@ -107,19 +107,32 @@ class RKNNDevice(Compiled):
     rknn.rknn_matmul_create(self.ctx, info, self.io_attr)
     rknn.rknn_matmul_set_core_mask(self.ctx, rknn.RKNN_NPU_CORE_0_1_2)
 
-    super().__init__(device, RKNNAllocator(self), RKNNRenderer(), ClangCompiler(),  functools.partial(RKNNProgram, self))
+    super().__init__(device, RKNNAllocator(self), RKNNRenderer(), ClangJITCompiler(),  functools.partial(RKNNProgram, self))
 
 
 class RKNNProgram:
   def __init__(self, dev:RKNNDevice, name:str, lib:bytes):
     print('name', name) 
     self.dev = dev
+    liba = ClangJITCompiler().compile("""
+    #include <stdio.h>
+    #include "rknn_api.h"
+    #include "rknn_custom_op.h"
 
+    int compute_custom_sigmoid_float32(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
+                                    rknn_custom_op_tensor* outputs, uint32_t n_outputs)
+{
+
+    return 0;
+}
+    """)
+    print('liba', liba)
+    print('name', name)
     from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
     # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
     # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
-    self.mem = mmap(-1, len(lib), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
-    self.mem.write(lib)
+    self.mem = mmap(-1, len(liba), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
+    self.mem.write(liba)
 
 
     custom_op = (rknn.rknn_custom_op * 1)()
@@ -147,12 +160,10 @@ class RKNNProgram:
     
     # Copy string into op_type buffer
     dest_ptr = ct.cast(custom_op[0].op_type, ct.c_char_p)
-    libc.strncpy(dest_ptr, b"compute_custom_sigmoid_float32", 256 - 1)
+    libc.strncpy(dest_ptr, b"cstDualResidual", 256 - 1)
     custom_op[0].version = 1
     custom_op[0].target  = rknn.RKNN_TARGET_TYPE_CPU
-    liba = ClangJITCompiler().compile("void add(int *out, int *a, int *b) { out[0] = a[0] + b[0]; }")
-    print('liba', liba)
-    print('name', name)
+
     self.fxn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(rknn.struct__rknn_custom_op_context), ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32)(mv_address(self.mem))
     custom_op[0].compute = self.fxn
     reg_custom_op = rknn.rknn_register_custom_ops(self.dev.custom_ctx, custom_op, 1)
@@ -161,7 +172,9 @@ class RKNNProgram:
 
     # try input fake data
     input_data = (ct.c_void_p * io_num.n_input)()
-
+    for i in range(io_num.n_input):
+      buf = ct.create_string_buffer(input_attrs[i].n_elems * ct.sizeof(ct.c_uint16))
+      input_data[i] = ct.cast(buf, ct.c_void_p)
 
     for i in range(io_num.n_input):
       inputs[i].index = i
@@ -171,7 +184,16 @@ class RKNNProgram:
       inputs[i].size = input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
       inputs[i].buf = input_data[i]
 
-    ret = rknn.rknn_inputs_set(self.dev.custom_ctx, io_num.n_input, inputs)
+    rknn.rknn_inputs_set(self.dev.custom_ctx, io_num.n_input, inputs)
+    rknn.rknn_run(self.dev.custom_ctx, None)
+
+  # io_num = rknn.rknn_input_output_num()
+  #   rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
+
+    perf_run = rknn.rknn_perf_run()
+    ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
+
+    print('run_duration', perf_run.run_duration)
   
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     # print([i.malloc for i in bufs])
