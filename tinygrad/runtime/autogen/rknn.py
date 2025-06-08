@@ -599,7 +599,7 @@ except AttributeError:
 try:
     rknn_outputs_get = _libraries['librknnrt.so'].rknn_outputs_get
     rknn_outputs_get.restype = ctypes.c_int32
-    rknn_outputs_get.argtypes = [rknn_context, uint32_t, struct__rknn_output * 0, ctypes.POINTER(struct__rknn_output_extend)]
+    rknn_outputs_get.argtypes = [rknn_context, uint32_t, struct__rknn_output * 2, ctypes.POINTER(struct__rknn_output_extend)]
 except AttributeError:
     pass
 try:

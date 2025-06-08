@@ -110,7 +110,28 @@ class CStyleLanguage(Renderer):
     prg = ''.join([f"{self.kernel_prefix}void {self.get_kernel_modifier(uops)}{function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
+       
+
     print(prg if prefix is None else "\n".join(prefix)+f"\n{prg}")
+    code = """
+    #include <stdio.h>
+    #include <stdlib.h>
+    void E_4(int* restrict data0, int* restrict data1, int* restrict data2) {
+  int val0 = *(data1+0);
+  int val1 = *(data1+1);
+  int val2 = *(data1+2);
+  int val3 = *(data1+3);
+  int val4 = *(data2+0);
+  int val5 = *(data2+1);
+  int val6 = *(data2+2);
+  int val7 = *(data2+3);
+  *(data0+0) = (val0-val4);
+  *(data0+1) = (val1-val5);
+  *(data0+2) = (val2-val6);
+  *(data0+3) = (val3-val7);
+  printf("awd");
+}
+    """
     return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
 
   def render_cast(self, dt:DType, val: str) -> str: return f"({self.render_dtype(dt)})({val})"
@@ -246,6 +267,7 @@ class IntelRenderer(OpenCLRenderer):
       dt_in = ("ushort", "bf16") if arg[2] == dtypes.bfloat16 else (arg[2].name, "f16")
       prefix.append(f"""{arg[3].name}8 __{arg[0]}({dt_in[0]}16 a, {dt_in[0]}16 b, {arg[3].name}8 c) {{
     return intel_sub_group_{dt_in[1]}_{dt_in[1]}_matrix_mad_k16(as_int8(a), as_int8(b), c);\n}}""")
+
     return super().render_kernel(function_name, kernel, bufs, uops, prefix or None)
 
 class MetalRenderer(CStyleLanguage):

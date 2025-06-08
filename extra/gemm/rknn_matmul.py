@@ -32,17 +32,27 @@ rknnalloc._copyin(a, memoryview(bytearray(A)))
 rknnalloc._copyin(b, memoryview(bytearray(B)))
 
 compiler = device.compiler
-prog = RKNNProgram(device, "compute_custom_sigmoid_float32", compiler.compile("""
+prog = RKNNProgram(device, "cstDualResidual", compiler.compile("""
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "rknn_api.h"
 #include "rknn_custom_op.h"
 
 #include <math.h>
 
-
-int compute_custom_sigmoid_float32(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
+int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
+   
+ unsigned char*      in_ptr   = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
+    unsigned char*      out_ptr  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
+    const float*        in_data  = (const float*)in_ptr;
+    float*              out_data = (float*)out_ptr;
+    int inside  = 1;
+
+        out_data[0] = 1.0f;
+
 
     return 0;
 }

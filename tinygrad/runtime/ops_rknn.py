@@ -131,8 +131,8 @@ class RKNNProgram:
     from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
     # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
     # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
-    self.mem = mmap(-1, len(liba), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
-    self.mem.write(liba)
+    self.mem = mmap(-1, len(lib), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
+    self.mem.write(lib)
 
 
     custom_op = (rknn.rknn_custom_op * 1)()
@@ -150,13 +150,21 @@ class RKNNProgram:
     input_attrs= (rknn.rknn_tensor_attr * io_num.n_input)()
     ct.memset(input_attrs, 0, io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
 
+    output_attrs= (rknn.rknn_tensor_attr * io_num.n_input)()
+    ct.memset(output_attrs, 0, io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
+
     inputs = (rknn.rknn_input * io_num.n_input)()
     ct.memset(inputs, 0, io_num.n_input * ct.sizeof(rknn.rknn_input))
+    outputs = (rknn.rknn_output * io_num.n_output)()
+    ct.memset(outputs, 0, io_num.n_output * ct.sizeof(rknn.rknn_output))
 
 
     for i in range(io_num.n_input):
       input_attrs[i].index = i
+      output_attrs[i].index = i
       ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_OUTPUT_ATTR, ct.byref(output_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+
     
     # Copy string into op_type buffer
     dest_ptr = ct.cast(custom_op[0].op_type, ct.c_char_p)
@@ -194,7 +202,15 @@ class RKNNProgram:
     ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
 
     print('run_duration', perf_run.run_duration)
-  
+    for i in range(io_num.n_output):
+      outputs[i].index = i
+      outputs[i].want_float = 0
+      outputs[i].is_prealloc = 0
+
+    rknn.rknn_outputs_get(self.dev.custom_ctx, io_num.n_output, outputs, None)
+    print(outputs[0].size)
+    print(outputs[0])
+      
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     # print([i.malloc for i in bufs])
     # args = list([i.malloc for i in bufs]) 
