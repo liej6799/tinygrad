@@ -45,17 +45,21 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
    
- unsigned char*      in_ptr   = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
-    unsigned char*      out_ptr  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
-    const float*        in_data  = (const float*)in_ptr;
-    float*              out_data = (float*)out_ptr;
+   unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
+  unsigned char*      in_ptr_1   = (unsigned char*)inputs[1].mem.virt_addr + inputs[1].mem.offset;
+  unsigned char*      out_ptr_0  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
+  unsigned char*      out_ptr_1  = (unsigned char*)outputs[1].mem.virt_addr + outputs[1].mem.offset;
+  const float*        in_data_0  = (const float*)in_ptr_0;
+  const float*        in_data_1  = (const float*)in_ptr_1;
+  float*              out_data_0 = (float*)out_ptr_0;
+  float*              out_data_1 = (float*)out_ptr_1;
+
     int inside  = 1;
-
-        out_data[0] = 1.0f;
-
+    out_data_0 = (in_data_0);
+    out_data_1 = (in_data_1);
 
     return 0;
-}
+    }
 """))
 
 # print(a, b, c)

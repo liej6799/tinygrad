@@ -140,29 +140,29 @@ class RKNNProgram:
 
     print('size: ',  ct.sizeof(rknn.rknn_tensor_attr))
 
-    io_num = rknn.rknn_input_output_num()
-    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
+    self.io_num = rknn.rknn_input_output_num()
+    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(self.io_num), ct.sizeof(self.io_num))
 
     custom_string = rknn.rknn_custom_string()
     rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_CUSTOM_STRING, ct.byref(custom_string), ct.sizeof(custom_string))
     print(custom_string)
 
-    input_attrs= (rknn.rknn_tensor_attr * io_num.n_input)()
-    ct.memset(input_attrs, 0, io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
+    self.input_attrs= (rknn.rknn_tensor_attr * self.io_num.n_input)()
+    ct.memset(self.input_attrs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
 
-    output_attrs= (rknn.rknn_tensor_attr * io_num.n_input)()
-    ct.memset(output_attrs, 0, io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
+    output_attrs= (rknn.rknn_tensor_attr * self.io_num.n_input)()
+    ct.memset(output_attrs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
 
-    inputs = (rknn.rknn_input * io_num.n_input)()
-    ct.memset(inputs, 0, io_num.n_input * ct.sizeof(rknn.rknn_input))
-    outputs = (rknn.rknn_output * io_num.n_output)()
-    ct.memset(outputs, 0, io_num.n_output * ct.sizeof(rknn.rknn_output))
+    self.inputs = (rknn.rknn_input * self.io_num.n_input)()
+    ct.memset(self.inputs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_input))
+    self.outputs = (rknn.rknn_output * self.io_num.n_output)()
+    ct.memset(self.outputs, 0, self.io_num.n_output * ct.sizeof(rknn.rknn_output))
 
 
-    for i in range(io_num.n_input):
-      input_attrs[i].index = i
+    for i in range(self.io_num.n_input):
+      self.input_attrs[i].index = i
       output_attrs[i].index = i
-      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(self.input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
       ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_OUTPUT_ATTR, ct.byref(output_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
 
     
@@ -178,38 +178,7 @@ class RKNNProgram:
 
     print('reg_custom_op', reg_custom_op)
 
-    # try input fake data
-    input_data = (ct.c_void_p * io_num.n_input)()
-    for i in range(io_num.n_input):
-      buf = ct.create_string_buffer(input_attrs[i].n_elems * ct.sizeof(ct.c_uint16))
-      input_data[i] = ct.cast(buf, ct.c_void_p)
-
-    for i in range(io_num.n_input):
-      inputs[i].index = i
-      inputs[i].pass_through = 0
-      inputs[i].type = rk.RKNN_TENSOR_FLOAT16
-      inputs[i].fmt = input_attrs[i].fmt
-      inputs[i].size = input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
-      inputs[i].buf = input_data[i]
-
-    rknn.rknn_inputs_set(self.dev.custom_ctx, io_num.n_input, inputs)
-    rknn.rknn_run(self.dev.custom_ctx, None)
-
-  # io_num = rknn.rknn_input_output_num()
-  #   rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
-
-    perf_run = rknn.rknn_perf_run()
-    ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
-
-    print('run_duration', perf_run.run_duration)
-    for i in range(io_num.n_output):
-      outputs[i].index = i
-      outputs[i].want_float = 0
-      outputs[i].is_prealloc = 0
-
-    rknn.rknn_outputs_get(self.dev.custom_ctx, io_num.n_output, outputs, None)
-    print(outputs[0].size)
-    print(outputs[0])
+   
       
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     # print([i.malloc for i in bufs])
@@ -227,6 +196,50 @@ class RKNNProgram:
     rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[1].buf, self.dev.io_attr.B)
     rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[0].buf, self.dev.io_attr.C)
     rknn.rknn_matmul_run(self.dev.ctx)
+
+ # try input fake data
+    input_data = (ct.c_void_p * self.io_num.n_input)()
+    for i in range(self.io_num.n_input):
+    #  buf = ct.create_string_buffer(self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16))
+      buf = (ctypes.c_float * 1)(1.0)
+      
+      print('buf', buf)
+      input_data[i] = ct.cast(buf, ct.c_void_p)
+
+    for i in range(self.io_num.n_input):
+      self.inputs[i].index = i
+      self.inputs[i].pass_through = 0
+      self.inputs[i].type = rk.RKNN_TENSOR_FLOAT16
+      self.inputs[i].fmt = self.input_attrs[i].fmt
+      self.inputs[i].size = self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
+      self.inputs[i].buf = input_data[i]
+
+    rknn.rknn_inputs_set(self.dev.custom_ctx, self.io_num.n_input, self.inputs)
+    rknn.rknn_run(self.dev.custom_ctx, None)
+
+  # io_num = rknn.rknn_input_output_num()
+  #   rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
+
+    perf_run = rknn.rknn_perf_run()
+    ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
+
+    print('run_duration', perf_run.run_duration)
+    for i in range(self.io_num.n_output):
+      self.outputs[i].index = i
+      self.outputs[i].want_float = 0
+      self.outputs[i].is_prealloc = 0
+
+    rknn.rknn_outputs_get(self.dev.custom_ctx, self.io_num.n_output, self.outputs, None)
+    print(self.outputs[0].size)
+    print(self.outputs[0].buf)
+    
+    void_ptr = ct.c_void_p(self.outputs[0].buf)
+    # Cast void_ptr to c_char_p (pointer to char)
+    float_ptr = ct.cast(void_ptr, ct.POINTER(ct.c_float))
+
+    first_value = float_ptr
+    print('value:', first_value.contents)
+
 
 
 
