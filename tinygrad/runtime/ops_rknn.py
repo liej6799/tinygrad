@@ -107,7 +107,7 @@ class RKNNDevice(Compiled):
     rknn.rknn_matmul_create(self.ctx, info, self.io_attr)
     rknn.rknn_matmul_set_core_mask(self.ctx, rknn.RKNN_NPU_CORE_0_1_2)
 
-    super().__init__(device, RKNNAllocator(self), RKNNRenderer(), ClangJITCompiler(),  functools.partial(RKNNProgram, self))
+    super().__init__(device, MallocAllocator, RKNNRenderer(), ClangJITCompiler(),  functools.partial(RKNNProgram, self))
 
 
 class RKNNProgram:
@@ -190,21 +190,58 @@ class RKNNProgram:
     # print('args: ', args)
     # print("run cpu", self.fxn)
     # print(self.fxn(*bufs))
-    
+    print('local_size', local_size)
+    print('global_size', global_size)
+    print('vals', vals)
 
-    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[2].buf, self.dev.io_attr.A)
-    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[1].buf, self.dev.io_attr.B)
-    rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[0].buf, self.dev.io_attr.C)
-    rknn.rknn_matmul_run(self.dev.ctx)
+    args = list(bufs)
 
- # try input fake data
-    input_data = (ct.c_void_p * self.io_num.n_input)()
-    for i in range(self.io_num.n_input):
-    #  buf = ct.create_string_buffer(self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16))
-      buf = (ctypes.c_float * 1)(1.0)
-      
-      print('buf', buf)
-      input_data[i] = ct.cast(buf, ct.c_void_p)
+    for i in range(10):
+      print(args[1][i])
+
+
+    # rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[2].buf, self.dev.io_attr.A)
+    # rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[1].buf, self.dev.io_attr.B)
+    # rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[0].buf, self.dev.io_attr.C)
+    # rknn.rknn_matmul_run(self.dev.ctx)
+
+    # for i in range(10):
+
+    #   print(bufs[1].malloc)
+
+
+#  # try input fake 
+#     print('self.io_num.n_input', self.input_attrs[0].n_dims)
+#     input_data = (ct.c_void_p * self.io_num.n_input)()
+#     for i in range(self.io_num.n_input):
+#     #  buf = ct.create_string_buffer(self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16))
+#       for j in range(self.input_attrs[0].n_dims):
+        
+#         buf = (ctypes.c_float * 1)(1.0)
+        
+#         print('buf', buf)
+#         input_data[i][j] = ct.cast(buf, ct.c_void_p)
+    size = 16777216
+
+    # Define a ctypes array of floats
+    FloatArray = ctypes.c_float * size
+
+    # Allocate and initialize 'test' array
+    test = FloatArray()
+    for i in range(size):
+        test[i] = 10.0
+
+    # Allocate 'data' array
+    data = FloatArray()
+
+    # Copy memory from 'test' to 'data' (like memcpy)
+    ctypes.memmove(data, test, ctypes.sizeof(FloatArray))
+
+    # Cast 'data' to unsigned char pointer (byte pointer)
+    byte_data = ctypes.cast(data, ctypes.c_void_p)
+
+    # input_data[0] = (args[1])
+    # input_data[1] = (args[2])
 
     for i in range(self.io_num.n_input):
       self.inputs[i].index = i
@@ -212,8 +249,8 @@ class RKNNProgram:
       self.inputs[i].type = rk.RKNN_TENSOR_FLOAT16
       self.inputs[i].fmt = self.input_attrs[i].fmt
       self.inputs[i].size = self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
-      self.inputs[i].buf = input_data[i]
-
+      self.inputs[i].buf = byte_data
+    print(' self.input_attrs[i].fmt',  self.input_attrs[i].fmt)
     rknn.rknn_inputs_set(self.dev.custom_ctx, self.io_num.n_input, self.inputs)
     rknn.rknn_run(self.dev.custom_ctx, None)
 
@@ -226,19 +263,21 @@ class RKNNProgram:
     print('run_duration', perf_run.run_duration)
     for i in range(self.io_num.n_output):
       self.outputs[i].index = i
-      self.outputs[i].want_float = 0
+      self.outputs[i].want_float = 1
       self.outputs[i].is_prealloc = 0
 
     rknn.rknn_outputs_get(self.dev.custom_ctx, self.io_num.n_output, self.outputs, None)
-    print(self.outputs[0].size)
-    print(self.outputs[0].buf)
-    
-    void_ptr = ct.c_void_p(self.outputs[0].buf)
-    # Cast void_ptr to c_char_p (pointer to char)
-    float_ptr = ct.cast(void_ptr, ct.POINTER(ct.c_float))
 
-    first_value = float_ptr
-    print('value:', first_value.contents)
+    print(self.inputs[0].buf)
+    print(self.outputs[0].buf)
+    # Cast void_ptr to c_char_p (pointer to char)
+    float_ptr_1 = ct.cast(self.inputs[0].buf, ct.POINTER(ct.c_float))
+    float_ptr_2 = ct.cast(self.outputs[0].buf, ct.POINTER(ct.c_float))
+
+
+    print('value:', float_ptr_1[0])
+    print('value:', float_ptr_2[0])
+
 
 
 
@@ -258,7 +297,7 @@ class RKNNAllocator(Allocator):
     alignment = 0x1000 if size >= 0x1000 else 0x20
     malloc = (ctypes.c_uint8 * size).from_address(options.external_ptr) if options.external_ptr else self._alloc_aligned(size, alignment)
 
-    print(buf)
+    print('options', options)
 
     return RKNNBuffer(buf, buf.contents.virt_addr, size, malloc)  # Placeholder for actual buffer allocation logic)
     

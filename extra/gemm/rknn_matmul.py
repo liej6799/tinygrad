@@ -5,6 +5,7 @@ import numpy as np
 from tinygrad import Device, dtypes
 from tinygrad.helpers import getenv, flat_mv
 from tinygrad.runtime.ops_rknn import RKNNDevice, RKNNAllocator, RKNNProgram
+from tinygrad.device import Compiled, Compiler, MallocAllocator, CPUProgram
 import ctypes as ct
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.autogen import rknn as rknn
@@ -13,7 +14,7 @@ N = getenv("N", 32)
 LID = 2
 
 device = RKNNDevice("RKNN")
-rknnalloc = RKNNAllocator(dev=device)
+rknnalloc = MallocAllocator
 
 ROW_A = 1
 COL_A = 32
@@ -54,10 +55,14 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
   float*              out_data_0 = (float*)out_ptr_0;
   float*              out_data_1 = (float*)out_ptr_1;
 
-    int inside  = 1;
-    out_data_0 = (in_data_0);
-    out_data_1 = (in_data_1);
 
+    const auto out_elems = outputs[0].attr.n_elems; 
+    for (size_t idx=0; idx<out_elems;idx++) {
+      float val0 = *(in_data_0+idx);
+      float val1 = *(in_data_1+idx);
+
+      *(out_data_0+idx) = (3.0f);
+    }
     return 0;
     }
 """))
@@ -68,9 +73,9 @@ prog(c, a, b)
 
 
 
-rknnalloc._copyout(c,flat_mv(C.data))
+# rknnalloc._copyout(c,flat_mv(C.data))
 
-print(C)
+# print(C)
 # prog = RKNNProgram(device, "test", RKNNCompiler().compile(f"""
 # #include <vector123>
 # #include <arm_neon.h>
