@@ -76,7 +76,7 @@ class RKNNDevice(Compiled):
     self.custom_ctx = ct.c_ulong()
     #/root/dev/tinygrad/extra/rockchip/mobilenet_v1.rknn
 
-    py_str = '/root/dev/tinygrad/extra/rockchip/dual_residual_custom.rknn'
+    py_str = '/root/dev/rk3588/rknn-demo/dual_residual_custom.rknn'
 
     # Convert to bytes
     byte_str = py_str.encode('utf-8')
@@ -237,8 +237,10 @@ class RKNNProgram:
     # Copy memory from 'test' to 'data' (like memcpy)
     ctypes.memmove(data, test, ctypes.sizeof(FloatArray))
 
-    # Cast 'data' to unsigned char pointer (byte pointer)
+
     byte_data = ctypes.cast(data, ctypes.c_void_p)
+
+    print(f"First float value: {data[0]:.6f}")
 
     # input_data[0] = (args[1])
     # input_data[1] = (args[2])
@@ -246,11 +248,13 @@ class RKNNProgram:
     for i in range(self.io_num.n_input):
       self.inputs[i].index = i
       self.inputs[i].pass_through = 0
-      self.inputs[i].type = rk.RKNN_TENSOR_FLOAT16
-      self.inputs[i].fmt = self.input_attrs[i].fmt
-      self.inputs[i].size = self.input_attrs[i].n_elems * ct.sizeof(ct.c_uint16)
+      self.inputs[i].type = rk.RKNN_TENSOR_FLOAT32
+      self.inputs[i].fmt = rknn.RKNN_TENSOR_UNDEFINED
+      self.inputs[i].size = size
       self.inputs[i].buf = byte_data
+
     print(' self.input_attrs[i].fmt',  self.input_attrs[i].fmt)
+    print('self.inputs[i].size', self.inputs[i].size)
     rknn.rknn_inputs_set(self.dev.custom_ctx, self.io_num.n_input, self.inputs)
     rknn.rknn_run(self.dev.custom_ctx, None)
 

@@ -61,7 +61,7 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
       float val0 = *(in_data_0+idx);
       float val1 = *(in_data_1+idx);
 
-      *(out_data_0+idx) = (3.0f);
+      *(out_data_0+idx) = val0 + 1.0f;
     }
     return 0;
     }
