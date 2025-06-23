@@ -196,6 +196,8 @@ class RKNNProgram:
 
     args = list(bufs)
 
+    print('bufs: ', bufs[0])
+
     for i in range(10):
       print(args[1][i])
 
@@ -221,7 +223,7 @@ class RKNNProgram:
         
 #         print('buf', buf)
 #         input_data[i][j] = ct.cast(buf, ct.c_void_p)
-    size = 16777216
+    size = 24
 
     # Define a ctypes array of floats
     FloatArray = ctypes.c_float * size
@@ -237,10 +239,26 @@ class RKNNProgram:
     # Copy memory from 'test' to 'data' (like memcpy)
     ctypes.memmove(data, test, ctypes.sizeof(FloatArray))
 
-
     byte_data = ctypes.cast(data, ctypes.c_void_p)
+    byte_data_2 = ctypes.cast( bufs[0], ctypes.c_void_p)
+
+    ByteArray = ctypes.c_ubyte * (size * ctypes.sizeof(ctypes.c_float))
+    byte_data_3 = ByteArray.from_address(ctypes.addressof(data))
 
     print(f"First float value: {data[0]:.6f}")
+
+    for i in range(10):
+      print('type 1: ', byte_data_3[i])
+      print('type 2: ', bufs[1][i])
+
+    print('size: ', ct.sizeof(byte_data_3) /4)
+    print('size: ', ct.sizeof(bufs[1]))
+
+    res_1 = ctypes.cast(byte_data_3, ctypes.c_void_p)
+    res_2 = ctypes.cast(bufs[1], ctypes.c_void_p)
+    print('res_1: ', res_1)
+    print('res_2: ', res_2)
+    print(bufs[1][0])
 
     # input_data[0] = (args[1])
     # input_data[1] = (args[2])
@@ -251,7 +269,7 @@ class RKNNProgram:
       self.inputs[i].type = rk.RKNN_TENSOR_FLOAT32
       self.inputs[i].fmt = rknn.RKNN_TENSOR_UNDEFINED
       self.inputs[i].size = size
-      self.inputs[i].buf = byte_data
+      self.inputs[i].buf = res_2
 
     print(' self.input_attrs[i].fmt',  self.input_attrs[i].fmt)
     print('self.inputs[i].size', self.inputs[i].size)
@@ -275,12 +293,17 @@ class RKNNProgram:
     print(self.inputs[0].buf)
     print(self.outputs[0].buf)
     # Cast void_ptr to c_char_p (pointer to char)
-    float_ptr_1 = ct.cast(self.inputs[0].buf, ct.POINTER(ct.c_float))
-    float_ptr_2 = ct.cast(self.outputs[0].buf, ct.POINTER(ct.c_float))
+    float_ptr_1 = ct.cast(self.inputs[0].buf, ct.POINTER(ct.c_ubyte))
+    float_ptr_2 = ct.cast(self.outputs[0].buf, ct.POINTER(ct.c_ubyte))
 
 
-    print('value:', float_ptr_1[0])
-    print('value:', float_ptr_2[0])
+    ctypes.memmove(bufs[0], float_ptr_2, size)
+
+
+
+    print('value:', float_ptr_1[6])
+    print('value:', float_ptr_2[6])
+    print('value:', bufs[0][6])
 
 
 

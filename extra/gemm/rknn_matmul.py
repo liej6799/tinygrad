@@ -20,13 +20,17 @@ ROW_A = 1
 COL_A = 32
 COL_B = 32
 
-a = rknnalloc.alloc(device.io_attr.A.size)
-b = rknnalloc.alloc(device.io_attr.B.size)
+a = rknnalloc.alloc(device.io_attr.A.size * 2)
+b = rknnalloc.alloc(device.io_attr.B.size * 2)
 c = rknnalloc.alloc(device.io_attr.C.size)
 
-A = np.random.rand(ROW_A, COL_A).astype(np.float16)
-B = np.random.rand(COL_A, COL_B).astype(np.float16)
+A = np.empty((ROW_A, COL_A), dtype=np.float32)
+B = np.empty((COL_A, COL_B), dtype=np.float32)
 C = np.empty((ROW_A, COL_B), dtype=np.float32)
+
+A.fill(10.0)
+B.fill(10.0)
+print("data: ", A[0][0])
 
 # copyin
 rknnalloc._copyin(a, memoryview(bytearray(A)))
@@ -46,7 +50,7 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
    
-   unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
+  unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
   unsigned char*      in_ptr_1   = (unsigned char*)inputs[1].mem.virt_addr + inputs[1].mem.offset;
   unsigned char*      out_ptr_0  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
   unsigned char*      out_ptr_1  = (unsigned char*)outputs[1].mem.virt_addr + outputs[1].mem.offset;
@@ -61,7 +65,7 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
       float val0 = *(in_data_0+idx);
       float val1 = *(in_data_1+idx);
 
-      *(out_data_0+idx) = val0 + 1.0f;
+      *(out_data_0+idx) = val0 + 5.0f;
     }
     return 0;
     }
