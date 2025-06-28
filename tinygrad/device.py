@@ -255,13 +255,7 @@ class CPUProgram:
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     args = list(bufs)
 
-    print('0--')
-    for i in range(20):
-      print(args[0][i])
 
-    print('1--')
-    for i in range(20):
-      print(args[1][i])
 
 
     print('args: ', args)

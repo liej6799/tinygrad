@@ -14,22 +14,22 @@ N = getenv("N", 32)
 LID = 2
 
 device = RKNNDevice("RKNN")
-rknnalloc = MallocAllocator
+rknnalloc = RKNNAllocator()
 
 ROW_A = 1
-COL_A = 32
+COL_A = 24
 COL_B = 32
 
-a = rknnalloc.alloc(device.io_attr.A.size * 2)
-b = rknnalloc.alloc(device.io_attr.B.size * 2)
-c = rknnalloc.alloc(device.io_attr.C.size)
+a = rknnalloc.alloc(24 * 2)
+b = rknnalloc.alloc(24 * 2)
+c = rknnalloc.alloc(24 * 2)
 
 A = np.empty((ROW_A, COL_A), dtype=np.float32)
-B = np.empty((COL_A, COL_B), dtype=np.float32)
-C = np.empty((ROW_A, COL_B), dtype=np.float32)
+B = np.empty((ROW_A, COL_A), dtype=np.float32)
+C = np.empty((ROW_A, COL_A), dtype=np.float32)
 
-A.fill(10.0)
-B.fill(10.0)
+A.fill(16.0)
+B.fill(16.0)
 print("data: ", A[0][0])
 
 # copyin

@@ -7,6 +7,7 @@ from tinygrad.runtime.autogen import rknn
 import ctypes as ct 
 import os, mmap, functools
 import fcntl
+from tinygrad.helpers import getenv, flat_mv
 from typing import Any, cast, ClassVar
 from tinygrad.runtime.support.hcq import FileIOInterface
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, prod, fromimport, OSX
@@ -58,8 +59,8 @@ class RKNNRenderer(ClangRenderer):
   device = "RKNN"
 
 class RKNNBuffer:
-  def __init__(self, buf:Any, virt_addr:int, size:int, malloc, offset:int=0):
-    self.buf, self.virt_addr, self.size, self.malloc, self.offset = buf, virt_addr, size, malloc, offset
+  def __init__(self, buf:Any, size:int):
+    self.buf, self.size = buf, size
 
 
 
@@ -107,7 +108,7 @@ class RKNNDevice(Compiled):
     rknn.rknn_matmul_create(self.ctx, info, self.io_attr)
     rknn.rknn_matmul_set_core_mask(self.ctx, rknn.RKNN_NPU_CORE_0_1_2)
 
-    super().__init__(device, MallocAllocator, RKNNRenderer(), ClangJITCompiler(),  functools.partial(RKNNProgram, self))
+    super().__init__(device, RKNNAllocator(), ClangRenderer(), ClangJITCompiler(),  functools.partial(RKNNProgram, self))
 
 
 class RKNNProgram:
@@ -119,20 +120,39 @@ class RKNNProgram:
     #include "rknn_api.h"
     #include "rknn_custom_op.h"
 
-    int compute_custom_sigmoid_float32(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
+#include <math.h>
+
+int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* inputs, uint32_t n_inputs,
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
+   
+   unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
+  unsigned char*      in_ptr_1   = (unsigned char*)inputs[1].mem.virt_addr + inputs[1].mem.offset;
+  unsigned char*      out_ptr_0  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
+  unsigned char*      out_ptr_1  = (unsigned char*)outputs[1].mem.virt_addr + outputs[1].mem.offset;
+  const float*        in_data_0  = (const float*)in_ptr_0;
+  const float*        in_data_1  = (const float*)in_ptr_1;
+  float*              out_data_0 = (float*)out_ptr_0;
+  float*              out_data_1 = (float*)out_ptr_1;
 
+
+    const auto out_elems = outputs[0].attr.n_elems; 
+    for (size_t idx=0; idx<out_elems;idx++) {
+      float val0 = *(in_data_0+idx);
+      float val1 = *(in_data_1+idx);
+
+      *(out_data_0+idx) = (val0 + val1) + 0;
+    }
     return 0;
-}
+    }
     """)
     print('liba', liba)
     print('name', name)
     from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
     # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
     # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
-    self.mem = mmap(-1, len(lib), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
-    self.mem.write(lib)
+    self.mem = mmap(-1, len(liba), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
+    self.mem.write(liba)
 
 
     custom_op = (rknn.rknn_custom_op * 1)()
@@ -193,13 +213,9 @@ class RKNNProgram:
     print('local_size', local_size)
     print('global_size', global_size)
     print('vals', vals)
-
     args = list(bufs)
+    print('args: ', args)
 
-    print('bufs: ', bufs[0])
-
-    for i in range(10):
-      print(args[1][i])
 
 
     # rknn.rknn_matmul_set_io_mem(self.dev.ctx, bufs[2].buf, self.dev.io_attr.A)
@@ -223,56 +239,22 @@ class RKNNProgram:
         
 #         print('buf', buf)
 #         input_data[i][j] = ct.cast(buf, ct.c_void_p)
-    size = 24
+    
 
-    # Define a ctypes array of floats
-    FloatArray = ctypes.c_float * size
+    self.inputs[0].index = 0
+    self.inputs[0].pass_through = 0
+    self.inputs[0].type = rk.RKNN_TENSOR_FLOAT32
+    self.inputs[0].fmt = rknn.RKNN_TENSOR_UNDEFINED
+    self.inputs[0].size = bufs[1].size
+    self.inputs[0].buf =  ctypes.cast( bufs[1].buf, ctypes.c_void_p)
 
-    # Allocate and initialize 'test' array
-    test = FloatArray()
-    for i in range(size):
-        test[i] = 10.0
+    self.inputs[1].index = 1
+    self.inputs[1].pass_through = 0
+    self.inputs[1].type = rk.RKNN_TENSOR_FLOAT32
+    self.inputs[1].fmt = rknn.RKNN_TENSOR_UNDEFINED
+    self.inputs[1].size = bufs[2].size
+    self.inputs[1].buf = ctypes.cast( bufs[2].buf, ctypes.c_void_p)
 
-    # Allocate 'data' array
-    data = FloatArray()
-
-    # Copy memory from 'test' to 'data' (like memcpy)
-    ctypes.memmove(data, test, ctypes.sizeof(FloatArray))
-
-    byte_data = ctypes.cast(data, ctypes.c_void_p)
-    byte_data_2 = ctypes.cast( bufs[0], ctypes.c_void_p)
-
-    ByteArray = ctypes.c_ubyte * (size * ctypes.sizeof(ctypes.c_float))
-    byte_data_3 = ByteArray.from_address(ctypes.addressof(data))
-
-    print(f"First float value: {data[0]:.6f}")
-
-    for i in range(10):
-      print('type 1: ', byte_data_3[i])
-      print('type 2: ', bufs[1][i])
-
-    print('size: ', ct.sizeof(byte_data_3) /4)
-    print('size: ', ct.sizeof(bufs[1]))
-
-    res_1 = ctypes.cast(byte_data_3, ctypes.c_void_p)
-    res_2 = ctypes.cast(bufs[1], ctypes.c_void_p)
-    print('res_1: ', res_1)
-    print('res_2: ', res_2)
-    print(bufs[1][0])
-
-    # input_data[0] = (args[1])
-    # input_data[1] = (args[2])
-
-    for i in range(self.io_num.n_input):
-      self.inputs[i].index = i
-      self.inputs[i].pass_through = 0
-      self.inputs[i].type = rk.RKNN_TENSOR_FLOAT32
-      self.inputs[i].fmt = rknn.RKNN_TENSOR_UNDEFINED
-      self.inputs[i].size = size
-      self.inputs[i].buf = res_2
-
-    print(' self.input_attrs[i].fmt',  self.input_attrs[i].fmt)
-    print('self.inputs[i].size', self.inputs[i].size)
     rknn.rknn_inputs_set(self.dev.custom_ctx, self.io_num.n_input, self.inputs)
     rknn.rknn_run(self.dev.custom_ctx, None)
 
@@ -293,52 +275,66 @@ class RKNNProgram:
     print(self.inputs[0].buf)
     print(self.outputs[0].buf)
     # Cast void_ptr to c_char_p (pointer to char)
-    float_ptr_1 = ct.cast(self.inputs[0].buf, ct.POINTER(ct.c_ubyte))
-    float_ptr_2 = ct.cast(self.outputs[0].buf, ct.POINTER(ct.c_ubyte))
+    float_ptr_1 = ct.cast(self.inputs[0].buf, ct.POINTER(ct.c_float))
+    float_ptr_2 = ct.cast(self.outputs[0].buf, ct.POINTER(ct.c_float))
+    float_ptr_3 = ct.cast(self.inputs[1].buf, ct.POINTER(ct.c_float))
 
+    ctypes.memmove(bufs[0].buf, float_ptr_2, bufs[0].size)
+    print('value:', float_ptr_1[0])
+    print('value:', float_ptr_2[0])
+    print('value:', float_ptr_3[0])
 
-    ctypes.memmove(bufs[0], float_ptr_2, size)
-
-
-
-    print('value:', float_ptr_1[6])
-    print('value:', float_ptr_2[6])
-    print('value:', bufs[0][6])
-
-
-
-
-
-class RKNNAllocator(Allocator):
-  def __init__(self, dev:RKNNDevice):
-    self.dev = dev
-    super().__init__()    
-  dev = None
-  def _as_buffer(self, src:RKNNBuffer) -> memoryview: return to_mv(src.virt_addr, src.size)
+class RKNNAllocator(LRUAllocator):
+  def _alloc(self, size:int, options):
+    print('alloc size', size)
+    # must be aligned to 0x20 for 256-bit ymm registers
+    # TODO: investigate if this is the cause of nondeterminism in speed
+    alignment = 0x1000 if size >= 0x1000 else 0x20
+    return RKNNBuffer(buf = (ctypes.c_uint8 * size).from_address(options.external_ptr) if options.external_ptr else self._alloc_aligned(size, alignment), size=size)
   def _alloc_aligned(self, size:int, alignment:int):
     buffer = (ctypes.c_uint8 * (size + alignment))()
     offset = round_up(ctypes.addressof(buffer), alignment) - ctypes.addressof(buffer)
     return (ctypes.c_uint8 * size).from_buffer(buffer, offset)
-  def _alloc(self, size, options): 
-    buf = rknn.rknn_create_mem(self.dev.ctx, size)
-    alignment = 0x1000 if size >= 0x1000 else 0x20
-    malloc = (ctypes.c_uint8 * size).from_address(options.external_ptr) if options.external_ptr else self._alloc_aligned(size, alignment)
-
-    print('options', options)
-
-    return RKNNBuffer(buf, buf.contents.virt_addr, size, malloc)  # Placeholder for actual buffer allocation logic)
-    
-  def _copyin(self, dest:RKNNBuffer, src:memoryview): 
+  def _as_buffer(self, src) -> memoryview: return flat_mv(memoryview(src.buf))
+  def _copyin(self, dest, src:memoryview): 
     print('copyin')
-    ct.memmove(dest.virt_addr, from_mv(src), src.nbytes)
-    
-  def _copyout(self, dest:memoryview, src:RKNNBuffer): 
-    print('copyout')
-    ct.memmove(from_mv(src), dest.virt_addr, dest.size)
+    ctypes.memmove(dest.buf, from_mv(src), len(src))
+  def _copyout(self, dest:memoryview, src): ctypes.memmove(from_mv(dest), src, len(dest))
+  def _offset(self, buf, size:int, offset:int): return from_mv(self._as_buffer(buf)[offset:offset+size])
 
-  def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
-    print('transfer')
-    pass    
+
+
+
+# class RKNNAllocator(Allocator):
+#   def __init__(self, dev:RKNNDevice):
+#     self.dev = dev
+#     super().__init__()    
+#   dev = None
+#   def _as_buffer(self, src:RKNNBuffer) -> memoryview: return to_mv(src.virt_addr, src.size)
+#   def _alloc_aligned(self, size:int, alignment:int):
+#     buffer = (ctypes.c_uint8 * (size + alignment))()
+#     offset = round_up(ctypes.addressof(buffer), alignment) - ctypes.addressof(buffer)
+#     return (ctypes.c_uint8 * size).from_buffer(buffer, offset)
+#   def _alloc(self, size, options): 
+#     buf = rknn.rknn_create_mem(self.dev.ctx, size)
+#     alignment = 0x1000 if size >= 0x1000 else 0x20
+#     malloc = (ctypes.c_uint8 * size).from_address(options.external_ptr) if options.external_ptr else self._alloc_aligned(size, alignment)
+
+#     print('options', options)
+
+#     return RKNNBuffer(buf, buf.contents.virt_addr, size, malloc)  # Placeholder for actual buffer allocation logic)
+    
+#   def _copyin(self, dest:RKNNBuffer, src:memoryview): 
+#     print('copyin')
+#     ct.memmove(dest.virt_addr, from_mv(src), src.nbytes)
+    
+#   def _copyout(self, dest:memoryview, src:RKNNBuffer): 
+#     print('copyout')
+#     ct.memmove(from_mv(src), dest.virt_addr, dest.size)
+
+#   def _transfer(self, dest, src, sz:int, src_dev, dest_dev): 
+#     print('transfer')
+#     pass    
 
 class RKNNGraph(MultiGraphRunner):
   def __call__(self, input_rawbuffers, var_vals, wait=False) -> float|None: return 1e-3

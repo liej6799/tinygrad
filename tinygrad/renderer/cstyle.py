@@ -110,28 +110,7 @@ class CStyleLanguage(Renderer):
     prg = ''.join([f"{self.kernel_prefix}void {self.get_kernel_modifier(uops)}{function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
-       
-
     print(prg if prefix is None else "\n".join(prefix)+f"\n{prg}")
-    code = """
-    #include <stdio.h>
-    #include <stdlib.h>
-    void E_4(int* restrict data0, int* restrict data1, int* restrict data2) {
-  int val0 = *(data1+0);
-  int val1 = *(data1+1);
-  int val2 = *(data1+2);
-  int val3 = *(data1+3);
-  int val4 = *(data2+0);
-  int val5 = *(data2+1);
-  int val6 = *(data2+2);
-  int val7 = *(data2+3);
-  *(data0+0) = (val0-val4);
-  *(data0+1) = (val1-val5);
-  *(data0+2) = (val2-val6);
-  *(data0+3) = (val3-val7);
-  printf("awd");
-}
-    """
     return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
 
   def render_cast(self, dt:DType, val: str) -> str: return f"({self.render_dtype(dt)})({val})"
@@ -244,12 +223,38 @@ class ClangRenderer(CStyleLanguage):
   def _render_body(self, function_name, kernel, bufs, uops, pref=None) -> str: return super().render_kernel(function_name, kernel, bufs, uops, pref)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[DType,bool]]]) -> str: return ""
 
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    defines = '\n'.join(self._render_defines(uops))
+    return defines + "\n" + self._render_body(function_name, kernel, bufs, uops, prefix) + "\n" + self._render_entry(function_name, bufs)
+
 class OpenCLRenderer(CStyleLanguage):
   device = "GPU"
 
   # language options
   kernel_prefix = "__kernel "
   buffer_prefix = "__global "
+  smem_align = "__attribute__ ((aligned (16))) "
+  smem_prefix = "__local "
+  barrier = "barrier(CLK_LOCAL_MEM_FENCE);"
+  float4 = "(float4)"
+  code_for_workitem = {"g": lambda x: f"get_group_id({x})", "l": lambda x: f"get_local_id({x})", "i": lambda x: f"get_global_id({x})"}
+  type_map = { dtypes.int8: "char", dtypes.uint8: "uchar", dtypes.uint32: "uint", dtypes.uint16: "ushort", dtypes.uint64: "ulong",
+              dtypes.bfloat16: "ushort" }
+
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"as_{ctx.render_dtype(x.dtype)}({ctx[x.src[0]]})"),
+    # load/store image (OpenCL)
+    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2)), UPat.var("gate")), UPat.var("var"))),
+      lambda ctx,buf,idx,var,gate: f"({ctx[gate]}?read_imagef({ctx[buf]}, smp, {ctx[idx]}):{ctx[var]})"),
+    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2))),)),
+      lambda ctx,buf,idx: f"read_imagef({ctx[buf]}, smp, {ctx[idx]})"),
+    (UPat(Ops.STORE, src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2))), UPat.var("var", dtypes.float.vec(4))), allow_any_len=True),
+      lambda ctx,buf,idx,var: f"write_imagef({ctx[buf]}, {ctx[idx]}, {ctx[var]});"),
+  ]) + base_rewrite
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    if any(uop.dtype.base == dtypes.half for uop in uops): prefix = (["#pragma OPENCL EXTENSION cl_khr_fp16 : enable"] + (prefix or []))
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
 class IntelRenderer(OpenCLRenderer):
   device, suffix, kernel_prefix = "GPU", "INTEL", "__attribute__((intel_reqd_sub_group_size(8)))\n" + "__kernel "
