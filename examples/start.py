@@ -2,8 +2,8 @@ from tinygrad import Tensor, dtypes
 # rand = Tensor.rand(2, 3) # create a tensor of shape (2, 3) filled with random values from a uniform distribution
 # Create two tensors
 
-t1 = Tensor([[5.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # 2D tensor (matrix)
-t2 = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # 2D tensor (matrix)
+t1 = Tensor([[5.0, 2.0, 3.0, 4.0], [4.0, 5.0, 6.0, 4.0]])  # 2D tensor (matrix)
+t2 = Tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 5.0, 6.0, 4.0]])  # 2D tensor (matrix)
 
 t1_float32 = t1.float()
 t2_float32 = t2.float()

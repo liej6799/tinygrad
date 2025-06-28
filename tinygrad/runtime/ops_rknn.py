@@ -22,7 +22,7 @@ import time
 import pickle, base64, itertools, time, struct, sys
 from tinygrad.device import Compiled, Compiler, MallocAllocator, CPUProgram
 from tinygrad.runtime.ops_cpu import ClangJITCompiler
-
+import torch
 
 class ClangCompiler(Compiler):
   def __init__(self, cachekey="compile_clang", args:list[str]|None=None, objdump_tool='objdump'):
@@ -62,6 +62,26 @@ class RKNNBuffer:
   def __init__(self, buf:Any, size:int):
     self.buf, self.size = buf, size
 
+class Model(torch.nn.Module):
+  def __init__(self, *args, **kwargs) -> None:
+      super().__init__(*args, **kwargs)
+ 
+
+  def forward(self, x, y):
+      r1, r2 = torch.ops.cst.dual_residual(x, y)
+      return r1, r2
+
+
+class cstDualResidual:
+    # custom operator cstDualResidual 
+    op_type = 'cstDualResidual'
+    def shape_infer(self, node, in_shapes, in_dtypes):
+        return in_shapes.copy(), in_dtypes.copy()
+    def compute(self, node, inputs):
+        x = inputs[0]
+        y = inputs[1]
+        return [x, y] 
+
 
 
 
@@ -74,19 +94,8 @@ class RKNNDevice(Compiled):
 
     print('RKNN device')
     self.ctx = ct.c_ulong()
-    self.custom_ctx = ct.c_ulong()
-    #/root/dev/tinygrad/extra/rockchip/mobilenet_v1.rknn
-
-    py_str = '/root/dev/rk3588/rknn-demo/dual_residual_custom.rknn'
-
-    # Convert to bytes
-    byte_str = py_str.encode('utf-8')
-
-    # Create c_char_p
-    c_str = ctypes.c_char_p(byte_str)
 
 
-    rknn.rknn_init(self.custom_ctx, c_str, 0, 0, None)
 
     ROW_A = 1
     COL_A = 32
@@ -126,7 +135,7 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
                                     rknn_custom_op_tensor* outputs, uint32_t n_outputs)
 {
    
-   unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
+  unsigned char*      in_ptr_0  = (unsigned char*)inputs[0].mem.virt_addr + inputs[0].mem.offset;
   unsigned char*      in_ptr_1   = (unsigned char*)inputs[1].mem.virt_addr + inputs[1].mem.offset;
   unsigned char*      out_ptr_0  = (unsigned char*)outputs[0].mem.virt_addr + outputs[0].mem.offset;
   unsigned char*      out_ptr_1  = (unsigned char*)outputs[1].mem.virt_addr + outputs[1].mem.offset;
@@ -153,7 +162,106 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
     # MAP_JIT allows us to easily flip pages from RW- to R-X and vice versa. It is a noop on intel cpus. (man pthread_jit_write_protect_np)
     self.mem = mmap(-1, len(liba), MAP_ANON | MAP_PRIVATE | (MAP_JIT if OSX else 0), PROT_READ | PROT_WRITE | PROT_EXEC)
     self.mem.write(liba)
+    
+   
+      
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
 
+    # generate RKN
+    import torch
+    import torch.utils.cpp_extension
+
+    cpp_source = """
+    #include <torch/script.h>
+    std::tuple<torch::Tensor, torch::Tensor> dual_residual(torch::Tensor x, torch::Tensor y) {
+      return std::tuple<torch::Tensor, torch::Tensor>(x, y);}
+    static auto registry = torch::RegisterOperators()
+      .op("cst::dual_residual", &dual_residual);
+    """
+
+
+    torch.utils.cpp_extension.load_inline(
+      name="test",
+      cpp_sources=cpp_source,
+      functions="dual_residual",
+      verbose=True,
+      is_python_module=True,
+    )
+
+    x = torch.randn(1, int(bufs[1].size/4))
+    y = torch.randn(1, int(bufs[2].size/4))
+    m = Model()
+    z = m(x, y)
+        
+    from torch.onnx import register_custom_op_symbolic
+    from torch.onnx.symbolic_helper import parse_args
+
+    @parse_args('v', 'v', 'f')
+    def dual_residual_symbolic(g, x, y):
+        output = g.op("rknn_cst::cstDualResidual", x, y, 
+                    outputs=2)
+        return output
+
+    register_custom_op_symbolic("cst::dual_residual", dual_residual_symbolic, 12)
+    torch.onnx.export(m, (x, y), "dual_residual.onnx", opset_version=12)
+
+    # generate rknn
+    from rknn.api import RKNN
+    from rknn.api.custom_op import get_node_attr
+    custom_model_path = 'dual_residual.onnx'
+
+    # Create RKNN object
+    rknna = RKNN()
+
+    # Pre-process config
+    print('--> Config model')
+    rknna.config( target_platform='rk3588')
+    print('done')
+
+    # Register cstSigmoid op
+    print('--> Register cstDualResidual op')
+    ret = rknna.reg_custom_op(cstDualResidual())
+    if ret != 0:
+        print('Register cstDualResidual op failed!')
+        exit(ret)
+    print('done')
+
+    # Load model
+    print('--> Loading model')
+    ret = rknna.load_onnx(model=custom_model_path)
+    if ret != 0:
+        print('Load model failed!')
+        exit(ret)
+    print('done')
+
+    # Build model
+    print('--> Building model')
+    ret = rknna.build(do_quantization=False, dataset=None)
+    if ret != 0:
+        print('Build model failed!')
+        exit(ret)
+    print('done')
+
+    # Export rknn model
+    print('--> Export rknn model')
+    ret = rknna.export_rknn('dual_residual_custom.rknn')
+    if ret != 0:
+        print('Export rknn model failed!')
+        exit(ret)
+    print('done')
+
+    # Release
+    rknna.release()
+
+    self.custom_ctx = ct.c_ulong()
+
+    #/root/dev/tinygrad/extra/rockchip/mobilenet_v1.rknns
+    py_str = 'dual_residual_custom.rknn'
+    # Convert to bytes
+    byte_str = py_str.encode('utf-8')
+    # Create c_char_p
+    c_str = ctypes.c_char_p(byte_str)
+    rknn.rknn_init(self.custom_ctx, c_str, 0, 0, None)
 
     custom_op = (rknn.rknn_custom_op * 1)()
     ct.memset(ct.byref(custom_op), 0, ct.sizeof(rknn.rknn_custom_op))   
@@ -161,17 +269,17 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
     print('size: ',  ct.sizeof(rknn.rknn_tensor_attr))
 
     self.io_num = rknn.rknn_input_output_num()
-    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(self.io_num), ct.sizeof(self.io_num))
+    rknn.rknn_query(self.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(self.io_num), ct.sizeof(self.io_num))
 
     custom_string = rknn.rknn_custom_string()
-    rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_CUSTOM_STRING, ct.byref(custom_string), ct.sizeof(custom_string))
+    rknn.rknn_query(self.custom_ctx, rknn.RKNN_QUERY_CUSTOM_STRING, ct.byref(custom_string), ct.sizeof(custom_string))
     print(custom_string)
 
     self.input_attrs= (rknn.rknn_tensor_attr * self.io_num.n_input)()
     ct.memset(self.input_attrs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
 
-    output_attrs= (rknn.rknn_tensor_attr * self.io_num.n_input)()
-    ct.memset(output_attrs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
+    self.output_attrs= (rknn.rknn_tensor_attr * self.io_num.n_input)()
+    ct.memset(self.output_attrs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_tensor_attr))
 
     self.inputs = (rknn.rknn_input * self.io_num.n_input)()
     ct.memset(self.inputs, 0, self.io_num.n_input * ct.sizeof(rknn.rknn_input))
@@ -181,9 +289,9 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
 
     for i in range(self.io_num.n_input):
       self.input_attrs[i].index = i
-      output_attrs[i].index = i
-      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(self.input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
-      ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_OUTPUT_ATTR, ct.byref(output_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+      self.output_attrs[i].index = i
+      ret = rknn.rknn_query(self.custom_ctx, rknn.RKNN_QUERY_INPUT_ATTR, ct.byref(self.input_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
+      ret = rknn.rknn_query(self.custom_ctx, rknn.RKNN_QUERY_OUTPUT_ATTR, ct.byref(self.output_attrs[i]), ct.sizeof(rknn.rknn_tensor_attr))
 
     
     # Copy string into op_type buffer
@@ -194,13 +302,11 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
 
     self.fxn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(rknn.struct__rknn_custom_op_context), ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32, ctypes.POINTER(rknn.struct__rknn_custom_op_tensor), ctypes.c_uint32)(mv_address(self.mem))
     custom_op[0].compute = self.fxn
-    reg_custom_op = rknn.rknn_register_custom_ops(self.dev.custom_ctx, custom_op, 1)
+    reg_custom_op = rknn.rknn_register_custom_ops(self.custom_ctx, custom_op, 1)
 
-    print('reg_custom_op', reg_custom_op)
 
-   
-      
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+
+
     # print([i.malloc for i in bufs])
     # args = list([i.malloc for i in bufs]) 
     # print('args: ', args)
@@ -255,14 +361,15 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
     self.inputs[1].size = bufs[2].size
     self.inputs[1].buf = ctypes.cast( bufs[2].buf, ctypes.c_void_p)
 
-    rknn.rknn_inputs_set(self.dev.custom_ctx, self.io_num.n_input, self.inputs)
-    rknn.rknn_run(self.dev.custom_ctx, None)
+
+    rknn.rknn_inputs_set(self.custom_ctx, self.io_num.n_input, self.inputs)
+    rknn.rknn_run(self.custom_ctx, None)
 
   # io_num = rknn.rknn_input_output_num()
   #   rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_IN_OUT_NUM, ct.byref(io_num), ct.sizeof(io_num))
 
     perf_run = rknn.rknn_perf_run()
-    ret = rknn.rknn_query(self.dev.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
+    ret = rknn.rknn_query(self.custom_ctx, rknn.RKNN_QUERY_PERF_RUN, ct.byref(perf_run), ct.sizeof(perf_run));
 
     print('run_duration', perf_run.run_duration)
     for i in range(self.io_num.n_output):
@@ -270,7 +377,7 @@ int cstDualResidual(rknn_custom_op_context* op_ctx, rknn_custom_op_tensor* input
       self.outputs[i].want_float = 1
       self.outputs[i].is_prealloc = 0
 
-    rknn.rknn_outputs_get(self.dev.custom_ctx, self.io_num.n_output, self.outputs, None)
+    rknn.rknn_outputs_get(self.custom_ctx, self.io_num.n_output, self.outputs, None)
 
     print(self.inputs[0].buf)
     print(self.outputs[0].buf)
