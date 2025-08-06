@@ -136,6 +136,8 @@
 #define DPU_LUT_LO_SLOPE_SCALE   0x4128 // LO LUT slope scale
 #define DPU_LUT_LO_SLOPE_SHIFT   0x412C // LO LUT slope shift
 
+
+#define DPU_RDMA_DATA_CUBE_WIDTH  0x500 ilue of the offset pend
 // TODO Add PPU
 
 // NPU capability is limited to the following units

@@ -1,6 +1,6 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
-
+#include "rkt_registers.h"
 
 #if !defined(__KERNEL__)
 #define __user

@@ -95,7 +95,7 @@ generate_cuda() {
 }
 
 generate_rockchip() {
-  clang2py  extra/rockchip/drm_mode.h extra/rockchip/drm.h extra/rockchip/rknpu_ioctl.h extra/rockchip/ggml_rknpu.h extra/rockchip/npu_cna.h extra/rockchip/npu_dpu.h extra/rockchip/npu_hw.h -o $BASE/rockchip.py -k cdefstum 
+  clang2py  extra/rockchip/rkt_registers.h extra/rockchip/drm_mode.h extra/rockchip/drm.h extra/rockchip/rknpu_ioctl.h extra/rockchip/ggml_rknpu.h extra/rockchip/npu_cna.h extra/rockchip/npu_dpu.h extra/rockchip/npu_hw.h -o $BASE/rockchip.py -k cdefstum -l /usr/lib/librknnrt.so
   fixup $BASE/rockchip.py
   sed -i "s\import ctypes\import ctypes, os\g" $BASE/rockchip.py
   sed -i "s/import fcntl, functools/import functools/g" $BASE/rockchip.py
@@ -103,6 +103,13 @@ generate_rockchip() {
   sed -i "s/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd, \*\*kwargs):/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:FileIOInterface, \*\*kwargs):/g" $BASE/rockchip.py
   sed -i "s/fcntl.ioctl(__fd, (__idir<<30)/__fd.ioctl((__idir<<30)/g" $BASE/rockchip.py
   python3 -c "import tinygrad.runtime.autogen.rockchip"  
+}
+
+generate_rocket() {
+  clang2py extra/rockchip/rkt_registers.h -o $BASE/rocket.py -l /usr/lib/librknnrt.so
+  sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/rocket.py
+  fixup $BASE/rocket.py
+  python3 -c "import tinygrad.runtime.autogen.rocket" 
 }
 
 generate_rknn() {
@@ -568,6 +575,7 @@ elif [ "$1" == "vfio" ]; then generate_vfio
 elif [ "$1" == "webgpu" ]; then generate_webgpu
 elif [ "$1" == "rockchip" ]; then generate_rockchip
 elif [ "$1" == "rknn" ]; then generate_rknn
+elif [ "$1" == "rocket" ]; then generate_rocket
 elif [ "$1" == "all" ]; then generate_opencl; generate_hip; generate_comgr; generate_cuda; generate_rockchip; generate_nvrtc; generate_hsa; generate_kfd; generate_nv; generate_amd; generate_io_uring; generate_libc; generate_am; generate_webgpu
 else echo "usage: $0 <type>"
 fi

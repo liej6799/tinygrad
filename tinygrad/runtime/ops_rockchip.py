@@ -1,7 +1,9 @@
 import platform
+from types import SimpleNamespace
 from tinygrad.helpers import init_c_var, from_mv, init_c_struct_t, getenv
 from tinygrad.device import Compiled, Compiler, LRUAllocator, Renderer, Allocator
 from tinygrad.engine.jit import MultiGraphRunner
+from tinygrad.ops import Ops, UOp
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import BumpAllocator, HCQArgsState, HCQCompiled, HCQAllocatorBase, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, FileIOInterface
 
@@ -16,10 +18,50 @@ from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, pro
 from tinygrad.runtime.autogen import libc
 from tinygrad.device import Compiled, ProfileEvent, BufferSpec, CPUProgram, PROFILE
 import ctypes
+
+
+class RDNACodegen:
+  def __init__(self):
+    print('RDNACodegen')
+    self.rops: list[any] = []
+  def lower_define_global(self, u: UOp):
+    print('lower_define_global', u)
+  def lower_special(self, u: UOp):
+    print('lower_special', u)
+  def lower_const(self, u: UOp):
+    print('lower_const', u)
+  def lower_add(self, u: UOp):
+    print('lower_add', u)
+  def lower_mul(self, u: UOp):
+    print('lower_mul', u)
+  def lower_index(self, u: UOp):
+    print('lower_index', u)
+  def lower_load(self, u: UOp):
+    print('lower_load', u)
+  def lower_store(self, u: UOp):
+    print('lower_store', u)
+  def lower_gep(self, u: UOp):
+    print('lower_gep', u)
+  def lower_const(self, u: UOp):
+    print('lower_const', u)
+  def lower_sink(self, u: UOp):
+    print('lower_sink', u)
+  
+
+
+  def lower(self, uops:list[UOp]):
+    for i,u in enumerate(uops):
+      getattr(self, f'lower_{u.op.name.lower()}')(u)
+
+
+
+
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP" 
   def render(self, uops:list) -> str:
-    print('renderer')
+    codegen = RDNACodegen()
+    codegen.lower(uops)
+    print('renderer', uops)
     return "123"
 
 
@@ -92,8 +134,14 @@ class RockchipProgram(HCQProgram):
   def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
     print('rockchip program')
     self.dev, self.name, self.lib = dev, name, lib
+    self.buf_info, self.consts_info = [], []
 
-    super().__init__(RockchipArgsState, self.dev, self.name, kernargs_alloc_size=1)
+    self.buf_info.append(SimpleNamespace(offset=0 ))
+    self.buf_info.append(SimpleNamespace(offset=16 ))
+    self.buf_info.append(SimpleNamespace(offset=32))
+
+
+    super().__init__(RockchipArgsState, self.dev, self.name, kernargs_alloc_size=8)
 
 class RockchipArgsState(HCQArgsState):
   def __init__(self, ptr:int, prg:RockchipProgram, bufs:tuple[HCQBuffer, ...], vals:tuple[int, ...]=()):
@@ -101,14 +149,16 @@ class RockchipArgsState(HCQArgsState):
     # Store the buffers and values for easy access
     self.bufs = bufs
     self.vals = vals
-    print('rockchip args state', self.bufs, self.vals)
+
+    self.bufs_info = []
     
+
     self.output = self.bufs[0].meta.dma_addr
     self.input = self.bufs[1].meta.dma_addr
     self.weights = self.bufs[2].meta.dma_addr
-    self.dev = self.prg.dev
-    print('rockchip args state', self.output, self.input, self.weights)
-    
+
+    for i, b in enumerate(bufs):
+      self.bufs_info.append(SimpleNamespace(dma_addr = b.meta.dma_addr))
 
 
 
@@ -203,10 +253,15 @@ class RockchipComputeQueue(HWQueue):
 
     return self
 
+
   def signal(self, signal:RockchipSignal, value=0):
     print('signal', signal, value)
     return self
 
+
+    
+    # Return as ctypes 64-bit unsigned integer type
+    return ctypes.c_uint64(result)
   def timestamp(self, signal:RockchipSignal): 
     print('timestamp')
     return self.signal(signal, 0)
@@ -214,6 +269,33 @@ class RockchipComputeQueue(HWQueue):
   def exec(self, prg:RockchipProgram, args_state:RockchipArgsState, global_size, local_size):
     print('exec123')
     self.bind_args_state(args_state)
+    def reg(val, shift, mask):
+      return ((val) << shift) & mask;
+
+    def emit_raw(target, reg, value):
+        # Pack the values into a 64-bit integer as per hardware spec
+        target = target + 0x1
+        print('target', hex(target), 'reg', hex(reg), 'value', hex(value))
+        packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
+        print('packed_value', hex(packed_value))
+        self.q(packed_value)
+
+
+
+    def NPUOP(op, value, reg):
+      print('op', hex(op), 'value', hex(value), 'reg', hex(reg))
+      # Ensure inputs are within bit ranges by masking
+      op_masked = op & 0xffff        # 16 bits
+      value_masked = value & 0xffffffff  # 32 bits
+      reg_masked = reg & 0xffff      # 16 bits
+      
+      # Construct the 64-bit integer as unsigned long long
+      result = (ctypes.c_uint64(op_masked).value << 48) | \
+              (ctypes.c_uint64(value_masked).value << 16) | \
+              ctypes.c_uint64(reg_masked).value
+      return result
+
+
 
     print('rockchip exec', global_size, local_size, prg)
     print("HCQBuffer values:", args_state.bufs)
@@ -232,86 +314,102 @@ class RockchipComputeQueue(HWQueue):
     # Queue the execution command with buffer addresses
 
     # Sequence of hardware commands for execution
+    print('output', args_state.output)
+    print('prg', args_state.ptr)
 
-    self.q(0x10010000000e4004), # 0
-    self.q(0x20010000000e5004), # 1
-    self.q(0x1001000001e5400c), # 2
-    self.q(0x1001480000024010), # 3
-    self.q(0x1001000000004014), # 4
-    self.q(0x1001000000004020), # 5
-    self.q(0x1001000000c04024), # 6
-    self.q(0x1001000000094030), # 7
-    self.q(0x1001000000004034), # 8
-    self.q(0x1001000000004038), # 9
-    self.q(0x100100070007403c), # 10
-    self.q(0x1001000000534040), # 11
-    self.q(0x1001000000004044), # 12
-    self.q(0x1001000000004048), # 13
-    self.q(0x100100000000404c), # 14
-    self.q(0x1001000000024050), # 15
-    self.q(0x1001000000004054), # 16
-    self.q(0x1001000000074058), # 17
-    self.q(0x100100000009405c), # 18
-    self.q(0x1001000000534060), # 19
-    self.q(0x1001000000004064), # 20
-    self.q(0x1001000000004068), # 21
-    self.q(0x100100000000406c), # 22
-    self.q(0x1001108202c04070), # 23
-    self.q(0x1001000000004074), # 24
-    self.q(0x1001000000014078), # 25
-    self.q(0x100100000000407c), # 26
-    self.q(0x1001000000004080), # 27
-    self.q(0x1001000100014084), # 28
-    self.q(0x1001000000004088), # 29
-    self.q(0x1001000000004090), # 30
-    self.q(0x1001000000004094), # 31
-    self.q(0x1001000000004098), # 32
-    self.q(0x100100000000409c), # 33
-    self.q(0x10010000000040a0), # 34
-    self.q(0x10010000000040a4), # 35
-    self.q(0x10010000000040a8), # 36
-    self.q(0x10010000000040ac), # 37
-    self.q(0x1001000000c040c0), # 38
-    self.q(0x10010000000040c4), # 39
-    self.q(0x1001000000004100), # 40
-    self.q(0x1001000000004104), # 41
-    self.q(0x1001000000004108), # 42
-    self.q(0x100100000000410c), # 43
-    self.q(0x1001000000004110), # 44
-    self.q(0x1001000000004114), # 45
-    self.q(0x1001000000004118), # 46
-    self.q(0x100100000000411c), # 47
-    self.q(0x1001000000004120), # 48
-    self.q(0x1001000000004124), # 49
-    self.q(0x1001000000004128), # 50
-    self.q(0x100100000000412c), # 51
-    self.q(0x200100000009500c), # 52
-    self.q(0x2001000000005010), # 53
-    self.q(0x2001000000075014), # 54
-    self.q(0x2001000000005018), # 55
-    self.q(0x200100000000501c), # 56
-    self.q(0x2001000000005020), # 57
-    self.q(0x2001000000005028), # 58
-    self.q(0x200100000000502c), # 59
-    self.q(0x2001400000085034), # 60
-    self.q(0x2001000000005038), # 61
-    self.q(0x2001000000c05040), # 62
+    burst_len = 0xF
+    conv_mode = rk.direct_convolution
+    output_mode  = 0x2
+    flying_mode = 0x1 # bypass CNA, directly to DPU (0x0 for default)
+    channel= 7 # max is 7 channel
+    dataout_width = 5
+    dataout_height = 0
+
+    # ALU OPS IS HERE
+    ew_cvt_type = 0
+    ew_data_mode = 1
+    ew_data_size = 2
+    ew_relu_bypass = 1
+    ew_lut_bypass = 1
+
+    ew_alu_algo = 2
+    # 4'd0: Max; 
+    # 4'd1: Min; 
+    # 4'd2: Add; 
+    # 4'd3: Div; 
+    # 4'd4: Minus; 
+    # 4'd5: Abs; 
+    # 4'd6: Neg; 
+    # 4'd7: Floor; 
+    # 4'd8: Ceil. 
+    ew_op_src = 1
+
+    erdma_data_size_16bit=2
+
+    emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
+    reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+    reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+    reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+
+    emit_raw(rk.DPU, rk.DPU_FEATURE_MODE_CFG,
+    reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+    reg(conv_mode, rk.DPU_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_CONV_MODE__MASK) |
+    reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
+    reg(flying_mode, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__MASK))
+
+    emit_raw(rk.DPU, rk.DPU_DATA_FORMAT,
+    reg(rk.precision_float16, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+    reg(rk.precision_float16, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+    reg(rk.precision_float16, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+
+    emit_raw(rk.DPU, rk.DPU_DATA_CUBE_CHANNEL,
+    reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+    reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+
+    emit_raw(rk.DPU, rk.DPU_DATA_CUBE_WIDTH,
+    reg(dataout_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+
+    emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
+    reg(args_state.bufs_info[0].dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+
+    emit_raw(rk.DPU, rk.DPU_EW_CFG,
+    reg(ew_cvt_type, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+    reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
+    reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+    reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+    reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+    reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+    reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
+
+
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+    reg(args_state.bufs_info[1].dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+    reg(args_state.bufs_info[2].dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
+    reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
+    reg(dataout_height, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
+    reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
+    reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
+    reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+    emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
+    reg(3, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__MASK) |
+    reg(3, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__MASK) |
+    reg(conv_mode, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__MASK) |
+    reg(flying_mode, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK) |
+    
+    reg(burst_len, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__MASK) | 
+    reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__MASK))
+    
     self.q(0x2001000178495044), # 63
-    self.q(0x2001000000005048), # 64
-    self.q(0x200100000020504c), # 65
-    self.q(0x2001000000005064), # 66
-    self.q(0x2001010101015068), # 67
-    self.q(0x200100000020506c), # 68
-    self.q(0x0000000000000000), # 69
-    self.q(0x0101000000000014), # 70
-    self.q(0x0041000000000000), # 71
+
     self.q(0x0081000000180008), # 72
     
-    self._q[55] = self._q[55] |  ((args_state.input & 0xFFFFFFFF) << 16)
-    self._q[61] = self._q[61] | ((args_state.weights & 0xFFFFFFFF) << 16)
-    self._q[5] = self._q[5] | ((args_state.output & 0xFFFFFFFF) << 16)
-
-
     return self
 
   def bind(self, dev:RockchipDevice):
