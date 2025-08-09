@@ -67,21 +67,186 @@ class RockchipProgram:
     target = target + 0x1
 
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
+    print(hex(packed_value))
     self.q.append(packed_value)
-  def boilerplate(self):
+  def fake_ops(self, uop, dtype):
     self.q = []
-    burst_len = 0xF
-    conv_mode = 0
-    output_mode  = 0x2
-    flying_mode = 0x1 # bypass CNA, directly to DPU (0x0 for default)
-    channel = 7
-    dataout_width = 5
-    dataout_height = 0
+    if dtype == dtypes.int:
+      self.q.append(0x10010000000e4004)
+      self.q.append(0x20010000000e5004)
+      self.q.append(0x1001000001e5400c)
+      self.q.append(0x1001900000044010)
 
-    precision_int8 = 0
-    precision_float16 = 2
-    precision_int32 = 4
-    precision_float32 = 5
+      self.q.append(0x1001000000004014)
+      self.q.append(0x1001ffed02004020)
+      self.q.append(0x1001000000c04024)
+      self.q.append(0x1001000000094030)
+      self.q.append(0x1001000000004034)
+      self.q.append(0x1001000000004038)
+      self.q.append(0x100100030003403c)
+      self.q.append(0x1001000000534040)
+      self.q.append(0x1001000000004044)
+      self.q.append(0x1001000000004048)
+      self.q.append(0x100100000000404c)
+      self.q.append(0x1001000000024050)
+      self.q.append(0x1001000000004054)
+      self.q.append(0x1001000000034058)
+      self.q.append(0x100100000009405c)
+      self.q.append(0x1001000000534060)
+      self.q.append(0x1001000000004064)
+      self.q.append(0x1001000000004068)
+      self.q.append(0x100100000000406c)
+      self.q.append(0x100110c202c04070)
+      self.q.append(0x1001000000004074)
+      self.q.append(0x1001000000014078)
+      self.q.append(0x100100000000407c)
+      self.q.append(0x1001000000004080)
+      self.q.append(0x1001000000014084)
+      self.q.append(0x1001000000004088)
+      self.q.append(0x1001000000004090)
+      self.q.append(0x1001000000004094)
+      self.q.append(0x1001000000004098)
+      self.q.append(0x100100000000409c)
+      self.q.append(0x10010000000040a0)
+      self.q.append(0x10010000000040a4)
+      self.q.append(0x10010000000040a8)
+      self.q.append(0x10010000000040ac)
+      self.q.append(0x1001000000c040c0)
+      self.q.append(0x10010000000040c4)
+      self.q.append(0x1001000000004100)
+      self.q.append(0x1001000000004104)
+      self.q.append(0x1001000000004108)
+      self.q.append(0x100100000000410c)
+      self.q.append(0x1001000000004110)
+      self.q.append(0x1001000000004114)
+      self.q.append(0x1001000000004118)
+      self.q.append(0x100100000000411c)
+      self.q.append(0x1001000000004120)
+      self.q.append(0x1001000000004124)
+      self.q.append(0x1001000000004128)
+      self.q.append(0x100100000000412c)
+      self.q.append(0x200100000009500c)
+      self.q.append(0x2001000000005010)
+      self.q.append(0x2001000000035014)
+      self.q.append(0x2001ffed00805018)
+      self.q.append(0x200100000000501c)
+      self.q.append(0x2001000000005020)
+      self.q.append(0x2001000000005028)
+      self.q.append(0x200100000000502c)
+      self.q.append(0x20014000000c5034)
+      self.q.append(0x2001ffed01405038)
+      self.q.append(0x2001000000c05040)
+      self.q.append(0x2001000278815044)
+      self.q.append(0x2001000000005048)
+      self.q.append(0x200100000020504c)
+      self.q.append(0x2001000000005064)
+      self.q.append(0x2001010101015068)
+      self.q.append(0x200100000020506c)
+    elif dtype == dtypes.float:
+      self.q.append(0x10010000000e4004)
+      self.q.append(0x20010000000e5004)
+      self.q.append(0x1001000001e5400c)
+      self.q.append(0x1001480000024010)
+      self.q.append(0x1001000000004014)
+      self.q.append(0x1001fff330004020)
+      self.q.append(0x1001000000c04024)
+      self.q.append(0x1001000000094030)
+      self.q.append(0x1001000000004034)
+      self.q.append(0x1001000000004038)
+      self.q.append(0x100100070007403c)
+      self.q.append(0x1001000000534040)
+      self.q.append(0x1001000000004044)
+      self.q.append(0x1001000000004048)
+      self.q.append(0x100100000000404c)
+      self.q.append(0x1001000000024050)
+      self.q.append(0x1001000000004054)
+      self.q.append(0x1001000000074058)
+      self.q.append(0x100100000009405c)
+      self.q.append(0x1001000000534060)
+      self.q.append(0x1001000000004064)
+      self.q.append(0x1001000000004068)
+      self.q.append(0x100100000000406c)
+      self.q.append(0x1001108202c04070)
+      self.q.append(0x1001000000004074)
+      self.q.append(0x1001000000014078)
+      self.q.append(0x100100000000407c)
+      self.q.append(0x1001000000004080)
+      self.q.append(0x1001000100014084)
+      self.q.append(0x1001000000004088)
+      self.q.append(0x1001000000004090)
+      self.q.append(0x1001000000004094)
+      self.q.append(0x1001000000004098)
+      self.q.append(0x100100000000409c)
+      self.q.append(0x10010000000040a0)
+      self.q.append(0x10010000000040a4)
+      self.q.append(0x10010000000040a8)
+      self.q.append(0x10010000000040ac)
+      self.q.append(0x1001000000c040c0)
+      self.q.append(0x10010000000040c4)
+      self.q.append(0x1001000000004100)
+      self.q.append(0x1001000000004104)
+      self.q.append(0x1001000000004108)
+      self.q.append(0x100100000000410c)
+      self.q.append(0x1001000000004110)
+      self.q.append(0x1001000000004114)
+      self.q.append(0x1001000000004118)
+      self.q.append(0x100100000000411c)
+      self.q.append(0x1001000000004120)
+      self.q.append(0x1001000000004124)
+      self.q.append(0x1001000000004128)
+      self.q.append(0x100100000000412c)
+      self.q.append(0x200100000009500c)
+      self.q.append(0x2001000000005010)
+      self.q.append(0x2001000000075014)
+      self.q.append(0x2001fff330c05018)
+      self.q.append(0x200100000000501c)
+      self.q.append(0x2001000000005020)
+      self.q.append(0x2001000000005028)
+      self.q.append(0x200100000000502c)
+      self.q.append(0x2001400000085034)
+      self.q.append(0x2001fff331805038)
+      self.q.append(0x2001000000c05040)
+      self.q.append(0x2001000178495044)
+      self.q.append(0x2001000000005048)
+      self.q.append(0x200100000020504c)
+      self.q.append(0x2001000000005064)
+      self.q.append(0x2001010101015068)
+      self.q.append(0x200100000020506c)
+      self.q.append(0x0000000000000000)
+      self.q.append(0x0101000000000014)
+      self.q.append(0x0041000000000000)
+
+
+
+  def ops(self, uop, dtype):
+    self.q = []
+    print(uop, dtype)
+    #out_precision 
+    dpu_format_precision_int8 = 0
+    dpu_format_precision_int16 = 1
+    dpu_format_precision_float16 = 2
+    dpu_format_precision_bfloat16 = 3
+    dpu_format_precision_int32 = 4
+    dpu_format_precision_float32 = 5
+    dpu_format_precision_int4 = 6
+    # 3'd0: Integer 8bit; 
+    # 3'd1: Integer 16bit; 
+    # 3'd2: Float point 16bit; 
+    # 3'd3: Bfloat 16bit; 
+    # 3'd4: Integer 32bit; 
+    # 3'd5: Float point 32bit; 
+    # 3'd6: Integer 4bit. 
+
+    erdma_data_mode_4bit = 0
+    erdma_data_mode_8bit = 1
+    erdma_data_size_16bit=2
+    erdma_data_mode_32bit = 3
+    # 2'd0: 4bit; 
+    # 2'd1: 8bit; 
+    # 2'd2: 16bit; 
+    # 2'd3: 32bit. 
+
+    
 
    # ALU OPS IS HERE
     ew_cvt_type = 0
@@ -100,7 +265,76 @@ class RockchipProgram:
     # 4'd7: Floor; 
     # 4'd8: Ceil. 
     ew_op_src = 1
-    erdma_data_size_16bit=2
+
+    if (dtype == dtypes.int):
+      # self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      #   self.reg(dpu_format_precision_int16, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      #   self.reg(dpu_format_precision_int16, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      #   self.reg(dpu_format_precision_int16, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+      self.q.append(0x2001ffed01405038)
+      # self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
+      #   self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
+      #   self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+      self.q.append(0x1001900000044010)
+      
+      # self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      #     self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      #     self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+      self.q.append(0x100100030003403c)
+      # self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
+      #   self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+      self.q.append(0x2001000000035014)
+      # self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
+      #   self.reg(ew_cvt_type, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+      #   self.reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
+      #   self.reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+      #   self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+      #   self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      #   self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      #   self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
+      self.q.append(0x100110c202c04070)
+      self.q.append(0x2001000278815044)
+
+      
+    elif (dtype == dtypes.float):
+      # self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      #   self.reg(dpu_format_precision_float32, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      #   self.reg(dpu_format_precision_float32, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      #   self.reg(dpu_format_precision_float32, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+      self.q.append(0x2001fff331805038)
+      # self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
+      #   self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
+      #   self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+      self.q.append(0x1001480000024010)
+      
+      # self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      #     self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      #     self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+      self.q.append(0x100100070007403c)
+      # self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
+      #   self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+      self.q.append(0x2001000000075014)
+      # self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
+      #   self.reg(ew_cvt_type, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+      #   self.reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
+      #   self.reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+      #   self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+      #   self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      #   self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      #   self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
+      self.q.append(0x1001108202c04070)
+      self.q.append(0x2001000178495044)
+  def boilerplate(self):
+    print(self.q)
+    self.q = []
+    burst_len = 0xF
+    conv_mode = 0
+    output_mode  = 0x2
+    flying_mode = 0x1 # bypass CNA, directly to DPU (0x0 for default)
+ 
+    dataout_width = 5
+    dataout_height = 0
+
 
     self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
         self.reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
@@ -113,39 +347,20 @@ class RockchipProgram:
         self.reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
         self.reg(flying_mode, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__MASK))
 
-    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
-        self.reg(precision_float16, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
-        self.reg(precision_float16, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
-        self.reg(precision_float16, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
-    
-    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
-        self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
-        self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
-    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
-        self.reg(ew_cvt_type, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
-        self.reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
-        self.reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
-        self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
-        self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
-        self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
-        self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
+
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
         self.reg(dataout_height, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
-    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
-        self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
 
-    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
-        self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
-        self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
 
  
   def submit(self):
-    self.q.append(0x2001000178495044), # 63
+    #self.q.append(0x2001000178495044), # 63
+
     self.q.append(0x0081000000180008), # 72
     tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
     regcmd = ctypes.cast(self.device.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
@@ -279,15 +494,15 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
-          self.boilerplate()
-
+      
+          self.fake_ops(uop, dtype)
           self.input_buf = self.device._gpu_alloc(len(inp[0]), 0)
           self.weight_buf = self.device._gpu_alloc(len(inp[1]), 0)
           self.output_buf = self.device._gpu_alloc(len(inp[0]), 0)
      
-          src = memoryview(array.array('i', inp[0]))
+          src = memoryview(array.array('f', inp[0]))
           ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-          src2 = memoryview(array.array('i', inp[1]))
+          src2 = memoryview(array.array('f', inp[1]))
           ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
 
           self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
@@ -300,9 +515,9 @@ class RockchipProgram:
           self.submit()
 
     
-          dst = memoryview(bytearray(self.output_buf.size))
-          ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-          print('dst', list(dst))
+          dst = memoryview(bytearray(self.output_buf.size * 4))
+          ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size * 4)
+          print('dst', list(dst.cast('f')))
           print('src', list(src))
           print('src2', list(src2))
           print([exec_alu(uop, dtype, p) for p in zip(*inp)])
