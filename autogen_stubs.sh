@@ -444,6 +444,17 @@ generate_sqtt() {
   python3 -c "import tinygrad.runtime.autogen.sqtt"
 }
 
+generate_rockchip() {
+  clang2py  extra/rockchip/rknpu_register.h extra/rockchip/drm_mode.h extra/rockchip/drm.h extra/rockchip/rknpu_ioctl.h -o $BASE/rockchip.py -k cdefstum
+  fixup $BASE/rockchip.py
+  sed -i "s\import ctypes\import ctypes, os\g" $BASE/rockchip.py
+  sed -i "s/import fcntl, functools/import functools/g" $BASE/rockchip.py
+  sed -i "/import functools/a from tinygrad.runtime.support.hcq import FileIOInterface" $BASE/rockchip.py
+  sed -i "s/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd, \*\*kwargs):/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:FileIOInterface, \*\*kwargs):/g" $BASE/rockchip.py
+  sed -i "s/fcntl.ioctl(__fd, (__idir<<30)/__fd.ioctl((__idir<<30)/g" $BASE/rockchip.py
+  python3 -c "import tinygrad.runtime.autogen.rockchip"  
+}
+
 generate_webgpu() {
   clang2py extra/webgpu/webgpu.h -o $BASE/webgpu.py
   fixup $BASE/webgpu.py
@@ -488,6 +499,7 @@ elif [ "$1" == "adreno" ]; then generate_adreno
 elif [ "$1" == "pci" ]; then generate_pci
 elif [ "$1" == "vfio" ]; then generate_vfio
 elif [ "$1" == "webgpu" ]; then generate_webgpu
+elif [ "$1" == "rockchip" ]; then generate_rockchip
 elif [ "$1" == "libusb" ]; then generate_libusb
 elif [ "$1" == "all" ]; then generate_opencl; generate_hip; generate_comgr; generate_cuda; generate_nvrtc; generate_hsa; generate_kfd; generate_nv; generate_amd; generate_io_uring; generate_libc; generate_am; generate_webgpu
 else echo "usage: $0 <type>"
