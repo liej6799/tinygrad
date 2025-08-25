@@ -127,63 +127,65 @@ class RockchipProgram:
       self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__MASK) |
       self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
-   
+  
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
+      self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
+      self.reg(self.get_edata_size(dtype), rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+    
+    self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+      self.reg(0, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
+      self.reg(0, rk.DPU_BS_CFG_BS_ALU_SRC__SHIFT, rk.DPU_BS_CFG_BS_ALU_SRC__MASK) |
+      self.reg(0, rk.DPU_BS_CFG_BS_RELUX_EN__SHIFT, rk.DPU_BS_CFG_BS_RELUX_EN__MASK) |
+      self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      self.reg(0, rk.DPU_BS_CFG_BS_MUL_PRELU__SHIFT, rk.DPU_BS_CFG_BS_MUL_PRELU__MASK) |
+      self.reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      self.reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      self.reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+      self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      self.reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      self.reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      self.reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+
+    if op == Ops.MUL:
+      self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
+        self.reg(0, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_CVT_ROUND__SHIFT, rk.DPU_EW_CFG_EW_CVT_ROUND__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
+        self.reg(self.get_edata_size(dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_EQUAL_EN__SHIFT, rk.DPU_EW_CFG_EW_EQUAL_EN__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT, rk.DPU_EW_CFG_EW_BINARY_EN__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_RELUX_EN__SHIFT, rk.DPU_EW_CFG_EW_RELUX_EN__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_MUL_PRELU__SHIFT, rk.DPU_EW_CFG_EW_MUL_PRELU__MASK) |
+        self.reg(1, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+  
     if op == Ops.ADD:
       self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_CVT_ROUND__SHIFT, rk.DPU_EW_CFG_EW_CVT_ROUND__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
         self.reg(self.get_edata_size(dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_EQUAL_EN__SHIFT, rk.DPU_EW_CFG_EW_EQUAL_EN__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT, rk.DPU_EW_CFG_EW_BINARY_EN__MASK) |
         self.reg(2, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_RELUX_EN__SHIFT, rk.DPU_EW_CFG_EW_RELUX_EN__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
-        self.reg(1, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
-       
-      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
-        self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
-        self.reg(self.get_edata_size(dtype), rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
-      
-      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
-        self.reg(0, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
-        self.reg(0, rk.DPU_BS_CFG_BS_ALU_SRC__SHIFT, rk.DPU_BS_CFG_BS_ALU_SRC__MASK) |
-        self.reg(0, rk.DPU_BS_CFG_BS_RELUX_EN__SHIFT, rk.DPU_BS_CFG_BS_RELUX_EN__MASK) |
-        self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
-        self.reg(0, rk.DPU_BS_CFG_BS_MUL_PRELU__SHIFT, rk.DPU_BS_CFG_BS_MUL_PRELU__MASK) |
-        self.reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
-        self.reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
-        self.reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
-
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
-        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
-        
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_ALU_CFG,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
-        self.reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET,
-        self.reg(0,0,0))
-      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 65537);
-      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
-        self.reg(1-1, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__SHIFT, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0);
-      self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0);
-
+        self.reg(1, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_MUL_PRELU__SHIFT, rk.DPU_EW_CFG_EW_MUL_PRELU__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+        self.reg(0, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+  
   def create_channel(self, channel):
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
       self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
@@ -214,6 +216,7 @@ class RockchipProgram:
       self.reg(notch, rk.DPU_RDMA_RDMA_EW_SURF_NOTCH_EW_SURF_NOTCH__SHIFT, rk.DPU_RDMA_RDMA_EW_SURF_NOTCH_EW_SURF_NOTCH__MASK))
 
   def create_reg(self):
+    self.q = []
     self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
       self.reg(1  , rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
       self.reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
@@ -260,11 +263,35 @@ class RockchipProgram:
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_DMA_CFG, 0);
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_PAD_CFG, 0);
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_WEIGHT,
-      self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_E_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_E_WEIGHT__MASK) |
-      self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_N_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_N_WEIGHT__MASK) |
-      self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_B_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_B_WEIGHT__MASK) |
-      self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_M_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_M_WEIGHT__MASK))
-
+    self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_E_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_E_WEIGHT__MASK) |
+    self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_N_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_N_WEIGHT__MASK) |
+    self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_B_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_B_WEIGHT__MASK) |
+    self.reg(1, rk.DPU_RDMA_RDMA_WEIGHT_M_WEIGHT__SHIFT, rk.DPU_RDMA_RDMA_WEIGHT_M_WEIGHT__MASK))
+    self.emit_raw(rk.DPU, rk.REG_DPU_BN_ALU_CFG,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      self.reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET,
+      self.reg(0,0,0))
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 65537);
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+      self.reg(1-1, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__SHIFT, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__MASK))
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0);
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0);
  
   def submit(self):
     #self.q.append(0x2001000178495044), # 63
@@ -409,9 +436,12 @@ class RockchipProgram:
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
           self.create_reg()
+    
           self.input_buf = self.device._gpu_alloc(len(inp[0]), 0)
           self.weight_buf = self.device._gpu_alloc(len(inp[1]), 0)
           self.output_buf = self.device._gpu_alloc(len(inp[0]), 0)
+        
+      
           import numpy as np
 
           if dtype == dtypes.float:
@@ -421,7 +451,7 @@ class RockchipProgram:
 
             src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
             ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-            dst = np.frombuffer((bytearray(self.output_buf.size * 1024)), dtype=np.float16)
+            dst = np.frombuffer((bytearray(self.output_buf.size * 2)), dtype=np.float16)
 
             self.ops(uop, dtypes.float16)    
           elif dtype == dtypes.int32:
@@ -430,7 +460,7 @@ class RockchipProgram:
 
             src2 = memoryview(bytearray(np.int32(inp[1]).tobytes()))
             ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-            dst = np.frombuffer((bytearray(self.output_buf.size * 1024)), dtype=np.int32)
+            dst = np.frombuffer((bytearray(self.output_buf.size * 4)), dtype=np.int32)
 
             self.ops(uop, dtypes.int32)              
 
@@ -444,8 +474,11 @@ class RockchipProgram:
           self.submit()
     
           ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * 1024)
-
-          ul[i] = dst.tolist()
+          print(inp[0])
+          print(inp[1])
+          print(dst.tolist())
+          print([exec_alu(uop, dtype, p) for p in zip(*inp)])
+          ul[i] =dst.tolist()
     
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
