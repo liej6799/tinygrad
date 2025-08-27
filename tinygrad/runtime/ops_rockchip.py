@@ -42,7 +42,6 @@ class RockchipRenderer(Renderer):
 
 class RockchipDevice(Compiled):
   def _gpu_alloc(self, size:int, flags) -> HCQBuffer:
-    
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
     mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)    
     va_addr = self.fd_ctl.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mem_map.offset)
@@ -67,7 +66,7 @@ class RockchipProgram:
     # Pack the values into a 64-bit integer as per hardware spec
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
-    print(hex(packed_value))
+    # print(hex(packed_value))
     self.q.append(packed_value)
   def get_precision(self, dtype):
     # 3'd0: Integer 8bit; 
@@ -111,7 +110,6 @@ class RockchipProgram:
       raise ValueError(f"Unsupported dtype for edata_size: {dtype}")
 
   def ops(self, op, dtype):
-    print(op, dtype)
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
       self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
@@ -339,7 +337,6 @@ class RockchipProgram:
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,   
             __payload=submit_res
     )
-    print(res)
 
   def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
     self.uops: list[tuple[Ops, DType|None, list[int], Any]] = pickle.loads(lib)
@@ -347,7 +344,7 @@ class RockchipProgram:
     self.q = []
     print('enter init')
 
-  
+
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     st = time.perf_counter()
@@ -435,51 +432,47 @@ class RockchipProgram:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
-          self.create_reg()
-    
-          self.input_buf = self.device._gpu_alloc(len(inp[0]), 0)
-          self.weight_buf = self.device._gpu_alloc(len(inp[1]), 0)
-          self.output_buf = self.device._gpu_alloc(len(inp[0]), 0)
-        
-      
-          import numpy as np
+          if (len(inp) == 2 and (dtype == dtypes.float or dtype == dtypes.int32) and (uop == Ops.MUL or uop == Ops.ADD)):
 
-          if dtype == dtypes.float:
 
-            src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
-            ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+            self.input_buf = self.device._gpu_alloc(len(inp[0]), 0)
+            self.weight_buf = self.device._gpu_alloc(len(inp[1]), 0)
+            self.output_buf = self.device._gpu_alloc(len(inp[0]), 0)
+            
+            import numpy as np
+            self.create_reg()
+            if dtype == dtypes.float:
+              src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.float16)
+              
+              self.ops(uop, dtypes.float16)
+   
+            elif dtype == dtypes.int32:
+              src = memoryview(bytearray(np.int32(inp[0]).tobytes()))
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              src2 = memoryview(bytearray(np.int32(inp[1]).tobytes()))
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int32)
 
-            src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
-            ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-            dst = np.frombuffer((bytearray(self.output_buf.size * 2)), dtype=np.float16)
-
-            self.ops(uop, dtypes.float16)    
-          elif dtype == dtypes.int32:
-            src = memoryview(bytearray(np.int32(inp[0]).tobytes()))
-            ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-
-            src2 = memoryview(bytearray(np.int32(inp[1]).tobytes()))
-            ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-            dst = np.frombuffer((bytearray(self.output_buf.size * 4)), dtype=np.int32)
-
-            self.ops(uop, dtypes.int32)              
-
-          self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
-              self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-          self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-            self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-          self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-            self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+              self.ops(uop, dtypes.int32)
+     
+            self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
+                self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+              self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+              self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
           
-          self.submit()
-    
-          ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * 1024)
-          print(inp[0])
-          print(inp[1])
-          print(dst.tolist())
-          print([exec_alu(uop, dtype, p) for p in zip(*inp)])
-          ul[i] =dst.tolist()
-    
+            self.submit()
+            ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
+
+            ul[i] = dst.tolist()
+          else:
+            print('OPERATION NOT SUPPORTED, FALLBACK TO CPU', uop, dtype)
+            ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
     return time.perf_counter() - st
