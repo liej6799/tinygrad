@@ -1,5 +1,5 @@
 from __future__ import annotations
-import platform, subprocess, sys, ctypes, functools, time, mmap, threading, queue
+import platform, subprocess, sys, ctypes, ctypes.util, functools, time, mmap, threading, queue, tempfile, os
 from tinygrad.helpers import capstone_flatdump, getenv, from_mv, to_mv, OSX, mv_address, wait_cond, cpu_profile
 from tinygrad.device import Compiler, BufferSpec, DMACPURef
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQBuffer, HWQueue, HCQArgsState, HCQSignal, HCQProgram, MMIOInterface
@@ -12,18 +12,24 @@ class CPUSignal(HCQSignal):
     if self.is_timeline and self.owner is not None: self.owner.tasks.join()
 
 class ClangJITCompiler(Compiler):
-  def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
 
   def compile(self, src:str) -> bytes:
     # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
     # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
     target = 'x86_64' if sys.platform == 'win32' else platform.machine()
-    args = [ f'--target={target}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib', '-fno-ident']
-    arch_args = ['-ffixed-x18'] if target == 'arm64' else []
-    obj = subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
-    return jit_loader(obj)
 
-  def disassemble(self, lib:bytes): return capstone_flatdump(lib)
+    lib_path_args = [f'-L/usr/local/lib']
+    lib_args = [f'-lrknpu_utils']
+    
+    # Remove bare metal flags for linking and add shared library flags
+    link_args = ['-O2', '-fPIC', '-fno-math-errno', '-shared', '-fno-ident']
+    link_arch_args = ['-ffixed-x18'] if target == 'arm64' else []
+    
+    with tempfile.NamedTemporaryFile(delete=True) as output_file:
+      subprocess.check_output([getenv("CC", 'clang'), '-x', 'c', *link_args, *link_arch_args, 
+                                *lib_path_args, *lib_args, '-', '-o', str(output_file.name)], input=src.encode('utf-8'))
+      return output_file.read()
+
 
 class CPUWorker(threading.Thread):
   def __init__(self, dev):
@@ -63,6 +69,39 @@ class CPUProgram(HCQProgram):
   rt_lib = ctypes.CDLL(ctypes.util.find_library('System' if OSX else 'kernel32') if OSX or sys.platform == "win32" else 'libgcc_s.so.1')
 
   def __init__(self, dev, name:str, lib:bytes):
+    # Detect if lib is a shared library (ELF shared object) or object file
+    self.is_shared_lib = lib.startswith(b'\x7fELF') and len(lib) > 16 and lib[16] == 3  # ET_DYN = 3 for shared objects
+    
+    if self.is_shared_lib:
+      self._init_shared_lib(dev, name, lib)
+    else:
+      self._init_object_file(dev, name, lib)
+  
+  def _init_shared_lib(self, dev, name:str, lib:bytes):
+    """Initialize from shared library"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.so') as tmp_lib:
+      tmp_lib.write(lib)
+      tmp_lib.flush()
+      
+      # Load as shared library
+      self.dll = ctypes.CDLL(tmp_lib.name)
+      self.fxn = getattr(self.dll, name, None)
+      if self.fxn is None:
+        # Try common kernel function names
+        for func_name in [f"{name}_kernel", "kernel", "main"]:
+          self.fxn = getattr(self.dll, func_name, None)
+          if self.fxn is not None: break
+      
+      if self.fxn is None:
+        raise RuntimeError(f"Could not find function {name} in shared library")
+      
+      self.fxn.restype = None  # void return type
+      self.temp_lib_path = tmp_lib.name
+    
+    super().__init__(HCQArgsState, dev, name, kernargs_alloc_size=0)
+      
+  def _init_object_file(self, dev, name:str, lib:bytes):
+    """Initialize from object file (original behavior)"""
     if sys.platform == "win32":
       PAGE_EXECUTE_READWRITE, MEM_COMMIT, MEM_RESERVE = 0x40, 0x1000, 0x2000
       ctypes.windll.kernel32.VirtualAlloc.restype = ctypes.c_void_p
@@ -81,19 +120,13 @@ class CPUProgram(HCQProgram):
       self.mem.write(lib)
       if OSX: CPUProgram.rt_lib.pthread_jit_write_protect_np(True)
 
-      # __clear_cache isn't a normal libc function, but a compiler support routine found in libgcc_s for gcc and compiler-rt for clang.
-      # libgcc_s comes as shared library but compiler-rt is only a bunch of static library archives which we can't directly load, but fortunately
-      # it somehow found its way into libSystem on macos (likely because it used __builtin_clear_cache) and libgcc_s is ~always present on linux
-      # Using ["name"] instead of .name because otherwise name is getting mangled: https://docs.python.org/3.12/reference/expressions.html#index-5
-      CPUProgram.rt_lib["__clear_cache"](ctypes.c_void_p(mv_address(self.mem)), ctypes.c_void_p(mv_address(self.mem) + len(lib)))
-
       self.fxn = ctypes.CFUNCTYPE(None)(mv_address(self.mem))
 
     super().__init__(HCQArgsState, dev, name, kernargs_alloc_size=0)
 
   def __del__(self):
     if getattr(sys, 'is_finalizing', lambda: True)(): return
-    if sys.platform == 'win32': ctypes.windll.kernel32.VirtualFree(ctypes.c_void_p(self.mem), ctypes.c_size_t(0), 0x8000) #0x8000 - MEM_RELEASE
+
 
 class CPUAllocator(HCQAllocatorBase):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
