@@ -66,7 +66,7 @@ class RockchipProgram:
     # Pack the values into a 64-bit integer as per hardware spec
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
-    # print(hex(packed_value))
+    print(hex(packed_value))
     self.q.append(packed_value)
   def get_precision(self, dtype):
     # 3'd0: Integer 8bit; 
@@ -102,7 +102,7 @@ class RockchipProgram:
     # 2'd3: 32bit
     if dtype == dtypes.int8:
       return 1
-    elif dtype == dtypes.int16 or dtype == dtypes.float16:
+    elif dtype == dtypes.int16 or dtype == dtypes.float16 or dtype == dtypes.bfloat16:
       return 2
     elif dtype == dtypes.int32 or dtype == dtypes.float32:
       return 3

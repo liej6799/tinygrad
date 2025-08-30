@@ -1,8 +1,8 @@
 import numpy as np
 from tinygrad.helpers import getenv
 from tinygrad import dtypes, Tensor, Device
-dtype_in = dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else dtypes.float
-acc_dtype = dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else None
+dtype_in = dtypes.half 
+acc_dtype = dtypes.half
 
 GPUS = getenv("GPUS", 0)
 M = getenv("M", 16384)

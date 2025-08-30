@@ -5,8 +5,8 @@ from tinygrad.dtype import _to_np_dtype
 from tinygrad.codegen.opt.kernel import OptOps
 from tinygrad.engine.realize import lower_schedule
 
-dtype_in = dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else dtypes.float
-acc_dtype = dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else None
+dtype_in = dtypes.half 
+acc_dtype = dtypes.half
 if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
 if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
 
