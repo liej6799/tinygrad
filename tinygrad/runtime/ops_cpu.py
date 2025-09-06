@@ -17,7 +17,6 @@ class ClangJITCompiler(Compiler):
     # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
     # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
     target = 'x86_64' if sys.platform == 'win32' else platform.machine()
-
     # Remove bare metal flags for linking and add shared library flags
     link_args = ['-O2', '-fPIC', '-fno-math-errno', '-shared', '-fno-ident']
     link_arch_args = ['-ffixed-x18'] if target == 'arm64' else []
@@ -29,9 +28,9 @@ class ClangJITCompiler(Compiler):
 
 
 class CPUWorker(threading.Thread):
-  def __init__(self, dev):
+  def __init__(self, dev, tasks, thread_id):
     super().__init__()
-    self.dev, self.tasks, self.daemon = dev, dev.tasks, True
+    self.dev, self.tasks, self.thread_id, self.daemon = dev, tasks, thread_id, True
 
   def run(self):
     while True:
@@ -108,5 +107,5 @@ class CPUAllocator(HCQAllocatorBase):
 class CPUDevice(HCQCompiled):
   def __init__(self, device:str=""):
     self.tasks:queue.Queue = queue.Queue()
-    CPUWorker(self).start()
+    CPUWorker(self, self.tasks, thread_id=0).start()
     super().__init__(device, CPUAllocator(self), ClangRenderer(), ClangJITCompiler(), functools.partial(CPUProgram, self), CPUSignal, CPUComputeQueue)
