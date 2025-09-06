@@ -20,25 +20,35 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 os.environ["DEFAULT_FLOAT"] = "BFLOAT16"
 
-def _load(m, i):
+def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else dtype.fmt
+
+def to_storage_scalar(x, dtype: DType):
+  if dtype == dtypes.bfloat16: return (struct.unpack('I', struct.pack('f', float_to_bf16(x)))[0] >> 16) & 0xFFFF
+  return x
+
+def from_storage_scalar(x, dtype: DType):
+  if dtype == dtypes.bfloat16: return struct.unpack('f', struct.pack('I', (x & 0xFFFF) << 16))[0]
+  return x
+
+def _load(m, i, dtype: DType):
   if i is None: return 0.0
   if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
-  return m[i]
+  return from_storage_scalar(m[i], dtype)
 
-def load(inp, j=0):
-  if len(inp) == 2: return [_load(m, x+j if x is not None else None) if gate else default for (m,x,gate),default in zip(*inp)]
-  return [_load(m, x+j if x is not None else None) for m,x,_ in inp[0]]
+def load(inp, j, dtype: DType):
+  if len(inp) == 2: return [_load(m, x+j if x is not None else None, dtype) if gate else default for (m,x,gate),default in zip(*inp)]
+  return [_load(m, x+j if x is not None else None, dtype) for m,x,_ in inp[0]]
 
-def _store(m, i, v):
+def _store(m, i, v, dtype: DType):
   if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
-  m[i] = v
+  m[i] = to_storage_scalar(v, dtype)
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
   def render(self, uops:list[UOp]) -> str:
-    lops = [(u.op, u.dtype, [uops.index(v) for v in u.src], u.arg) for u in uops]
+    # the value of SPECIAL comes from local/global_size, not form its source
+    lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
     return base64.b64encode(pickle.dumps(lops)).decode()
-
 
 
 class RockchipDevice(Compiled):
@@ -85,6 +95,7 @@ class RockchipProgram:
     # Pack the values into a 64-bit integer as per hardware spec
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
+    print(f"{hex(packed_value)}")
 
     self.q.append(packed_value)
   def get_precision(self, dtype):
@@ -127,6 +138,8 @@ class RockchipProgram:
       return 3
     else:
       raise ValueError(f"Unsupported dtype for edata_size: {dtype}")
+  def get_is_fp16(self, dtype):
+    return dtype == dtypes.float16 or dtype == dtypes.float
 
   def ops(self, op, dtype):
 
@@ -141,10 +154,13 @@ class RockchipProgram:
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__MASK) |
       self.reg(self.get_precision(dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE__MASK) |
-      self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
+      self.reg(self.get_is_fp16(dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__MASK) |
       self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
-  
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 
+      self.reg(self.get_is_fp16(dtype), rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK));
+
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
       self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
       self.reg(self.get_edata_size(dtype), rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
@@ -292,13 +308,35 @@ class RockchipProgram:
       self.reg(0,0,0))
     self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE,
       self.reg(0,0,0))
+
+      # if float REG_DPU_EW_CVT_SCALE_VALUE = 0, else REG_DPU_EW_CVT_SCALE_VALUE = 1
     self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      self.reg(0, rk.DPU_EW_CVT_SCALE_VALUE_EW_TRUNCATE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_TRUNCATE__MASK) |
+      self.reg(0, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SHIFT__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SHIFT__MASK) |
       self.reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      self.reg(9, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      self.reg(12, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_BS_BASE_ADDR,0)
+    
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER,
+      self.reg(1, rk.DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_RDMA_RDMA_S_POINTER_POINTER_PP_MODE__MASK) |
+      self.reg(1, rk.DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_RDMA_RDMA_S_POINTER_EXECUTER_PP_EN__MASK) |
+      self.reg(1, rk.DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_RDMA_RDMA_S_POINTER_POINTER_PP_EN__MASK))
+     
+
     self.emit_raw(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE,
       self.reg(0,0,0))
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET,
       self.reg(0,0,0))
-    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 65537);
+
+
+   
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
       self.reg(1-1, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__SHIFT, rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__MASK))
     self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0);
@@ -395,23 +433,25 @@ class RockchipProgram:
         if uop is Ops.STORE:
           for j,val in enumerate(inp[1] if dtp[1].count > 1 else [inp[1]]):
             for (m,o,g),v in zip(inp[0], val):
-              if g: _store(m, o+j, v)
+              if g: _store(m, o+j, v, dtp[1].scalar())
           i += 1
           continue
         if uop in {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
-          assert dtype.fmt is not None and isinstance(dtype, PtrDType)
-          if TYPE_CHECKING or sys.version_info < (3, 12): assert dtype.fmt != "e"
+          assert isinstance(dtype, PtrDType), dtype
+          storage_fmt = storage_fmt_for_dtype(dtype.base.scalar())
+          if storage_fmt is None: raise RuntimeError(f"{dtype=} is not supported")
+          if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
           if uop is Ops.DEFINE_REG:
             # REGs are per thread
-            ul[i] = [memoryview(bytearray(dtype.size*dtype.itemsize)).cast(dtype.fmt) for _ in range(warp_size)]
+            ul[i] = [memoryview(bytearray(dtype.size*dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
           else:
             buf = memoryview(bytearray(dtype.size*dtype.itemsize)) if uop is not Ops.DEFINE_GLOBAL else pbufs.pop(0)
-            ul[i] = [buf.cast(dtype.fmt)] * warp_size
+            ul[i] = [buf.cast(storage_fmt)] * warp_size
         elif uop is Ops.DEFINE_VAR:
           ul[i] = [pvals.pop(0)] * warp_size
         elif uop is Ops.SPECIAL:
-          if arg[0][0] == 'g': ul[i] = [idxs[2-int(arg[0][-1])]] * warp_size
-          elif arg[0][0] == 'l': ul[i] = [x[2-int(arg[0][-1])] for x in warp]
+          if arg[0] == 'g': ul[i] = [idxs[2-int(arg[-1])]] * warp_size
+          elif arg[0] == 'l': ul[i] = [x[2-int(arg[-1])] for x in warp]
         elif uop is Ops.CONST: ul[i] = [arg] * warp_size
         elif uop is Ops.INDEX:
           ret:list = []
@@ -435,23 +475,24 @@ class RockchipProgram:
               continue
         elif uop is Ops.VECTORIZE: ul[i] = inp
         elif uop is Ops.BITCAST:
-          assert dtp[0].fmt and dtype.fmt
-          pack_format, unpack_format = str(warp_size) + dtp[0].fmt, str(warp_size) + dtype.fmt
-          ul[i] = list(struct.unpack(unpack_format, struct.pack(pack_format, *inp[0])))
+          packed = struct.pack(str(warp_size) + storage_fmt_for_dtype(dtp[0].scalar()), *[to_storage_scalar(x, dtp[0].scalar()) for x in inp[0]])
+          ul[i] = list(struct.unpack(str(warp_size) +  storage_fmt_for_dtype(dtype.scalar()), packed))
+          ul[i] = [from_storage_scalar(x, dtype.scalar()) for x in ul[i]]
         elif uop is Ops.CAST:
           ul[i] = [truncate.get(dtype, lambda dt: dt)(dtypes.as_const(x, dtype)) for x in inp[0]]
         elif uop is Ops.LOAD:
           if dtype.count > 1:
-            ul[i] = [load([inp[i][j] if i != 0 and dtp[i].count > 1 else inp[i] for i in range(len(inp))], j) for j in range(dtype.count)]
+            ul[i] = [load([inp[i][j] if i != 0 and dtp[i].count > 1 else inp[i] for i in range(len(inp))], j, dtype.scalar()) \
+              for j in range(dtype.count)]
           else:
-            ul[i] = load(inp)
+            ul[i] = load(inp, 0, dtype)
         elif uop is Ops.GEP: ul[i] = inp[0][get_single_element(arg)]
       
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
-          if (len(inp) == 2 and (dtype == dtypes.int32) and (uop == Ops.MUL or uop == Ops.ADD)):
+          if (len(inp) == 2 and (dtype == dtypes.int32 or dtype == dtypes.int16 or dtype == dtypes.float or dtype == dtypes.float16) and (uop == Ops.MUL or uop == Ops.ADD)):
 
    
             self.device.add_buffer(len(inp[0]))
@@ -464,14 +505,15 @@ class RockchipProgram:
             print(self.weight_buf)
             print(self.output_buf)
             
+         
             import numpy as np
             self.create_reg()
-            if dtype == dtypes.float:
+            if dtype == dtypes.float or dtype == dtypes.float16:
               src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
               src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
               ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.float16)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
               
               self.ops(uop, dtypes.float16)
    
@@ -483,14 +525,16 @@ class RockchipProgram:
               dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int32)
 
               self.ops(uop, dtypes.int32)
-            elif dtype == dtypes.bfloat16:
-              src = memoryview(bytearray(np.bfloat16(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.bfloat16(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.bfloat16)
 
-              self.ops(uop, dtypes.bfloat16)    
+            elif dtype == dtypes.int16:
+              src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              src2 = memoryview(bytearray(np.int16(inp[1]).tobytes()))
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int16)
+
+              self.ops(uop, dtypes.int16)  
+
             self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
                 self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
             self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
