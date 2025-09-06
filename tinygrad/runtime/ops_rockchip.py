@@ -18,6 +18,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.uop.ops import exec_alu, Ops, UOp, GroupOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
+os.environ["DEFAULT_FLOAT"] = "BFLOAT16"
 
 def _load(m, i):
   if i is None: return 0.0
@@ -41,6 +42,7 @@ class RockchipRenderer(Renderer):
 
 
 class RockchipDevice(Compiled):
+  
   def _gpu_alloc(self, size:int, flags) -> HCQBuffer:
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
     mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)    
@@ -53,9 +55,26 @@ class RockchipDevice(Compiled):
     self.cmd_buf = self._gpu_alloc(1024, 0)
     self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING)
 
+    self.input_buf = None
+    self.weight_buf = None
+    self.output_buf = None
 
-    super().__init__(device, RockchipAllocator(self), RockchipRenderer(), RockchipCompiler(), functools.partial(RockchipProgram, self))
+    self.buffer_list = []
     
+    super().__init__(device, RockchipAllocator(self), RockchipRenderer(), RockchipCompiler(), functools.partial(RockchipProgram, self))
+
+  def add_buffer(self, size):
+
+    self.input_buf = next((item["buf"] for item in self.buffer_list if item["buf_type"] == "input" and item["size"] == size), None)
+    self.weight_buf = next((item["buf"] for item in self.buffer_list if item["buf_type"] == "weight" and item["size"] == size), None)
+    self.output_buf = next((item["buf"] for item in self.buffer_list if item["buf_type"] == "output" and item["size"] == size), None)
+    if (self.input_buf is None or self.weight_buf is None or self.output_buf is None):
+      self.input_buf = self._gpu_alloc(size, 0)
+      self.buffer_list.append({"buf_type": "input", "buf": self.input_buf, "size": size})
+      self.weight_buf = self._gpu_alloc(size, 0)
+      self.buffer_list.append({"buf_type": "weight", "buf": self.weight_buf, "size": size})
+      self.output_buf = self._gpu_alloc(size, 0)
+      self.buffer_list.append({"buf_type": "output", "buf": self.output_buf, "size": size})
 
 class RockchipProgram:
 
@@ -66,7 +85,7 @@ class RockchipProgram:
     # Pack the values into a 64-bit integer as per hardware spec
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
-    print(hex(packed_value))
+
     self.q.append(packed_value)
   def get_precision(self, dtype):
     # 3'd0: Integer 8bit; 
@@ -432,12 +451,18 @@ class RockchipProgram:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
-          if (len(inp) == 2 and (dtype == dtypes.float or dtype == dtypes.int32) and (uop == Ops.MUL or uop == Ops.ADD)):
+          if (len(inp) == 2 and (dtype == dtypes.int32) and (uop == Ops.MUL or uop == Ops.ADD)):
 
+   
+            self.device.add_buffer(len(inp[0]))
 
-            self.input_buf = self.device._gpu_alloc(len(inp[0]), 0)
-            self.weight_buf = self.device._gpu_alloc(len(inp[1]), 0)
-            self.output_buf = self.device._gpu_alloc(len(inp[0]), 0)
+            self.input_buf = self.device.input_buf
+            self.weight_buf = self.device.weight_buf
+            self.output_buf = self.device.output_buf
+
+            print(self.input_buf)
+            print(self.weight_buf)
+            print(self.output_buf)
             
             import numpy as np
             self.create_reg()
@@ -458,7 +483,14 @@ class RockchipProgram:
               dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int32)
 
               self.ops(uop, dtypes.int32)
-     
+            elif dtype == dtypes.bfloat16:
+              src = memoryview(bytearray(np.bfloat16(inp[0]).tobytes()))
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              src2 = memoryview(bytearray(np.bfloat16(inp[1]).tobytes()))
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.bfloat16)
+
+              self.ops(uop, dtypes.bfloat16)    
             self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
                 self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
             self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
@@ -468,7 +500,10 @@ class RockchipProgram:
           
             self.submit()
             ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
-
+            print("inp[0]", inp[0])
+            print(uop)
+            print("inp[1]", inp[1])
+            print('dst', dst.tolist())
             ul[i] = dst.tolist()
           else:
             print('OPERATION NOT SUPPORTED, FALLBACK TO CPU', uop, dtype)
