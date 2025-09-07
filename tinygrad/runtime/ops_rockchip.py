@@ -18,7 +18,6 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.uop.ops import exec_alu, Ops, UOp, GroupOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-os.environ["DEFAULT_FLOAT"] = "BFLOAT16"
 
 def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else dtype.fmt
 
@@ -95,7 +94,6 @@ class RockchipProgram:
     # Pack the values into a 64-bit integer as per hardware spec
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
-    print(f"{hex(packed_value)}")
 
     self.q.append(packed_value)
   def get_precision(self, dtype):
@@ -159,7 +157,8 @@ class RockchipProgram:
       self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
 
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 
-      self.reg(self.get_is_fp16(dtype), rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK));
+      self.reg(self.get_is_fp16(dtype), rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK));
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
       self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
@@ -492,7 +491,7 @@ class RockchipProgram:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
-          if (len(inp) == 2 and (dtype == dtypes.int32 or dtype == dtypes.int16 or dtype == dtypes.float or dtype == dtypes.float16) and (uop == Ops.MUL or uop == Ops.ADD)):
+          if (len(inp) == 2 and (dtype == dtypes.int8 or dtype == dtypes.int32 or dtype == dtypes.int16 or dtype == dtypes.float or dtype == dtypes.float16) and (uop == Ops.MUL or uop == Ops.ADD)):
 
    
             self.device.add_buffer(len(inp[0]))
@@ -501,10 +500,6 @@ class RockchipProgram:
             self.weight_buf = self.device.weight_buf
             self.output_buf = self.device.output_buf
 
-            print(self.input_buf)
-            print(self.weight_buf)
-            print(self.output_buf)
-            
          
             import numpy as np
             self.create_reg()
@@ -517,23 +512,23 @@ class RockchipProgram:
               
               self.ops(uop, dtypes.float16)
    
-            elif dtype == dtypes.int32:
-              src = memoryview(bytearray(np.int32(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int32(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int32)
-
-              self.ops(uop, dtypes.int32)
-
-            elif dtype == dtypes.int16:
+            elif dtype == dtypes.int32 or dtype == dtypes.int16:
               src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
               src2 = memoryview(bytearray(np.int16(inp[1]).tobytes()))
               ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int16)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.int16.itemsize)), dtype=np.int16)
 
-              self.ops(uop, dtypes.int16)  
+              self.ops(uop, dtypes.int16)
+
+            elif dtype == dtypes.int8:
+              src = memoryview(bytearray(np.int8(inp[0]).tobytes()))
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              src2 = memoryview(bytearray(np.int8(inp[1]).tobytes()))
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int8)
+
+              self.ops(uop, dtypes.int8)
 
             self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
                 self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
@@ -544,10 +539,10 @@ class RockchipProgram:
           
             self.submit()
             ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
-            print("inp[0]", inp[0])
-            print(uop)
-            print("inp[1]", inp[1])
-            print('dst', dst.tolist())
+            # print("inp[0]", inp[0])
+            # print(uop)
+            # print("inp[1]", inp[1])
+            # print('dst', dst.tolist())
             ul[i] = dst.tolist()
           else:
             print('OPERATION NOT SUPPORTED, FALLBACK TO CPU', uop, dtype)
