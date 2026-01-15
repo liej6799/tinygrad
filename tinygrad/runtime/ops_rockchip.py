@@ -8,7 +8,7 @@ from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storag
 from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, Target
 from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, bitcast
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
@@ -343,8 +343,12 @@ class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
 class RockchipRenderer(Renderer):
-  code_for_op = {k:v for k,v in python_alu.items() if k is not Ops.MULACC}
+  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC]}
   compiler = RockchipCompiler()
+  extra_matcher = PatternMatcher([
+    (UPat(Ops.MUL, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MUL, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
+    (UPat(Ops.ADD, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.ADD, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
+  ])
 
   def __init__(self, target:Target):
     self.target = target
