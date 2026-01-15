@@ -131,7 +131,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.ops_map = {Ops.ADD: 2, Ops.MUL: 0}
+    self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     st = time.perf_counter()
