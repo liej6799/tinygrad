@@ -23,7 +23,7 @@ class RockchipProgram:
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
     self.q.append(packed_value)
-  def boilerplate(self, size):
+  def boilerplate(self, op, size):
     self.q = []
     burst_len = 0xF
     output_mode  = 0x2
@@ -39,7 +39,7 @@ class RockchipProgram:
     ew_data_size = 2
     ew_relu_bypass = 1
     ew_lut_bypass = 1
-    ew_alu_algo = 2
+    ew_alu_algo = self.ops_map.get(op, 0)
     ew_op_src = 1
     erdma_data_size_16bit=2
 
@@ -68,7 +68,9 @@ class RockchipProgram:
         self.reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
         self.reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
         self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+        self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+        self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
 
@@ -129,6 +131,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
+    self.ops_map = {Ops.ADD: 2, Ops.MUL: 0}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     st = time.perf_counter()
@@ -298,8 +301,8 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
-          if len(src_values) >= 2 and dtype.scalar() == dtypes.half:
-            self.boilerplate(size=len(src_values[0]))
+          if len(src_values) >= 2 and uop in self.ops_map and dtype.scalar() == dtypes.half:
+            self.boilerplate(op=uop, size=len(src_values[0]))
 
             src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
             src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
@@ -325,9 +328,9 @@ class RockchipProgram:
             ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
             # fp16 2B, self.output_buf.size//2
             dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())  
-            print('dst', list(dst))
-            print('src', list(src))
-            print('src2', list(src2))
+            # print('dst', list(dst))
+            # print('src', list(src))
+            # print('src2', list(src2))
 
             values[i] = list(dst)
           else:
@@ -340,7 +343,7 @@ class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
 class RockchipRenderer(Renderer):
-  code_for_op = python_alu
+  code_for_op = {k:v for k,v in python_alu.items() if k is not Ops.MULACC}
   compiler = RockchipCompiler()
 
   def __init__(self, target:Target):
