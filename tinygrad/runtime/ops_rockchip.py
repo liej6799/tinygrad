@@ -84,7 +84,6 @@ class RockchipProgram:
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
-
   def submit(self):
     self.q.append(0x2001000178495044), # 63
     self.q.append(0x0081000000180008), # 72
@@ -131,7 +130,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.SUB: 4}
+    self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     st = time.perf_counter()
@@ -343,7 +342,8 @@ class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
 class RockchipRenderer(Renderer):
-  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC]}
+  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]}
+  code_for_op.update({Ops.FDIV: 0})
   compiler = RockchipCompiler()
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MUL, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
