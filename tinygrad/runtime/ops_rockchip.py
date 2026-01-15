@@ -2,57 +2,18 @@
 # a python uops emulator
 # works to test the tensor cores, and all the uops in general
 # this is the (living) definition of uops
-from typing import Any, TYPE_CHECKING, cast
-import pickle, base64, itertools, time, struct, sys, functools, array, ctypes, mmap, os
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_to_fp16, float_to_bf16, float_to_fp8, fp8_to_float
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, EMULATE, mv_address, to_mv
-from tinygrad.device import Compiled, Compiler, Allocator, CompilerSet, CompilerPair, BufferSpec
+from typing import Any, TYPE_CHECKING
+import pickle, base64, itertools, time, struct, sys, functools, array, ctypes, mmap, os, math, numpy as np
+from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
+from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, Target
+from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-
-def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else 'B' if dtype in dtypes.fp8s else dtype.fmt
-
-def to_storage_scalar(x, dtype: DType):
-  if dtype == dtypes.half: return float_to_fp16(x)
-  if dtype == dtypes.bfloat16: return (struct.unpack('I', struct.pack('f', float_to_bf16(x)))[0] >> 16) & 0xFFFF
-  if dtype in dtypes.fp8s: return float_to_fp8(float(x), dtype)
-  return x
-
-def from_storage_scalar(x, dtype: DType):
-  if dtype == dtypes.bfloat16: return struct.unpack('f', struct.pack('I', (x & 0xFFFF) << 16))[0]
-  if dtype in dtypes.fp8s: return fp8_to_float(int(x), dtype)
-  return x
-
-def _load(m, i, dtype: DType):
-  if i is None: return 0.0
-  if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
-  return from_storage_scalar(m[i], dtype)
-
-def load(inp, j, dtype: DType):
-  if len(inp) == 2: return [_load(m, x+j if x is not None else None, dtype) if gate else default for (m,x,gate),default in zip(*inp)]
-  return [_load(m, x+j if x is not None else None, dtype) for m,x,_ in inp[0]]
-
-def _store(m, i, v, dtype: DType):
-  if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
-  m[i] = to_storage_scalar(v, dtype)
-
-# here are the models for the WMMA instruction on the different hardware
-def generic_wmma_helper(inp, warp_size, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_elem, b_elem, c_map):
-  for cc, tinp, num in zip(("A", "B", "C"), inp, (NUM_A, NUM_B, NUM_C)):
-    assert len(tinp) == num, f"{cc} must have {num} elements per thread, it has {len(tinp)}"
-    assert len(flatten(tinp)) == num * warp_size, f"WMMA must have {num * warp_size} total elements for {cc} in WMMA"
-  assert warp_size > 0 and warp_size % WARP_THREADS == 0, f"must have multiples of {WARP_THREADS} warp threads"
-  out = [inp[2][elem_idx][:] for elem_idx in range(NUM_C)]
-  for goff in range(0, warp_size, WARP_THREADS):
-    for lane_id in range(WARP_THREADS):
-      for elem_idx in range(NUM_C): # calculate new muls and add to acc
-        (c_i, c_j) = c_map(lane_id, elem_idx)
-        out[elem_idx][goff+lane_id] += sum(a_elem(inp[0], _k, c_j, goff) * b_elem(inp[1], c_i, _k, goff) for _k in range(K))
-  return out
+from tinygrad.runtime.ops_python import _load, load, _store, generic_wmma_helper
 
 class RockchipProgram:
   def reg(self, val, shift, mask):
@@ -62,20 +23,16 @@ class RockchipProgram:
     target = target + 0x1
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
     self.q.append(packed_value)
-  def boilerplate(self):
+  def boilerplate(self, size):
     self.q = []
     burst_len = 0xF
-    conv_mode = 0
     output_mode  = 0x2
     flying_mode = 0x1 # bypass CNA, directly to DPU (0x0 for default)
     channel = 7
-    dataout_width = 5
     dataout_height = 0
+    dataout_width = math.ceil(size / ((dataout_height+1) * (channel+1))) - 1
 
-    precision_int8 = 0
     precision_float16 = 2
-    precision_int32 = 4
-    precision_float32 = 5
 
     ew_cvt_type = 0
     ew_data_mode = 1
@@ -93,7 +50,6 @@ class RockchipProgram:
 
     self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
         self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
-        self.reg(conv_mode, rk.DPU_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_CONV_MODE__MASK) |
         self.reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
         self.reg(flying_mode, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__MASK))
 
@@ -169,18 +125,34 @@ class RockchipProgram:
     )
     print(res)
 
-  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
+  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
 
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
     void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
     loop_ends: dict[int, int] = {srcs[1]:i for i, (uop, _, srcs, _) in enumerate(self.uops) if uop == Ops.END}
-    for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
+    warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
+    warp_size = len(warp)
+    has_control_flow = any(op in (Ops.RANGE, Ops.IF, Ops.ENDIF) for op,_,_,_ in self.uops)
+    vectorize_global = False
+    global_iters = itertools.product(*[range(x) for x in global_size[::-1]])
+    # why has_control_flow
+    if not has_control_flow and all(x == 1 for x in local_size):
+      total_elems = math.prod(global_size)
+      # why 16384
+      if 1 < total_elems <= 16384:
+        warp = list(itertools.product(*[range(x) for x in global_size[::-1]]))
+        warp_size = len(warp)
+        global_iters = [tuple(0 for _ in global_size)]
+        vectorize_global = True
+
+    # for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
+    for idxs in global_iters:
       values: dict[int, Any] = {}
       pbufs: list[memoryview] = list(bufs)
       pvals: list[int] = list(vals)
@@ -205,7 +177,7 @@ class RockchipProgram:
           i += 1
           continue
         if uop is Ops.AFTER: values[i] = src_values[0]
-        elif uop in {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
+        elif uop in {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
           assert isinstance(dtype, PtrDType), dtype
           storage_fmt = storage_fmt_for_dtype(dtype.base.scalar())
           if storage_fmt is None: raise RuntimeError(f"{dtype=} is not supported")
@@ -214,13 +186,13 @@ class RockchipProgram:
             # REGs are per thread
             values[i] = [memoryview(bytearray(dtype.size*dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
           else:
-            buf = memoryview(bytearray(dtype.size*dtype.itemsize)) if uop is not Ops.DEFINE_GLOBAL else pbufs.pop(0)
+            buf = memoryview(bytearray(dtype.size*dtype.itemsize)) if uop is not Ops.PARAM else pbufs.pop(0)
             values[i] = [buf.cast(storage_fmt)] * warp_size
         elif uop is Ops.DEFINE_VAR:
           values[i] = [pvals.pop(0)] * warp_size
         elif uop is Ops.SPECIAL:
-          if arg[0] == 'g': values[i] = [idxs[2-int(arg[-1])]] * warp_size
-          elif arg[0] == 'l': values[i] = [x[2-int(arg[-1])] for x in warp]
+          if arg[0] == 'g': values[i] = values[i] = [x[2-int(arg[-1])] for x in warp] if vectorize_global else [idxs[2-int(arg[-1])]] * warp_size
+          elif arg[0] == 'l': values[i] = values[i] = [0] * warp_size if vectorize_global else [x[2-int(arg[-1])] for x in warp]
         elif uop is Ops.CONST: values[i] = [arg] * warp_size
         elif uop is Ops.INDEX:
           ret:list = []
@@ -242,14 +214,11 @@ class RockchipProgram:
             del values[i]
             i = loop_ends[i] + 1
             continue
-        elif uop is Ops.VECTORIZE: values[i] = src_values
+        elif uop is Ops.STACK: values[i] = src_values
         elif uop is Ops.BITCAST:
-          packed = struct.pack(str(warp_size) + storage_fmt_for_dtype(src_dtypes[0].scalar()),
-                               *[to_storage_scalar(x, src_dtypes[0].scalar()) for x in src_values[0]])
-          values[i] = list(struct.unpack(str(warp_size) +  storage_fmt_for_dtype(dtype.scalar()), packed))
-          values[i] = [from_storage_scalar(x, dtype.scalar()) for x in values[i]]
+          values[i] = [bitcast(x, src_dtypes[0], dtype) for x in src_values[0]]
         elif uop is Ops.CAST:
-          values[i] = [truncate.get(dtype, lambda dt: dt)(dtypes.as_const(x, dtype)) for x in src_values[0]]
+          values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
         elif uop is Ops.LOAD:
           if dtype.count > 1:
             values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
@@ -329,16 +298,15 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
-          if len(src_values) >= 2:
-            self.boilerplate()
+          if len(src_values) >= 2 and dtype.scalar() == dtypes.half:
+            self.boilerplate(size=len(src_values[0]))
 
-            self.input_buf = self.device._gpu_alloc(len(src_values[0]), 0)
-            self.weight_buf = self.device._gpu_alloc(len(src_values[1]), 0)
-            self.output_buf = self.device._gpu_alloc(len(src_values[0]), 0)
-
-            src = memoryview(array.array('i', src_values[0]))
+            src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
+            src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
+            self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
+            self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
+            self.output_buf = self.device._gpu_alloc(src.nbytes, 0, name="output")
             ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-            src2 = memoryview(array.array('i', src_values[1]))
             ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
 
             self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
@@ -355,26 +323,34 @@ class RockchipProgram:
 
             dst = memoryview(bytearray(self.output_buf.size))
             ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+            # fp16 2B, self.output_buf.size//2
+            dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())  
             print('dst', list(dst))
             print('src', list(src))
             print('src2', list(src2))
-            print([exec_alu(uop, dtype, p) for p in zip(*src_values)])
 
-          values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
+            values[i] = list(dst)
+          else:
+            values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
         assert i in values, (uop, dtype, srcs, arg)
         i += 1
     return time.perf_counter() - st
 
+class RockchipCompiler(Compiler):
+  def compile(self, src:str) -> bytes: return base64.b64decode(src)
+
 class RockchipRenderer(Renderer):
-  device = "ROCKCHIP"
   code_for_op = python_alu
+  compiler = RockchipCompiler()
+
+  def __init__(self, target:Target):
+    self.target = target
+    self.tensor_cores = []
+
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
     lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
     return base64.b64encode(pickle.dumps(lops)).decode()
-
-class RockchipCompiler(Compiler):
-  def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
@@ -397,17 +373,22 @@ class RockchipAllocator(Allocator['RockchipDevice']):
   def _copyout(self, dest:memoryview, src): dest[:] = src
 
 class RockchipDevice(Compiled):
-  def _gpu_alloc(self, size:int, flags) -> HCQBuffer:
+  def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
+    flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
+    result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
+    print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}")
+    return flink_req.name
+  def _gpu_alloc(self, size:int, flags, name:str) -> HCQBuffer:
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
     mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)
     va_addr = self.fd_ctl.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mem_map.offset)
+    mem_create.flink_name = self.create_flink_name(mem_create.handle, name, virt_address=va_addr, obj_addr=mem_create.obj_addr, dma_address=mem_create.dma_addr)
 
     return HCQBuffer(va_addr=va_addr, size=size, meta=mem_create)
 
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
-    self.cmd_buf = self._gpu_alloc(1024, 0)
-    self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING)
+    self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+    self.cmd_buf = self._gpu_alloc(1024, 0, name="cmd_buf")
 
-    compilers = CompilerSet([CompilerPair(RockchipRenderer, RockchipCompiler)])
-    super().__init__(device, RockchipAllocator(self), compilers, functools.partial(RockchipProgram, self))
+    super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
