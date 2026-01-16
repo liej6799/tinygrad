@@ -103,6 +103,11 @@ class TestOps(unittest.TestCase):
     if exact: self.assertEqual(str(torch_cm.exception), str(tinygrad_cm.exception))
     if not CI: print("\ntesting %40r   torch/tinygrad exception: %s / %s" % (shps, torch_cm.exception, tinygrad_cm.exception), end="")
 
+  def test_tiny_add(self):
+    helper_test_op([(3), (3)], lambda x,y: x+y, Tensor.add, forward_only=True)
+  def test_tiny_mul(self):
+    helper_test_op([(64), (64)], lambda x,y: x*y, Tensor.mul, forward_only=True)
+
   def test_add(self):
     helper_test_op([(45,68), (45,68)], lambda x,y: x+y, Tensor.add)
     helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
@@ -162,6 +167,41 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65)], lambda x: -x)
     helper_test_op([(45,65)], lambda x: x.neg())
     helper_test_op([()], lambda x: x.neg())
+
+  def test_maximum(self):
+    helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
+    helper_test_op([(), ()], torch.maximum, Tensor.maximum)
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
+    helper_test_op(None, torch.maximum, Tensor.maximum,
+                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+    helper_test_op(None, torch.maximum, Tensor.maximum,
+                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], [True, True, False]], forward_only=True)
+
+    # test applying to different dtype
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1, 2, 3], 1.2], forward_only=True)
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 1.2], forward_only=True)
+    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 3], forward_only=True)
+
+  # failed, need supported for Ops.CMPNE
+  def test_minimum(self):
+    helper_test_op([(45,65), (45,65)], torch.minimum, Tensor.minimum)
+    helper_test_op([(), ()], torch.minimum, Tensor.minimum)
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], 3.])
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
+    helper_test_op(None, torch.minimum, Tensor.minimum,
+                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+    helper_test_op(None, torch.minimum, Tensor.minimum,
+                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], True], forward_only=True)
+    # helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], [True, True, False]], forward_only=True)
+
+    # # test applying to different dtype
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1, 2, 3], 1.2], forward_only=True)
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], 1.2], forward_only=True)
+    helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], 3], forward_only=True)
 
 if __name__ == '__main__':
   np.random.seed(1337)

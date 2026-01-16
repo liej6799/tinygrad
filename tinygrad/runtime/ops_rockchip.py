@@ -136,7 +136,7 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.submit_op = None
-    self.ops_map = {Ops.MUL: 0, Ops.NEG:0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
+    self.ops_map = {Ops.MUL: 0, Ops.NEG:0, Ops.MAX:0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
@@ -373,6 +373,9 @@ class RockchipRenderer(Renderer):
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MUL, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.ADD, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MAX, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half)).cast(dtypes.float)),
+    (UPat(Ops.NEG, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG).cast(dtypes.float)),
   ])
 
   def __init__(self, target:Target):
