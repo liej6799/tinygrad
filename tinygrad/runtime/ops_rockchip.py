@@ -76,6 +76,7 @@ class RockchipProgram:
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
     # need gated by op, even setting 0 make result wrong
     if op == Ops.FDIV: 
+      # setting 0 or 1 both works, remove line does not
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
         self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
 
@@ -92,8 +93,8 @@ class RockchipProgram:
   def submit(self):
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if self.submit_op == Ops.FDIV else 0x17849)
     self.q.append(0x0081000000180008), # 72
-    tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
-    regcmd = ctypes.cast(self.device.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
+    tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
+    regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
     for i in range(len(self.q)):
       regcmd[i] = self.q[i]
 
@@ -105,7 +106,7 @@ class RockchipProgram:
     tasks[0].int_status = 0;
     tasks[0].regcfg_amount = len(self.q)
     tasks[0].regcfg_offset = 0;
-    tasks[0].regcmd_addr = self.device.cmd_buf.meta.dma_addr
+    tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
 
     # TODO: update parameter name as driver updated
     submit_res = rk.struct_rknpu_submit(
@@ -115,7 +116,7 @@ class RockchipProgram:
             task_number=1,
             task_counter=0,
             priority=0,
-            task_obj_addr=self.device.task_buf.meta.obj_addr,   # Placeholder, would be actual address in real code
+            task_obj_addr=self.task_buf.meta.obj_addr,   # Placeholder, would be actual address in real code
             regcfg_obj_addr=0,
             task_base_addr=0,
             user_data=0,
@@ -138,6 +139,7 @@ class RockchipProgram:
     self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    self.device.reset_npu()
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -313,30 +315,42 @@ class RockchipProgram:
             self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
             self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
             self.output_buf = self.device._gpu_alloc(src.nbytes, 0, name="output")
-            ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-            ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+            self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+            self.cmd_buf = self.device._gpu_alloc(1024, 0, name="cmd_buf")
+            try:
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+              self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
 
-            self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
-                self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
-                         rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-              self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
-                       rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-              self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
-                       rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+                  self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
+                           rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+                self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
+                         rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+                self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
+                         rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
 
-            self.submit()
+              self.submit()
+              self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
 
-            dst = memoryview(bytearray(self.output_buf.size))
-            ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-            # fp16 2B, self.output_buf.size//2
-            dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())  
-            # print('dst', list(dst))
-            # print('src', list(src))
-            # print('src2', list(src2))
+              dst = memoryview(bytearray(self.output_buf.size))
+              ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+              # fp16 2B, self.output_buf.size//2
+              dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
+              # print('dst', list(dst))
+              # print('src', list(src))
+              # print('src2', list(src2))
 
-            values[i] = list(dst)
+              values[i] = list(dst)
+            finally:
+              self.device._gpu_free(self.input_buf)
+              self.device._gpu_free(self.weight_buf)
+              self.device._gpu_free(self.output_buf)
+              self.device._gpu_free(self.task_buf)
+              self.device._gpu_free(self.cmd_buf)
           else:
             values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
         assert i in values, (uop, dtype, srcs, arg)
@@ -397,10 +411,18 @@ class RockchipDevice(Compiled):
     mem_create.flink_name = self.create_flink_name(mem_create.handle, name, virt_address=va_addr, obj_addr=mem_create.obj_addr, dma_address=mem_create.dma_addr)
 
     return HCQBuffer(va_addr=va_addr, size=size, meta=mem_create)
+  def _gpu_sync(self, buf:HCQBuffer, flags:int) -> None:
+    if not getenv("ROCKCHIP_MEM_SYNC", 0): return
+    rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, __payload=rk.struct_rknpu_mem_sync(
+      flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.size))
+  def _gpu_free(self, buf:HCQBuffer) -> None:
+    FileIOInterface.munmap(buf.va_addr, buf.size)
+    rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(
+      handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr))
+  def reset_npu(self):
+    rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=rk.RKNPU_ACT_RESET, value=0))
 
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
-    self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
-    self.cmd_buf = self._gpu_alloc(1024, 0, name="cmd_buf")
 
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
