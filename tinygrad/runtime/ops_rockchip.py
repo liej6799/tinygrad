@@ -98,14 +98,14 @@ class RockchipProgram:
     for i in range(len(self.q)):
       regcmd[i] = self.q[i]
 
-    tasks[0].flags  = 0;
-    tasks[0].op_idx = 4;
-    tasks[0].enable_mask = 0x18;
-    tasks[0].int_mask = 0x300;
-    tasks[0].int_clear = 0x1ffff;
-    tasks[0].int_status = 0;
+    tasks[0].flags  = 0
+    tasks[0].op_idx = 4
+    tasks[0].enable_mask = 0x18
+    tasks[0].int_mask = 0x300
+    tasks[0].int_clear = 0x1ffff
+    tasks[0].int_status = 0
     tasks[0].regcfg_amount = len(self.q)
-    tasks[0].regcfg_offset = 0;
+    tasks[0].regcfg_offset = 0
     tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
 
     # TODO: update parameter name as driver updated
@@ -136,7 +136,7 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.submit_op = None
-    self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
+    self.ops_map = {Ops.MUL: 0, Ops.NEG:0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
@@ -307,7 +307,10 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
-          if len(src_values) >= 2 and uop in self.ops_map and dtype.scalar() == dtypes.half:
+          if uop in self.ops_map and dtype.scalar() == dtypes.half:
+            if uop == Ops.NEG and len(src_values)==1:
+              src_values.append([-1]*len(src_values[0]))
+              uop = Ops.MUL
             self.boilerplate(op=uop, size=len(src_values[0]))
 
             src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
@@ -344,7 +347,8 @@ class RockchipProgram:
               print('src', list(src))
               print('src2', list(src2))
               print('dst', list(dst))
-              print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) if uop in python_alu else None
+              try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
+              except: pass
 
               values[i] = list(dst)
             finally:

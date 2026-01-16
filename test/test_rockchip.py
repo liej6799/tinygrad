@@ -110,12 +110,58 @@ class TestOps(unittest.TestCase):
   def test_add3(self):
     helper_test_op([(45,65), (45,65), (45,65)], lambda x,y,z: x+y+z)
 
-  # failed
+  # failed, need ADD int16 support
   # def test_broadcasted_add(self):
+  #   pass
   #   helper_test_op([(45,65), (45,1)], lambda x,y: x+y)
   #   helper_test_op([(45,65), ()], lambda x,y: x+y)
   # def test_broadcasted_add_2(self):
   #   helper_test_op([(45,65), (65,)], lambda x,y: x+y)
+
+  def test_sub(self):
+    helper_test_op([(45,65), (45,65)], lambda x,y: x-y, Tensor.sub)
+    helper_test_op([(45,65), (45,65)], lambda x,y: x-y)
+    helper_test_op([(), ()], lambda x,y: x-y)
+  def test_scalar_sub(self):
+    helper_test_op([(45,65)], lambda x: x-2)
+    helper_test_op([()], lambda x: x-2)
+  def test_scalar_rsub(self):
+    helper_test_op([(45,65)], lambda x: 2-x)
+    helper_test_op([()], lambda x: 2-x)
+
+  def test_mul(self):
+    helper_test_op([(64,64), (64,64)], lambda x,y: x*y, Tensor.mul)
+    helper_test_op([(64,64), (64,64)], lambda x,y: x*y, Tensor.mul)
+    helper_test_op([(64,64), (64,64)], lambda x,y: x*y)
+    helper_test_op([(), ()], lambda x,y: x*y)
+  
+  # failed, need Ops.neg support
+  def test_scalar_mul(self):
+    helper_test_op([(45,65)], lambda x: x*2)
+    helper_test_op([(45,65)], lambda x: x*-1)
+    helper_test_op([(45,65)], lambda x: 255*x)
+    helper_test_op([(45,65)], lambda x: 2*x)
+    helper_test_op([()], lambda x: x*2)
+    helper_test_op([()], lambda x: 2*x)
+
+  def test_div(self):
+    helper_test_op([(45,65), (45,65)], lambda x,y: x/y, Tensor.div)
+    helper_test_op([(45,65), (45,65)], lambda x,y: x/y)
+    helper_test_op([(), ()], lambda x,y: x/y)
+
+  def test_scalar_div(self):
+    helper_test_op([(45,65)], lambda x: x/255)
+    helper_test_op([(45,65)], lambda x: x/1)
+    helper_test_op([(45,65)], lambda x: 1/x)
+    helper_test_op([(45,65)], lambda x: x/2)
+    helper_test_op([(45,65)], lambda x: 2/x)
+    helper_test_op([()], lambda x: x/2)
+    helper_test_op([()], lambda x: 2/x)
+
+  def test_neg(self):
+    helper_test_op([(45,65)], lambda x: -x)
+    helper_test_op([(45,65)], lambda x: x.neg())
+    helper_test_op([()], lambda x: x.neg())
 
 if __name__ == '__main__':
   np.random.seed(1337)

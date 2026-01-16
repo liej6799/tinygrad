@@ -69,3 +69,5 @@ mutants
 dagre/
 graphlib/
 uv.lock
+test/test_rockchip_old.py
+tinygrad/runtime/ops_rockchip copy.py
