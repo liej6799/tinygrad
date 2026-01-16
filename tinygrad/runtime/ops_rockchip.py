@@ -25,6 +25,7 @@ class RockchipProgram:
     self.q.append(packed_value)
   def boilerplate(self, op, size):
     self.q = []
+    self.submit_op = op
     burst_len = 0xF
     output_mode  = 0x2
     flying_mode = 0x1 # bypass CNA, directly to DPU (0x0 for default)
@@ -73,6 +74,10 @@ class RockchipProgram:
         self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
+    # need gated by op, even setting 0 make result wrong
+    if op == Ops.FDIV: 
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+        self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
@@ -85,7 +90,7 @@ class RockchipProgram:
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
   def submit(self):
-    self.q.append(0x2001000178495044), # 63
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if self.submit_op == Ops.FDIV else 0x17849)
     self.q.append(0x0081000000180008), # 72
     tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
     regcmd = ctypes.cast(self.device.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
@@ -102,6 +107,7 @@ class RockchipProgram:
     tasks[0].regcfg_offset = 0;
     tasks[0].regcmd_addr = self.device.cmd_buf.meta.dma_addr
 
+    # TODO: update parameter name as driver updated
     submit_res = rk.struct_rknpu_submit(
             flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
             timeout=6000,
@@ -121,15 +127,14 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
-    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,
-            __payload=submit_res
-    )
+    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     print(res)
 
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
+    self.submit_op = None
     self.ops_map = {Ops.MUL: 0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
