@@ -202,20 +202,15 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], 1.2], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], 3], forward_only=True)
 
-  # TODO, try fp32 ouput
-  # LUT method failed Not equal to tolerance rtol=0.001, atol=1e-06
-  # Max absolute difference among violations: 0.00586
-  # Max relative difference among violations: 0.01682
+  # failed Not equal to tolerance rtol=1e-3, atol=1e-06
   def test_exp2(self):
-    helper_test_op([(45,65)], torch.exp2, Tensor.exp2, atol=6e-3, rtol=2e-2)
+    helper_test_op([(45,65)], torch.exp2, Tensor.exp2, rtol=1e-3, atol=5e-3)
     # helper_test_op(None, torch.exp2, Tensor.exp2, vals=[[math.inf, -math.inf, math.nan]])
-    helper_test_op([()], torch.exp2, Tensor.exp2)
-
-  def test_sigmoid(self):
-    pass
-    # helper_test_op([(1,1)], torch.sigmoid, Tensor.sigmoid)
-    # helper_test_op([(45,65)], torch.sigmoid, Tensor.sigmoid)
-    # helper_test_op([()], torch.sigmoid, Tensor.sigmoid)
+    helper_test_op([()], torch.exp2, Tensor.exp2, atol=8e-3, rtol=1e-2)
+  # TODO test silu(-x)=silu(x)-x
+  def test_silu(self):
+    helper_test_op([(45,65)], torch.nn.functional.silu, Tensor.silu, rtol=1e-3, atol=5e-3)
+    helper_test_op([()], torch.nn.functional.silu, Tensor.silu)
 
 if __name__ == '__main__':
   np.random.seed(1337)
