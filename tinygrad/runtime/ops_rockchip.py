@@ -16,13 +16,14 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import _load, load, _store, generic_wmma_helper
 
 class RockchipProgram:
-  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
+  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
+    self.submit_op = None
     self.hardware_ops = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
-    self.exp2_inv_scale = 1.0
+    self.inv_scale = 1.0
     self.lut_size = 513
   def check_lut_enable(self, op, arg):
     return bool({op, arg} & {Ops.EXP2, "silu"})
@@ -93,6 +94,13 @@ class RockchipProgram:
           self.reg(22, rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__SHIFT,
                   rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__MASK))
 
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+      
+
     burst_len = 15
     output_mode = 2
     flying_mode = 1
@@ -106,17 +114,11 @@ class RockchipProgram:
     ew_data_mode = 1
     ew_data_size = 2
     ew_relu_bypass = arg != "relu"
-    ew_lut_bypass = 1
     ew_alu_algo = self.hardware_ops.get(op, 0)
     ew_op_src = 1
     erdma_data_size_16bit=2
     if self.lut_enable:
       ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
-        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
-        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
 
     self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
         self.reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
@@ -145,7 +147,7 @@ class RockchipProgram:
         self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
         self.reg(op in [Ops.MUL, Ops.FDIV] or self.lut_enable, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
-        self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+        self.reg(self.lut_enable == False, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
         self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
       )
@@ -205,17 +207,6 @@ class RockchipProgram:
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
     print(res)
-
-  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
-    self.device = dev
-    self.q = []
-    self.submit_op = None
-    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
-    self.cmd_buf_size = 16384
-    self.inv_scale = 1.0
-    self.lut_size = 513
-    self.lut_ops = [Ops.EXP2, Ops.CUSTOM]
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
@@ -434,16 +425,21 @@ class RockchipProgram:
                   dst = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
                 elif arg == "silu":
                   dst = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
+              values[i] = list(dst)
               print('src', list(src))
               print('src2', list(src2))
-              print('dst', list(dst))
+              print('dst', values[i])
               try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
               except: pass
-              values[i] = list(dst)
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
-            values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
+            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC)
+            if allow_fallback:
+              print('ALLOWED FALLBACK TO CPU', uop, dtype)
+              values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
+            else:
+              print('<!> EXIT OPERATION NOT SUPPORTED', uop, dtype, src_values)
         assert i in values, (uop, dtype, srcs, arg)
         i += 1
     return time.perf_counter() - st
