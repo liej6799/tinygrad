@@ -212,6 +212,13 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65)], torch.nn.functional.silu, Tensor.silu, rtol=1e-3, atol=5e-3)
     helper_test_op([()], torch.nn.functional.silu, Tensor.silu)
 
+  def test_relu(self):
+    helper_test_op([(64,64)], lambda x: x.relu())
+    helper_test_op([()], lambda x: x.relu())
+  def test_relu_exact(self):
+    helper_test_op(None, lambda x: x.relu(), vals=[[-1.,0,1]])
+  def test_relu_maximum_exact(self):
+    helper_test_op(None, lambda x: torch.maximum(x, torch.zeros_like(x, requires_grad=False)), lambda x: Tensor.maximum(x, 0), vals=[[-1.,0,1]])
 if __name__ == '__main__':
   np.random.seed(1337)
   unittest.main(verbosity=2)
