@@ -411,13 +411,13 @@ class RockchipProgram:
 
               self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
                   self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
-                           rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+                            rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
               self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
                 self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
-                         rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+                          rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
               self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
                 self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
-                         rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+                          rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
 
               self.submit()
               self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
@@ -439,14 +439,9 @@ class RockchipProgram:
               print('dst', list(dst))
               try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
               except: pass
-
               values[i] = list(dst)
             finally:
-              self.device._gpu_free(self.task_buf)
-              self.device._gpu_free(self.cmd_buf)
-              self.device._gpu_free(self.input_buf)
-              self.device._gpu_free(self.weight_buf)
-              self.device._gpu_free(self.output_buf)
+              self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
             values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
         assert i in values, (uop, dtype, srcs, arg)
@@ -531,5 +526,7 @@ class RockchipDevice(Compiled):
     FileIOInterface.munmap(buf.va_addr, buf.size)
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(
       handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr))
+  def _gpu_free_multiple(self, buf_list) -> None:
+    for buf in buf_list: self._gpu_free(buf)
   def reset_npu(self):
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=rk.RKNPU_ACT_RESET, value=0))
