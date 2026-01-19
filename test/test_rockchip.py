@@ -219,6 +219,33 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, lambda x: x.relu(), vals=[[-1.,0,1]])
   def test_relu_maximum_exact(self):
     helper_test_op(None, lambda x: torch.maximum(x, torch.zeros_like(x, requires_grad=False)), lambda x: Tensor.maximum(x, 0), vals=[[-1.,0,1]])
+  def test_relu6(self):
+    helper_test_op([(45,65)], torch.nn.functional.relu6, Tensor.relu6, high=100)
+    helper_test_op([()], torch.nn.functional.relu6, Tensor.relu6)
+
+  # failed special case math.inf
+  def _test_cmp(self, fxn, reverse=True):
+    # test different dtypes
+    helper_test_op(None, fxn, fxn, forward_only=True, vals=[[0.,1,2], [2.,1,0]])
+    helper_test_op(None, fxn, fxn, forward_only=True, vals=[[0,1,2], [2,1,0]])
+    helper_test_op(None, fxn, fxn, forward_only=True, vals=[[True, True, False], [False,True,False]])
+    # test broadcasting
+    for shps in [[(3, 4, 5), (3, 4, 5)], [(3, 4, 5), (5,)], [(5,), (3, 4, 5)]]:
+      helper_test_op(shps, fxn, fxn, forward_only=True)
+    # test cmp with const
+    helper_test_op(None, lambda x,y: fxn(x,2), lambda x,y: fxn(x,2), forward_only=True, vals=[[0.,1,2], [2.,1,0]])
+    if reverse: helper_test_op(None, lambda x,y: fxn(2,y), lambda x,y: fxn(2,y), forward_only=True, vals=[[0.,1,2], [2.,1,0]])
+    # test special floats  # TODO: fix nan
+    # specials = [0.0, 1.0, -1.0, math.inf, -math.inf]#, math.nan]
+    # for s0 in specials:
+    #   for s1 in specials:
+    #     helper_test_op(None, fxn, fxn, forward_only=True, vals=[[s0], [s1]])
+  # def test_cmp_eq(self): self._test_cmp(lambda x,y: x==y, reverse=False)
+  # def test_cmp_gt(self): self._test_cmp(lambda x,y: x>y)
+  # def test_cmp_ge(self): self._test_cmp(lambda x,y: x>=y)
+  def test_cmp_lt(self): self._test_cmp(lambda x,y: x<y)
+  # def test_cmp_le(self): self._test_cmp(lambda x,y: x<=y)
+
 if __name__ == '__main__':
   np.random.seed(1337)
   unittest.main(verbosity=2)

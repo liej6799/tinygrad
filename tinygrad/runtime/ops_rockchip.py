@@ -21,7 +21,7 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.submit_op = None
-    self.hardware_ops = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.hardware_ops = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.inv_scale = 1.0
     self.lut_size = 513
@@ -93,13 +93,29 @@ class RockchipProgram:
       self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT,
           self.reg(22, rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__SHIFT,
                   rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__MASK))
-
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
         self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
         self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
         self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
       
+    elif arg == "cmplt_diff2bool":
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+        self.reg(4, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
+      # DPU_BS perform ALU first then MUL
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_ALU_CFG,
+        self.reg(0x33800000, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__SHIFT, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
+        self.reg(0x4000, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(4, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELUX_EN__SHIFT, rk.DPU_BN_CFG_BN_RELUX_EN__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(0x7C00, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
+        self.reg(0x3F800000, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__SHIFT, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__MASK))
 
     burst_len = 15
     output_mode = 2
@@ -149,7 +165,8 @@ class RockchipProgram:
         self.reg(op in [Ops.MUL, Ops.FDIV] or self.lut_enable, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(self.lut_enable == False, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
-        self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
+        self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+        self.reg(arg == "cmplt_diff2bool", rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK) 
       )
     # 0 or 1 both passed test_div, do not emit OUT_CVT_SCALE for other ops
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
@@ -426,8 +443,8 @@ class RockchipProgram:
                 elif arg == "silu":
                   dst = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
               values[i] = list(dst)
-              print('src', list(src))
-              print('src2', list(src2))
+              print('src', src_values[0])
+              print('src2', src_values[1])
               print('dst', values[i])
               try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
               except: pass
@@ -450,6 +467,10 @@ class RockchipCompiler(Compiler):
 class RockchipRenderer(Renderer):
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]} | {Ops.FDIV: 0}
   compiler = RockchipCompiler()
+  pre_matcher = PatternMatcher([
+    (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
+     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
+  ])
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MUL, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.ADD, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
@@ -463,8 +484,8 @@ class RockchipRenderer(Renderer):
     (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
       UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
      lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
-    (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
-     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
+    (UPat(Ops.CMPLT, name="x"),
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),), arg="cmplt_diff2bool")),
   ])
 
   def __init__(self, target:Target):
