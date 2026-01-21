@@ -456,7 +456,7 @@ class RockchipProgram:
               # fp16 2B, self.output_buf.size//2
               result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
               if self.lut_enable:
-                raw = np.rint(np.array(dst, dtype=np.float32))
+                raw = np.rint(np.array(result, dtype=np.float32))
                 # q14 decode
                 if uop is Ops.EXP2:
                   result = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
