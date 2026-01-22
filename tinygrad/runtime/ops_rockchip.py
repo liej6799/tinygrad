@@ -21,12 +21,12 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.submit_op = None
-    self.hardware_ops = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.hardware_ops = {Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.inv_scale = 1.0
     self.lut_size = 513
   def check_lut_enable(self, op, arg):
-    return bool({op, arg} & {Ops.EXP2, "silu"})
+    return op in (Ops.EXP2, Ops.TRUNC) or (op is Ops.CUSTOM and arg == "silu")
   def reg(self, val, shift, mask):
     return ((val) << shift) & mask
   def emit_raw(self, target, reg, value):
@@ -50,6 +50,7 @@ class RockchipProgram:
     if self.lut_enable:
       lut = [0] * self.lut_size * 2
       index_shift = 5
+      index_scale = 0.0
       if op is Ops.EXP2:
         x_min, x_max = -2.0, 2.0
         step = (x_max - x_min) / (len(lut) - 1)
@@ -61,18 +62,23 @@ class RockchipProgram:
           y = math.exp2(x) * self.inv_scale
           q = int(math.floor((y + 1.0) * 2**14 + 0.5))
           lut[i] = np.clip(q, 0, 32767)
-      elif op is Ops.CUSTOM:
-        if arg == "silu":
-          x_min, x_max = 0, 5.8
-          step = (x_max - x_min) / (self.lut_size - 1)
-          index_scale = (1 << index_shift) / step
-          max_val = max(x_min / (1.0 + math.exp(-x_min)), x_max / (1.0 + math.exp(-x_max)))
-          self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
-          for i in range(self.lut_size * 2):
-            x = (i - self.lut_size + (i < self.lut_size)) * step
-            y = x / (1.0 + math.exp(-x)) * self.inv_scale
-            q = int(math.floor(y * (2**15 - 1) + 0.5)) if y >= 0.0 else int(math.ceil(y * (2**15 - 1) - 0.5))
-            lut[i] = np.clip(q, -32768, 32767)
+      elif op is Ops.CUSTOM and arg == "silu":
+        x_min, x_max = 0, 5.8
+        step = (x_max - x_min) / (self.lut_size - 1)
+        index_scale = (1 << index_shift) / step
+        max_val = max(x_min / (1.0 + math.exp(-x_min)), x_max / (1.0 + math.exp(-x_max)))
+        self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
+        for i in range(self.lut_size * 2):
+          x = (i - self.lut_size + (i < self.lut_size)) * step
+          y = x / (1.0 + math.exp(-x)) * self.inv_scale
+          q = int(math.floor(y * (2**15 - 1) + 0.5)) if y >= 0.0 else int(math.ceil(y * (2**15 - 1) - 0.5))
+          lut[i] = np.clip(q, -32768, 32767)
+      elif op is Ops.TRUNC:
+        max_val = 1 << 14
+        for table_id in range(2):
+          base = table_id * self.lut_size
+          for i in range(self.lut_size):
+            lut[base + i] = 0 if (i % 2 == 0) else max_val
       bn_mul_operand = int(np.float16(index_scale).view(np.int16)) if index_scale != 0 else 0x3C00
 
       self.fill_lut(lut)
@@ -80,13 +86,24 @@ class RockchipProgram:
           self.reg(1, rk.DPU_LUT_CFG_LUT_HYBRID_PRIORITY__SHIFT, rk.DPU_LUT_CFG_LUT_HYBRID_PRIORITY__MASK) |
           self.reg(1, rk.DPU_LUT_CFG_LUT_OFLOW_PRIORITY__SHIFT, rk.DPU_LUT_CFG_LUT_OFLOW_PRIORITY__MASK) |
           self.reg(2, rk.DPU_LUT_CFG_LUT_LO_LE_MUX__SHIFT, rk.DPU_LUT_CFG_LUT_LO_LE_MUX__MASK))
+      index_select = 14 if op is Ops.TRUNC else 5
       self.emit_raw(rk.DPU, rk.REG_DPU_LUT_INFO,
-          self.reg(5, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__MASK) |
-          self.reg(5, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_START,
-          self.reg(0xffffc000, rk.DPU_LUT_LE_START_LUT_LE_START__SHIFT, rk.DPU_LUT_LE_START_LUT_LE_START__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_END,
-          self.reg(0x00004000, rk.DPU_LUT_LO_END_LUT_LO_END__SHIFT, rk.DPU_LUT_LO_END_LUT_LO_END__MASK))
+          self.reg(index_select, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__MASK) |
+          self.reg(index_select, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__MASK))
+      if op is Ops.TRUNC:
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_START,
+            self.reg(0x00000000, rk.DPU_LUT_LE_START_LUT_LE_START__SHIFT, rk.DPU_LUT_LE_START_LUT_LE_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_END,
+            self.reg(0x44000000, rk.DPU_LUT_LE_END_LUT_LE_END__SHIFT, rk.DPU_LUT_LE_END_LUT_LE_END__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_START,
+            self.reg(0x44000000, rk.DPU_LUT_LO_START_LUT_LO_START__SHIFT, rk.DPU_LUT_LO_START_LUT_LO_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_END,
+            self.reg(0x44800000, rk.DPU_LUT_LO_END_LUT_LO_END__SHIFT, rk.DPU_LUT_LO_END_LUT_LO_END__MASK))
+      else:
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_START,
+            self.reg(0xffffc000, rk.DPU_LUT_LE_START_LUT_LE_START__SHIFT, rk.DPU_LUT_LE_START_LUT_LE_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_END,
+            self.reg(0x00004000, rk.DPU_LUT_LO_END_LUT_LO_END__SHIFT, rk.DPU_LUT_LO_END_LUT_LO_END__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE,
           self.reg(23107, rk.DPU_LUT_LE_SLOPE_SCALE_LUT_LE_SLOPE_UFLOW_SCALE__SHIFT,
                   rk.DPU_LUT_LE_SLOPE_SCALE_LUT_LE_SLOPE_UFLOW_SCALE__MASK))
@@ -472,7 +489,7 @@ class RockchipProgram:
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
-            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC)
+            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR)
             if allow_fallback:
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
@@ -495,12 +512,26 @@ class RockchipRenderer(Renderer):
      lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
   ])
   extra_matcher = PatternMatcher([
-    (UPat(Ops.MUL, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MUL, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
-    (UPat(Ops.ADD, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.ADD, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
-    (UPat(Ops.MAX, dtypes.int, name="x"), lambda x: x.src[0].cast(dtypes.short).alu(Ops.MAX, x.src[1].cast(dtypes.short)).cast(dtypes.int)),
-    (UPat(Ops.MAX, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half)).cast(dtypes.float)),
-    (UPat(Ops.NEG, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG).cast(dtypes.float)),
-    (UPat(Ops.EXP2, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+    (UPat(Ops.MUL, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.ADD, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.NEG, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
+    (UPat(Ops.EXP2, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+    (UPat(Ops.TRUNC, dtypes.floats, name="x"),
+     lambda x: None if x.tag == "rk_trunc" else
+        x.src[0].cast(dtypes.half)
+          .alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875))
+          .alu(Ops.TRUNC)
+          .cast(x.dtype)
+          .rtag("rk_trunc")
+    ),
     (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
       UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
      lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),

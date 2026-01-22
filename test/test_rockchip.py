@@ -269,7 +269,12 @@ class TestOps(unittest.TestCase):
       [(5, 5)],
       lambda x: torch.where(x > 0.5, 4, 2).type(torch.int32).permute((1, 0)),
       lambda x: (x > 0.5).where(4, 2).permute((1, 0)), forward_only=True)
-
+  def test_trunc(self):
+    # helper_test_op([()], lambda x: x.trunc(), forward_only=True)
+    # helper_test_op([(45,35)], lambda x: x.trunc(), forward_only=True)
+    helper_test_op(None, lambda x: x.half().trunc(), lambda x: x.cast(dtypes.float16).trunc(),
+                   vals=[[1.499, 1.5, 1.501, 1.0, 2.1, 0.0, -5.0, -2.499, -2.5, -2.501, 65504.0, -65504.0]],
+                   forward_only=True)
 
 if __name__ == '__main__':
   np.random.seed(1337)
