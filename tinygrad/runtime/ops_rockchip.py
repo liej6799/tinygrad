@@ -512,9 +512,10 @@ class RockchipRenderer(Renderer):
     xh = x.src[0].cast(dtypes.half)
     zero = UOp.const(dtypes.half, 0)
     neg = xh.alu(Ops.CMPLT, zero)
-    absx = UOp(Ops.WHERE, dtypes.half, src=(neg, xh.alu(Ops.NEG), xh))
-    mag = absx.alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875)).alu(Ops.TRUNC).rtag("rk_trunc")
-    signed = UOp(Ops.WHERE, dtypes.half, src=(neg, mag.alu(Ops.NEG), mag))
+    shifted = xh.alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875))
+    absx = UOp(Ops.WHERE, dtypes.half, src=(shifted.alu(Ops.CMPLT, zero), shifted.alu(Ops.NEG), shifted))
+    mag = absx.alu(Ops.TRUNC).rtag("rk_trunc")
+    signed = UOp(Ops.WHERE, dtypes.half, src=(neg, mag.alu(Ops.NEG).alu(Ops.ADD, UOp.const(dtypes.half, 1)), mag))
     return signed.cast(x.dtype)
   pre_matcher = PatternMatcher([
     (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
