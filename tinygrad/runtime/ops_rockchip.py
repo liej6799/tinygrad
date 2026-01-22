@@ -274,6 +274,7 @@ class RockchipProgram:
       while i < len(self.uops):
         uop, dtype, srcs, arg = self.uops[i]
         src_values = [values[v] for v in srcs if self.uops[v][0] not in void_ops]
+        print()
         print(i, uop, arg, src_values)
         src_dtypes = [self.uops[v][1] for v in srcs if self.uops[v][0] not in void_ops]
         if getenv("TRACE"): print(i, uop, dtype, arg, src_values, src_dtypes)
@@ -507,17 +508,27 @@ class RockchipRenderer(Renderer):
       UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
      lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
     (UPat(Ops.CMPLT, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),), arg="cmplt_diff2bool")),
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+                   arg="cmplt_diff2bool").cast(dtypes.bool)),
     (UPat(Ops.CMPEQ, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=
-                   (UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=
-                        (x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),)),))),
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
+       UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(
+         x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+       ),
+     )).cast(dtypes.bool)),
     # CMPNE(x) = 1 - CMPEQ(x)
     (UPat(Ops.CMPNE, name="x"),
       lambda x: UOp.const(dtypes.float16, 1).alu(
         Ops.SUB,
         x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
       ).cast(dtypes.bool)),
+    # ax + b(1-x) 
+    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
+     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
+       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.ints), UPat.var("b", dtypes.ints))),
+     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
+       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
 
   def __init__(self, target:Target):

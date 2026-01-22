@@ -252,6 +252,24 @@ class TestOps(unittest.TestCase):
   def test_cmp_ne(self):
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], [True, True, False]], forward_only=True)
 
+  def test_where(self):
+    helper_test_op(
+      [(100,)],
+      lambda x: torch.where(x > 0.5, 4, 2).type(torch.int32),
+      lambda x: (x > 0.5).where(4, 2), forward_only=True)
+
+    for shps in [[(8,),(1,),(1,)], [(10,10),(10,),(10,)], [(100,)]*3, [(10,10)]*3]:
+      helper_test_op(
+        shps,
+        lambda x, a, b: torch.where(x > 0.5, a, b),
+        lambda x, a, b: (x > 0.5).where(a, b), forward_only=True)
+
+  def test_where_permute(self):
+    helper_test_op(
+      [(5, 5)],
+      lambda x: torch.where(x > 0.5, 4, 2).type(torch.int32).permute((1, 0)),
+      lambda x: (x > 0.5).where(4, 2).permute((1, 0)), forward_only=True)
+
 
 if __name__ == '__main__':
   np.random.seed(1337)
