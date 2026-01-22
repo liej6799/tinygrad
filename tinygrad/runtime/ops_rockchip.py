@@ -507,6 +507,15 @@ class RockchipRenderer(Renderer):
   has_threads = False
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL, Ops.CMPNE]} | {Ops.FDIV: 0}
   compiler = RockchipCompiler()
+  def _rk_trunc_fix(x):
+    if x.tag == "rk_trunc": return None
+    xh = x.src[0].cast(dtypes.half)
+    zero = UOp.const(dtypes.half, 0)
+    neg = xh.alu(Ops.CMPLT, zero)
+    absx = UOp(Ops.WHERE, dtypes.half, src=(neg, xh.alu(Ops.NEG), xh))
+    mag = absx.alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875)).alu(Ops.TRUNC).rtag("rk_trunc")
+    signed = UOp(Ops.WHERE, dtypes.half, src=(neg, mag.alu(Ops.NEG), mag))
+    return signed.cast(x.dtype)
   pre_matcher = PatternMatcher([
     (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
      lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
@@ -525,13 +534,7 @@ class RockchipRenderer(Renderer):
     (UPat(Ops.EXP2, dtypes.float, name="x"),
      lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
     (UPat(Ops.TRUNC, dtypes.floats, name="x"),
-     lambda x: None if x.tag == "rk_trunc" else
-        x.src[0].cast(dtypes.half)
-          .alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875))
-          .alu(Ops.TRUNC)
-          .cast(x.dtype)
-          .rtag("rk_trunc")
-    ),
+     _rk_trunc_fix),
     (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
       UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
      lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
