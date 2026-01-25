@@ -157,3 +157,9 @@ intel = [TensorCore(dims=(8,8,16), threads=8, elements_per_thread=(16,16,8), dty
                     opts=("l0","l0","l0","u1","u1","u1"),
                     swizzle=((('r1', 'r2', 'r3'), ('u0', 'u1', 'u2'), ('l0', 'l1', 'l2', 'r0')),
                              (('l0', 'l1', 'l2'), ('r1', 'r2', 'r3'), ('u0', 'u1', 'u2', 'r0'))))]
+
+# ***** Rockchip *****
+
+rockchip = [TensorCore(dims=(2,2,1), threads=1, elements_per_thread=(2,4,4), dtype_in=dtypes.half, dtype_out=dtypes.float,
+                       opts=("u0","u1"),
+                       swizzle=(((), ('u0', 'u1'), ()), ((), ('u0', 'u0'), ())))]

@@ -365,6 +365,14 @@ class RockchipProgram:
           dims, dtype_in, device, threads = arg[1], first_src_dtype.scalar(), arg[4], arg[5]
           wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
           # TODO: refactor these to a shared TensorCoreLayout
+          if device == "ROCKCHIP":
+            if threads == 1 and dims == (2,2,1):
+              def a_elem(x, _k, row, goff): return x[row][goff]
+              def b_elem(x, col, _k, goff): return x[col][goff]
+              def c_map(_lane, elem): return (elem%2, elem//2)
+              values[i] = wmma_helper(1, 1, 2, 4, 4, a_elem, b_elem, c_map)
+              i += 1
+              continue
           if device == "METAL":
             # A (2 elements on 32 threads): row major
             def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
@@ -489,7 +497,7 @@ class RockchipProgram:
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
-            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR)
+            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR)
             if allow_fallback:
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
@@ -505,6 +513,7 @@ class RockchipCompiler(Compiler):
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
   has_threads = False
+  tensor_cores = tc.rockchip
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL, Ops.CMPNE]} | {Ops.FDIV: 0}
   compiler = RockchipCompiler()
   def _rk_trunc_fix(x):
@@ -528,6 +537,8 @@ class RockchipRenderer(Renderer):
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.MAX, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.ADD, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
     (UPat(Ops.MAX, dtypes.float, name="x"),
      lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
     (UPat(Ops.NEG, dtypes.float, name="x"),

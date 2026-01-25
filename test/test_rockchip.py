@@ -276,6 +276,17 @@ class TestOps(unittest.TestCase):
                    vals=[[1.499, 1.5, 1.501, 1.0, 2.1, 0.0, -5.0, -2.499, -2.5, -2.501]],
                    forward_only=True)
 
+  # # slow test
+  # def test_max_pool2d(self):
+  #   for ksz in [(3,3)]:
+  #     with self.subTest(kernel_size=ksz):
+  #       helper_test_op([(1,1,10,10)],
+  #         lambda x: torch.nn.functional.max_pool2d(x, kernel_size=ksz),
+  #         lambda x: Tensor.max_pool2d(x, kernel_size=ksz))
+
+  def test_gemm_fp16(self):
+    helper_test_op([(2,2), (2,2)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
+
 if __name__ == '__main__':
   np.random.seed(1337)
   unittest.main(verbosity=2)
