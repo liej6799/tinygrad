@@ -609,7 +609,12 @@ class RockchipProgram:
             self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
             self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
             self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
-            output_nbytes = src.nbytes if uop is not Ops.WMMA else len(src_values[2]) * dtypes.float32.itemsize
+            if uop is Ops.WMMA:
+              wmma_rows = max(1, len(src_values[0]))
+              wmma_cols = max(1, len(src_values[2]) // wmma_rows)
+              output_nbytes = max(0x100, (wmma_rows-1)*0x80 + wmma_cols*dtypes.float32.itemsize)
+            else:
+              output_nbytes = src.nbytes
             self.output_buf = self.device._gpu_alloc(output_nbytes, 0, name="output")
             try:
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
@@ -640,7 +645,11 @@ class RockchipProgram:
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
               print(dst.tobytes().hex())
               if uop is Ops.WMMA:
-                result = struct.unpack(f'<{self.output_buf.size//4}f', dst.tobytes())
+                raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
+                stride_f32 = 0x80 // dtypes.float32.itemsize
+                rows = max(1, len(src_values[0]))
+                cols = max(1, len(src_values[2]) // rows)
+                result = [float(raw[r*stride_f32 + c]) for r in range(rows) for c in range(cols)]
               else:
                 result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
               if self.lut_enable:
