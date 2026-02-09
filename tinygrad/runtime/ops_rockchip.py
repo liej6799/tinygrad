@@ -21,7 +21,7 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.submit_op = None
-    self.hardware_ops = {Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.hardware_ops = {Ops.WMMA:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.inv_scale = 1.0
     self.lut_size = 513
@@ -257,6 +257,8 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
+    if uop is Ops.WMMA:
+      breakpoint()
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
     print(res)
@@ -359,20 +361,21 @@ class RockchipProgram:
           else:
             values[i] = load(src_values, 0, dtype)
         elif uop is Ops.GEP: values[i] = src_values[0][get_single_element(arg)]
-        elif uop is Ops.WMMA:
+        # elif uop is Ops.WMMA:
+        elif uop is Ops.WMMA and False:
           first_src_dtype = self.uops[srcs[0]][1]
           assert isinstance(first_src_dtype, DType) # mypy
           dims, dtype_in, device, threads = arg[1], first_src_dtype.scalar(), arg[4], arg[5]
           wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
           # TODO: refactor these to a shared TensorCoreLayout
-          if device == "ROCKCHIP":
-            if threads == 1 and dims == (2,2,1):
-              def a_elem(x, _k, row, goff): return x[row][goff]
-              def b_elem(x, col, _k, goff): return x[col][goff]
-              def c_map(_lane, elem): return (elem%2, elem//2)
-              values[i] = wmma_helper(1, 1, 2, 4, 4, a_elem, b_elem, c_map)
-              i += 1
-              continue
+          # if device == "ROCKCHIP":
+          #   if threads == 1 and dims == (2,2,1):
+          #     def a_elem(x, _k, row, goff): return x[row][goff]
+          #     def b_elem(x, col, _k, goff): return x[col][goff]
+          #     def c_map(_lane, elem): return (elem%2, elem//2)
+          #     values[i] = wmma_helper(1, 1, 2, 4, 4, a_elem, b_elem, c_map)
+          #     i += 1
+          #     continue
           if device == "METAL":
             # A (2 elements on 32 threads): row major
             def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
@@ -436,9 +439,9 @@ class RockchipProgram:
             def c_map(lane, elem): return (elem%16, elem//16)
             values[i] = wmma_helper(1, 1, 16, 16, 256, elem, elem, c_map)
           else: raise NotImplementedError(f"unimplemented tensor core {arg}")
-        elif uop is Ops.CUSTOM or uop in GroupOp.ALU:
-          assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
-          assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
+        elif uop in [Ops.CUSTOM, Ops.WMMA] or uop in GroupOp.ALU:
+          if uop is not Ops.WMMA: assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
+          assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE, Ops.WMMA}, f"dtype mismatch on {uop}"
           if uop in self.hardware_ops and dtype.scalar() == dtypes.half:
             self.q = []
             self.lut_enable = self.check_lut_enable(uop, arg)
@@ -531,6 +534,9 @@ class RockchipRenderer(Renderer):
      lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
   ])
   extra_matcher = PatternMatcher([
+    (UPat(Ops.WMMA, dtype=dtypes.float.vec(4), name="x"),
+     lambda x: UOp(Ops.WMMA, dtypes.half.vec(4), x.src,
+                   (x.arg[0], x.arg[1], x.arg[2], dtypes.half, *x.arg[4:])).cast(dtypes.float.vec(4))),
     (UPat(Ops.MUL, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.int, name="x"),
