@@ -1,4 +1,4 @@
-import os, time, unittest, warnings
+import os, time, math, unittest, functools, platform, warnings
 import numpy as np
 import torch
 
@@ -7,6 +7,9 @@ if os.getenv("ROCKCHIP") == "1" and "DEV" not in os.environ: os.environ["DEV"] =
 from tinygrad.helpers import getenv, DEBUG, CI
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
+from tinygrad.device import is_dtype_supported
+from tinygrad.uop.ops import Ops
+from tinygrad.engine.realize import get_runner, CompiledRunner
 
 if getenv("TINY_BACKEND"):
   import tinygrad.nn.torch # noqa: F401 # pylint: disable=unused-import
@@ -90,6 +93,33 @@ def prepare_test_op(low, high, shps, vals, forward_only=False):
   return ts, tst
 
 class TestOps(unittest.TestCase):
+  @staticmethod
+  def _matmul_data(ash, bsh):
+    np.random.seed(0)
+    return np.random.uniform(-2, 2, size=ash).astype(np.float32), np.random.uniform(-2, 2, size=bsh).astype(np.float32)
+
+  def _matmul_runner(self, out:Tensor) -> CompiledRunner:
+    sink_asts = [ei.ast for ei in out.schedule() if ei.ast.op is Ops.SINK]
+    self.assertTrue(sink_asts)
+    runner = get_runner(Device.DEFAULT, sink_asts[-1])
+    self.assertIsInstance(runner, CompiledRunner)
+    return runner
+
+  def _run_fused_case(self, ash, bsh):
+    a_np, b_np = self._matmul_data(ash, bsh)
+    expected = torch.tensor(a_np).half().matmul(torch.tensor(b_np).half()).cpu().numpy()
+    probe = Tensor(a_np).half().matmul(Tensor(b_np).half())
+    runner = self._matmul_runner(probe)
+    prg = runner._prg
+    self.assertIsNotNone(getattr(prg, "fused_matmul_meta", None))
+    hits_before = prg.fused_matmul_hits
+    fallbacks_before = prg.fused_matmul_fallbacks
+    out = Tensor(a_np).half().matmul(Tensor(b_np).half())
+    got = out.realize().numpy()
+    np.testing.assert_allclose(got, expected, atol=5e-3, rtol=5e-3)
+    used = prg.fused_matmul_hits == hits_before + 1
+    fallback = prg.fused_matmul_fallbacks > fallbacks_before
+    self.assertTrue(used or fallback)
 
   def helper_test_exception(self, shps, torch_fxn, tinygrad_fxn=None, expected=None, forward_only=False, exact=False, vals=None, low=-1.5, high=1.5):
     if getenv("MOCKGPU") and Device.DEFAULT == "NV": self.skipTest('helper_test_exception fails in CI CUDA')
@@ -285,7 +315,15 @@ class TestOps(unittest.TestCase):
   #         lambda x: Tensor.max_pool2d(x, kernel_size=ksz))
 
   def test_gemm_fp16(self):
-    helper_test_op([(2,2), (2,2)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
+    i = 64
+    helper_test_op([(i,i), (i,i)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
+    # helper_test_op([(2,2), (2,2)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
+    # shapes = [((4,4), (4,4)), ((33,33), (33,33)), ((34,34), (34,34)), ((65,33), (33,65)), ((394,394), (394,394)),
+    #           ((1,8192), (8192,8192)), ((1,8192), (8192,8193)), ((1,8193), (8193,8192)), ((1,8193), (8193,8193)),
+    #           ((1,768), (768,2048)), ((1,2048), (2048,2048)), ((1,4096), (4096,4096))]
+
+
+
 
 if __name__ == '__main__':
   np.random.seed(1337)

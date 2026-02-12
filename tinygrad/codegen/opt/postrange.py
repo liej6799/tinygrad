@@ -1,5 +1,4 @@
-from __future__ import annotations
-import math, itertools
+import math, itertools, os
 from collections import defaultdict
 from typing import cast, Final
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, GroupOp, remove_all_tags
@@ -17,6 +16,7 @@ class Scheduler:
     self.ast, self.ren = ast, ren
     self.dont_use_locals = self.ast.arg.dont_use_locals if self.ast.arg is not None else False
     self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
+    self._name_override: str|None = None
     self.opt_range = count(start=max([x.arg[0] for x in self.rngs], default=0)+1)
 
   @property
@@ -44,11 +44,13 @@ class Scheduler:
     ret = Scheduler(self.ast, self.ren)
     ret.dont_use_locals = self.dont_use_locals
     ret.applied_opts = self.applied_opts[:]
+    ret._name_override = self._name_override
     if hasattr(self, 'tensor_core'): ret.tensor_core = self.tensor_core
     return ret
 
   kernel_cnt: Final[defaultdict[str, int]] = defaultdict(int)
   def get_optimized_ast(self, name_override:str|None=None) -> UOp:
+    if name_override is None: name_override = self._name_override
     if name_override is not None: name = name_override
     else:
       k_type = "r" if self.reduceop is not None else "E"
@@ -311,6 +313,139 @@ class Scheduler:
           return axes
     return None
 
+  def _match_rockchip_gemm(self) -> tuple[bool, str|None]:
+    if self.ren.device != "ROCKCHIP" or len(self.reduceops) != 1: return False, None
+    reduceop = self.reduceops[0]
+    root = reduceop.src[0] if reduceop.src[0].op is not Ops.CAST else reduceop.src[0].src[0]
+    if reduceop.arg is not Ops.ADD or root.op is not Ops.MUL: return False, None
+    if os.getenv("ROCKCHIP_FUSED_MATMUL", "1") == "0": return False, "disabled"
+
+    def parse_idx(idx:UOp) -> dict[UOp, int]|None:
+      coeff: dict[UOp, int] = {}
+      const = 0
+      for term in idx.split_uop(Ops.ADD):
+        if term.op is Ops.CONST:
+          const += int(term.arg)
+          continue
+        if term.op is Ops.RANGE:
+          coeff[term] = coeff.get(term, 0) + 1
+          continue
+        if term.op is Ops.MUL:
+          if term.src[0].op is Ops.RANGE and term.src[1].op is Ops.CONST:
+            coeff[term.src[0]] = coeff.get(term.src[0], 0) + int(term.src[1].arg)
+            continue
+          if term.src[1].op is Ops.RANGE and term.src[0].op is Ops.CONST:
+            coeff[term.src[1]] = coeff.get(term.src[1], 0) + int(term.src[0].arg)
+            continue
+        return None
+      return coeff if const == 0 else None
+
+    def batch_stride(coeff:dict[UOp, int], batch_axes:list[UOp], block:int) -> int|None:
+      if not batch_axes: return 0
+      stride = block
+      for ax in reversed(batch_axes):
+        if coeff.get(ax, None) != stride: return None
+        stride *= int(ax.vmax + 1)
+      return block
+
+    def fail(reason:str) -> tuple[bool, str]:
+      if os.getenv("ROCKCHIP_FUSED_MATMUL_DEBUG", "0") != "0": print(f"FUSED_MATMUL_FALLBACK:{reason}")
+      return False, reason
+
+    stores = [x for x in self.ast.toposort() if x.op is Ops.STORE]
+    if len(stores) != 1: return fail("store_count")
+
+    lhs, rhs = root.src
+    while lhs.op is Ops.CAST: lhs = lhs.src[0]
+    while rhs.op is Ops.CAST: rhs = rhs.src[0]
+    if lhs.op is not Ops.INDEX or rhs.op is not Ops.INDEX: return fail("mul_inputs_not_index")
+    if len(lhs.src) != 2 or len(rhs.src) != 2: return fail("indexed_gate_unsupported")
+
+    out_idx = stores[0].src[0]
+    if out_idx.op is not Ops.INDEX or len(out_idx.src) != 2: return fail("output_index_form")
+    out_val = stores[0].src[1]
+    while out_val.op is Ops.CAST: out_val = out_val.src[0]
+    if out_val is not reduceop: return fail("store_value_not_reduce")
+
+    if root.src[0].dtype.scalar() != dtypes.half or root.src[1].dtype.scalar() != dtypes.half: return fail("mul_input_not_fp16")
+    if reduceop.dtype.scalar() != dtypes.float: return fail("acc_not_fp32")
+
+    dtype_code = {dtypes.half: 0, dtypes.float: 1}
+    if lhs.src[0].op is not Ops.DEFINE_GLOBAL or rhs.src[0].op is not Ops.DEFINE_GLOBAL: return fail("input_buffer_kind")
+    if out_idx.src[0].op is not Ops.DEFINE_GLOBAL: return fail("output_buffer_kind")
+    a_dt = cast(int|None, dtype_code.get(lhs.src[0].dtype.base.scalar()))
+    b_dt = cast(int|None, dtype_code.get(rhs.src[0].dtype.base.scalar()))
+    c_dt = cast(int|None, dtype_code.get(out_idx.src[0].dtype.base.scalar()))
+    if a_dt is None or b_dt is None or c_dt is None: return fail("buffer_dtype_unsupported")
+
+    k_axes = list(reduceop.src[1:])
+    if len(k_axes) != 1: return fail("k_axes")
+    k_axis = k_axes[0]
+    shared = set(lhs.ranges) & set(rhs.ranges)
+    batch_axes = sorted([r for r in shared if r is not k_axis], key=lambda x: x.arg[0])
+    lhs_only = [r for r in lhs.ranges if r not in shared and r is not k_axis]
+    rhs_only = [r for r in rhs.ranges if r not in shared and r is not k_axis]
+    if len(lhs_only) > 1 or len(rhs_only) > 1: return fail("mn_axes")
+    m_axis, n_axis = (lhs_only[0] if lhs_only else None), (rhs_only[0] if rhs_only else None)
+
+    m, n, k = (int(m_axis.vmax + 1) if m_axis is not None else 1), (int(n_axis.vmax + 1) if n_axis is not None else 1), int(k_axis.vmax + 1)
+    if m <= 0 or n <= 0 or k <= 0: return fail("shape_non_positive")
+    batch = prod([int(x.vmax + 1) for x in batch_axes]) if batch_axes else 1
+
+    lhs_expected = set(batch_axes) | {k_axis} | ({m_axis} if m_axis is not None else set())
+    rhs_expected = set(batch_axes) | {k_axis} | ({n_axis} if n_axis is not None else set())
+    out_expected = set(batch_axes) | ({m_axis} if m_axis is not None else set()) | ({n_axis} if n_axis is not None else set())
+    if set(lhs.ranges) != lhs_expected or set(rhs.ranges) != rhs_expected or set(out_idx.ranges) != out_expected:
+      return fail("axis_mismatch")
+
+    a_coeff = parse_idx(lhs.src[1].get_idx())
+    b_coeff = parse_idx(rhs.src[1].get_idx())
+    c_coeff = parse_idx(out_idx.src[1].get_idx())
+    if a_coeff is None or b_coeff is None or c_coeff is None: return fail("index_not_affine")
+    if set(a_coeff) != lhs_expected or set(b_coeff) != rhs_expected or set(c_coeff) != out_expected:
+      return fail("index_axes_mismatch")
+
+    a_k_stride = a_coeff[k_axis]
+    if m_axis is None:
+      if a_k_stride != 1: return fail("lhs_k_stride")
+      a_m_stride, ta = k, 0
+    else:
+      a_m_stride = a_coeff[m_axis]
+      if a_k_stride == 1 and a_m_stride == k: ta = 0
+      elif a_m_stride == 1 and a_k_stride == m: ta = 1
+      else: return fail("lhs_layout")
+
+    b_k_stride = b_coeff[k_axis]
+    if n_axis is None:
+      if b_k_stride != 1: return fail("rhs_k_stride")
+      b_n_stride, tb = 1, 0
+    else:
+      b_n_stride = b_coeff[n_axis]
+      if b_n_stride == 1 and b_k_stride == n: tb = 0
+      elif b_k_stride == 1 and b_n_stride == k: tb = 1
+      else: return fail("rhs_layout")
+
+    c_n_stride = c_coeff.get(n_axis, 1) if n_axis is not None else 1
+    if c_n_stride != 1: return fail("out_n_stride")
+    c_m_stride = c_coeff.get(m_axis, n if n_axis is not None else 1) if m_axis is not None else (n if n_axis is not None else 1)
+    if m_axis is not None and c_m_stride != (n if n_axis is not None else 1): return fail("out_m_stride")
+
+    a_bs = batch_stride(a_coeff, batch_axes, m*k)
+    b_bs = batch_stride(b_coeff, batch_axes, k*n)
+    c_bs = batch_stride(c_coeff, batch_axes, m*n)
+    if a_bs is None or b_bs is None or c_bs is None: return fail("batch_layout")
+
+    if lhs.src[0].dtype.size < (batch-1)*a_bs + m*k: return fail("lhs_buffer_size")
+    if rhs.src[0].dtype.size < (batch-1)*b_bs + k*n: return fail("rhs_buffer_size")
+    if out_idx.src[0].dtype.size < (batch-1)*c_bs + m*n: return fail("out_buffer_size")
+
+    fields = [m, n, k, batch, a_bs, b_bs, c_bs, a_m_stride, a_k_stride, b_k_stride, b_n_stride, c_m_stride, c_n_stride,
+              int(lhs.src[0].arg), int(rhs.src[0].arg), int(out_idx.src[0].arg), ta, tb, a_dt, b_dt, c_dt]
+    self._name_override = "rkmm_v1_" + "_".join(str(x) for x in fields)
+    if os.getenv("ROCKCHIP_FUSED_MATMUL_DEBUG", "0") != "0":
+      print(f"FUSED_MATMUL_MATCH:m={m},n={n},k={k},batch={batch},slots={fields[13:16]}")
+    return True, None
+
   # helpers for hand_coded_optimizations
   @property
   def reduceops(self) -> list[UOp]: return [x for x in self.ast.backward_slice if x.op is Ops.REDUCE]
@@ -349,4 +484,25 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
     if not any(u.op is Ops.BUFFERIZE for u in ast.backward_slice):
       k = hand_coded_optimizations(k)
-  return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
+  name_override = ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None
+  if k._name_override is not None: name_override = k._name_override
+  return k.get_optimized_ast(name_override=name_override)
+
+def make_images(ast:UOp, ren:Renderer) -> UOp:
+  if IMAGE == 1 and ren.device in {"QCOM", "CL"}:
+    dg_types: dict = {}
+    def make_image(ctx, dg):
+      if (dt:=dg.dtype).base is dtypes.float and not isinstance(dt, ImageDType) and dt.size < 65536 and dt.nbytes() % 64 == 0:
+        ctx[dg.arg] = dt
+        return dg.replace(dtype=dtypes.imagef((1, dt.size // 4, 4), dt.nbytes()))
+
+    ast = graph_rewrite(ast, PatternMatcher([(UPat(Ops.DEFINE_GLOBAL, name="dg"), make_image)]), ctx=dg_types, name="create image buffers")
+
+    def undo_image_store(ctx, st, idx, dg):
+      if dg.arg in ctx and not any(c.op is Ops.RANGE and (c.vmax+1)%4 == 0 for c in idx.src[1].get_idx().split_uop(Ops.ADD)):
+        return st.replace(src=(idx.replace(src=(dg.replace(dtype=ctx[dg.arg]),)+idx.src[1:]),)+st.src[1:])
+
+    ast = graph_rewrite(ast, PatternMatcher([
+      (UPat(Ops.DEFINE_GLOBAL, name="dg").index(UPat(), name="idx").store(UPat(), name="st"), undo_image_store)
+    ]), ctx=dg_types, name="remove unfoldable image stores")
+  return ast

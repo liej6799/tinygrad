@@ -4,9 +4,9 @@
 # this is the (living) definition of uops
 from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, struct, sys, functools, array, ctypes, mmap, os, math, numpy as np
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, Target
-from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
+from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_to_fp16, float_to_bf16, float_to_fp8, fp8_to_float
+from tinygrad.helpers import all_same, getenv, flatten, get_single_element, EMULATE, mv_address, to_mv, DEBUG
+from tinygrad.device import Compiled, Compiler, Allocator, CompilerSet, CompilerPair, BufferSpec
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, bitcast
 from tinygrad.renderer import Renderer
@@ -14,6 +14,10 @@ from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import _load, load, _store, generic_wmma_helper
+
+def _rk_env(name:str, default:int) -> int:
+  try: return int(os.getenv(name, str(default)))
+  except ValueError: return default
 
 class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
@@ -25,6 +29,120 @@ class RockchipProgram:
     self.cmd_buf_size = 16384
     self.inv_scale = 1.0
     self.lut_size = 513
+    self.fused_matmul_meta = self._parse_fused_matmul_name(name)
+    self.fused_matmul_hits = 0
+    self.fused_matmul_fallbacks = 0
+
+  def _parse_fused_matmul_name(self, name:str) -> dict[str, int]|None:
+    if not name.startswith("rkmm_v1_"): return None
+    toks = name.split("_")
+    if len(toks) != 23: return None
+    try:
+      vals = [int(x) for x in toks[2:]]
+    except ValueError:
+      return None
+    keys = ["m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
+            "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt"]
+    if any(v < 0 for v in vals): return None
+    return dict(zip(keys, vals))
+
+  def _dtype_from_code(self, code:int):
+    if code == 0: return np.float16
+    if code == 1: return np.float32
+    raise RuntimeError(f"dtype_code_{code}")
+
+  def _run_wmma_matmul(self, a_matrix:np.ndarray, b_matrix:np.ndarray) -> np.ndarray:
+    m, k = a_matrix.shape
+    if b_matrix.shape[0] != k: raise RuntimeError("k_mismatch")
+    n = int(b_matrix.shape[1])
+    wmma_meta = self._wmma_params(int(m), int(n), int(k))
+    in_pack = np.zeros((wmma_meta["m"], wmma_meta["align_in"]), dtype=np.float16)
+    wt_pack = np.zeros((wmma_meta["align_out"], wmma_meta["align_in"]), dtype=np.float16)
+    in_pack[:, :wmma_meta["k"]] = a_matrix
+    wt_pack[:wmma_meta["n"], :wmma_meta["k"]] = b_matrix.T
+    src = memoryview(bytearray(in_pack.reshape(-1).tobytes()))
+    src2 = memoryview(bytearray(wt_pack.reshape(-1).tobytes()))
+    self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+    self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
+    self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
+    self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
+    out_stride = wmma_meta["align_out"] * dtypes.float32.itemsize
+    out_nbytes = max(0x100, (wmma_meta["m"]-1)*out_stride + wmma_meta["n"]*dtypes.float32.itemsize)
+    self.output_buf = self.device._gpu_alloc(out_nbytes, 0, name="output")
+    try:
+      ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+      ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+      self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.q, self.lut_enable = [], False
+      self.boilerplate(op=Ops.WMMA, size=int(m*k), arg=None,
+        feature_addr=self.input_buf.meta.dma_addr, weight_addr=self.weight_buf.meta.dma_addr, dst_addr=self.output_buf.meta.dma_addr,
+        wmma_meta=wmma_meta)
+      self.submit(Ops.WMMA)
+      self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      dst = memoryview(bytearray(self.output_buf.size))
+      ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+      raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
+      out = np.empty((m, n), dtype=np.float32)
+      stride = wmma_meta["align_out"]
+      for r in range(m): out[r, :] = raw[r*stride:r*stride+n]
+      return out
+    finally:
+      self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
+
+  def _run_fused_matmul(self, bufs:tuple[Any, ...]) -> None:
+    if self.fused_matmul_meta is None: raise RuntimeError("missing_meta")
+    m = self.fused_matmul_meta["m"]
+    n = self.fused_matmul_meta["n"]
+    k = self.fused_matmul_meta["k"]
+    batch = self.fused_matmul_meta["batch"]
+    a_slot, b_slot, c_slot = self.fused_matmul_meta["a_slot"], self.fused_matmul_meta["b_slot"], self.fused_matmul_meta["c_slot"]
+    if max(a_slot, b_slot, c_slot) >= len(bufs): raise RuntimeError("slot_oob")
+    a_arr = np.frombuffer(bufs[a_slot], dtype=self._dtype_from_code(self.fused_matmul_meta["a_dt"]))
+    b_arr = np.frombuffer(bufs[b_slot], dtype=self._dtype_from_code(self.fused_matmul_meta["b_dt"]))
+    c_arr = np.frombuffer(bufs[c_slot], dtype=self._dtype_from_code(self.fused_matmul_meta["c_dt"]))
+    if self.fused_matmul_meta["ta"] == 0 and (self.fused_matmul_meta["a_ms"], self.fused_matmul_meta["a_ks"]) != (k, 1):
+      raise RuntimeError("lhs_layout")
+    if self.fused_matmul_meta["ta"] == 1 and (self.fused_matmul_meta["a_ms"], self.fused_matmul_meta["a_ks"]) != (1, m):
+      raise RuntimeError("lhs_layout")
+    if self.fused_matmul_meta["tb"] == 0 and (self.fused_matmul_meta["b_ks"], self.fused_matmul_meta["b_ns"]) != (n, 1):
+      raise RuntimeError("rhs_layout")
+    if self.fused_matmul_meta["tb"] == 1 and (self.fused_matmul_meta["b_ks"], self.fused_matmul_meta["b_ns"]) != (1, k):
+      raise RuntimeError("rhs_layout")
+    if (self.fused_matmul_meta["c_ms"], self.fused_matmul_meta["c_ns"]) != (n, 1): raise RuntimeError("out_layout")
+    if batch > 1 and self.fused_matmul_meta["a_bs"] != m*k: raise RuntimeError("lhs_batch_stride")
+    if batch > 1 and self.fused_matmul_meta["b_bs"] != k*n: raise RuntimeError("rhs_batch_stride")
+    if batch > 1 and self.fused_matmul_meta["c_bs"] != m*n: raise RuntimeError("out_batch_stride")
+    if len(a_arr) < (batch-1)*self.fused_matmul_meta["a_bs"] + m*k: raise RuntimeError("lhs_buffer_too_small")
+    if len(b_arr) < (batch-1)*self.fused_matmul_meta["b_bs"] + k*n: raise RuntimeError("rhs_buffer_too_small")
+    if len(c_arr) < (batch-1)*self.fused_matmul_meta["c_bs"] + m*n: raise RuntimeError("out_buffer_too_small")
+
+    for bidx in range(batch):
+      a_base = bidx * self.fused_matmul_meta["a_bs"]
+      b_base = bidx * self.fused_matmul_meta["b_bs"]
+      c_base = bidx * self.fused_matmul_meta["c_bs"]
+      a_block = a_arr[a_base:a_base + m*k]
+      b_block = b_arr[b_base:b_base + k*n]
+      if len(a_block) != m*k or len(b_block) != k*n: raise RuntimeError("batch_slice_oob")
+      if self.fused_matmul_meta["ta"] == 0:
+        a_matrix = a_block.reshape(m, k).astype(np.float16, copy=False)
+      else:
+        a_matrix = a_block.reshape(k, m).T.astype(np.float16, copy=False)
+      if self.fused_matmul_meta["tb"] == 0:
+        b_matrix = b_block.reshape(k, n).astype(np.float16, copy=False)
+      else:
+        b_matrix = b_block.reshape(n, k).T.astype(np.float16, copy=False)
+      out_matrix = self._run_wmma_matmul(a_matrix, b_matrix)
+      # Validate one dot-product entry to avoid silently returning bad fused outputs.
+      ref00 = float(np.dot(a_matrix[0, :].astype(np.float32), b_matrix[:, 0].astype(np.float32)))
+      got00 = float(out_matrix[0, 0])
+      tol = max(1e-2, abs(ref00) * 5e-3)
+      if not np.isfinite(got00) or abs(got00 - ref00) > tol: raise RuntimeError("npu_verify_mismatch")
+      c_block = c_arr[c_base:c_base + m*n]
+      if len(c_block) != m*n: raise RuntimeError("out_batch_slice_oob")
+      if self.fused_matmul_meta["c_dt"] == 0: c_block[:] = out_matrix.astype(np.float16).reshape(-1)
+      else: c_block[:] = out_matrix.reshape(-1)
+
   def check_lut_enable(self, op, arg):
     return op in (Ops.EXP2, Ops.TRUNC) or (op is Ops.CUSTOM and arg == "silu")
   def reg(self, val, shift, mask):
@@ -443,19 +561,28 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
-    if uop is Ops.WMMA:
-      os.system("cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_emit ")
+    if uop is Ops.WMMA and DEBUG >= 7:
+      os.system("cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_emit ")
       os.system("cd ~/npu/ops_reg/ && python dump.py 3 > /tmp/tinygrad_input")
       os.system("cd ~/npu/ops_reg/ && python dump.py 4 > /tmp/tinygrad_weight")
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
-    print(res)
-    if uop is Ops.WMMA:
+    if DEBUG >= 7: print(res)
+    if uop is Ops.WMMA and DEBUG >= 7:
       os.system("cd ~/npu/ops_reg/ && python dump.py 5 > /tmp/tinygrad_output")
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
     st = time.perf_counter()
+    if self.fused_matmul_meta is not None:
+      try:
+        self._run_fused_matmul(bufs)
+        self.fused_matmul_hits += 1
+        return time.perf_counter() - st
+      except Exception as e:
+        reason = str(e)
+        self.fused_matmul_fallbacks += 1
+
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
     void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
@@ -483,10 +610,11 @@ class RockchipProgram:
       while i < len(self.uops):
         uop, dtype, srcs, arg = self.uops[i]
         src_values = [values[v] for v in srcs if self.uops[v][0] not in void_ops]
-        print()
-        print(i, uop, arg, src_values)
+        if DEBUG >= 7:
+          print()
+          print(i, uop, arg, src_values)
         src_dtypes = [self.uops[v][1] for v in srcs if self.uops[v][0] not in void_ops]
-        if getenv("TRACE"): print(i, uop, dtype, arg, src_values, src_dtypes)
+        if DEBUG >= 7: print(i, uop, dtype, arg, src_values, src_dtypes)
         if uop is Ops.END:
           i = srcs[1]
           continue
@@ -715,7 +843,7 @@ class RockchipProgram:
 
               dst = memoryview(bytearray(self.output_buf.size))
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-              print(dst.tobytes().hex())
+              if DEBUG >= 7: print(dst.tobytes().hex())
               if uop is Ops.WMMA:
                 raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
                 stride_f32 = wmma_meta["align_out"]
@@ -731,11 +859,12 @@ class RockchipProgram:
                 elif arg == "silu":
                   result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
               values[i] = list(result)
-              print('src', src_values[0])
-              print('src2', src_values[1])
-              print('dst', values[i])
-              try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
-              except: pass
+              if DEBUG >= 7:
+                print('src', src_values[0])
+                print('src2', src_values[1])
+                print('result', values[i])
+                try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
+                except: pass
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
@@ -828,7 +957,8 @@ class RockchipRenderer(Renderer):
 
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
-    lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
+    uop_to_idx = {u:i for i,u in enumerate(uops)}
+    lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
     return base64.b64encode(pickle.dumps(lops)).decode()
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
@@ -860,7 +990,7 @@ class RockchipDevice(Compiled):
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
     result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
-    print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name} {hex(dma_address)}")
+    # print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name} {hex(dma_address)}")
     return flink_req.name
   def _gpu_alloc(self, size:int, flags, name:str) -> HCQBuffer:
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
