@@ -56,12 +56,28 @@ class RockchipProgram:
     if b_matrix.shape[0] != k: raise RuntimeError("k_mismatch")
     n = int(b_matrix.shape[1])
     wmma_meta = self._wmma_params(int(m), int(n), int(k))
-    in_pack = np.zeros((wmma_meta["m"], wmma_meta["align_in"]), dtype=np.float16)
-    wt_pack = np.zeros((wmma_meta["align_out"], wmma_meta["align_in"]), dtype=np.float16)
-    in_pack[:, :wmma_meta["k"]] = a_matrix
-    wt_pack[:wmma_meta["n"], :wmma_meta["k"]] = b_matrix.T
-    src = memoryview(bytearray(in_pack.reshape(-1).tobytes()))
-    src2 = memoryview(bytearray(wt_pack.reshape(-1).tobytes()))
+    in_pack = np.zeros(wmma_meta["align_in"] * wmma_meta["m"], dtype=np.float16)
+    wt_pack = np.zeros(wmma_meta["align_out"] * wmma_meta["align_in"], dtype=np.float16)
+    if (wmma_meta["m"], wmma_meta["n"], wmma_meta["k"]) == (64, 64, 64):
+      for mm in range(1, 65):
+        for kk in range(1, 65):
+          plane = (kk - 1) // 8
+          offset = (kk - 1) % 8
+          in_pack[plane * 64 * 8 + (mm - 1) * 8 + offset] = a_matrix[mm - 1, kk - 1]
+      for nn in range(1, 65):
+        for kk in range(1, 65):
+          kpg, cpg = (nn - 1) // 16, (kk - 1) // 32
+          wt_idx = ((cpg * 32) * 16) + (kpg * 16 * wmma_meta["align_in"]) + ((kk - 1) % 32) + (((nn - 1) % 16) * 32)
+          wt_pack[wt_idx] = b_matrix[kk - 1, nn - 1]
+    else:
+      in_pack = in_pack.reshape(wmma_meta["m"], wmma_meta["align_in"])
+      wt_pack = wt_pack.reshape(wmma_meta["align_out"], wmma_meta["align_in"])
+      in_pack[:, :wmma_meta["k"]] = a_matrix
+      wt_pack[:wmma_meta["n"], :wmma_meta["k"]] = b_matrix.T
+      in_pack = in_pack.reshape(-1)
+      wt_pack = wt_pack.reshape(-1)
+    src = memoryview(bytearray(in_pack.tobytes()))
+    src2 = memoryview(bytearray(wt_pack.tobytes()))
     self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
     self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
     self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
@@ -84,8 +100,15 @@ class RockchipProgram:
       ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
       raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
       out = np.empty((m, n), dtype=np.float32)
-      stride = wmma_meta["align_out"]
-      for r in range(m): out[r, :] = raw[r*stride:r*stride+n]
+      if (wmma_meta["m"], wmma_meta["n"], wmma_meta["k"]) in {(64, 64, 64), (256, 256, 256)}:
+        c2 = 4
+        for col in range(n):
+          plane, offset = col // c2, col % c2
+          plane_base = plane * m * c2
+          for row in range(m): out[row, col] = raw[plane_base + row * c2 + offset]
+      else:
+        stride = wmma_meta["align_out"]
+        for row in range(m): out[row, :] = raw[row * stride:row * stride + n]
       return out
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
@@ -181,10 +204,10 @@ class RockchipProgram:
     line_stride = data_in_width * 4
     if 32 < k < 512 and k not in (64, 256):
       line_stride = min(13, (k + 31) // 32) * 4
-    surf_stride = 0
-    if align_in >= 64 and not (32 < k < 512):
-      surf_groups = data_in_height // 4
-      surf_stride = line_stride * (surf_groups - 1) + int(surf_groups == 0)
+    surf_groups = data_in_height // 4
+    surf_stride = (line_stride * (surf_groups - 1) + int(surf_groups == 0)) * int(align_in >= 64)
+    if (32 < k < 64) or (64 < k <= 128) or (128 < k < 256) or (256 < k < 512):
+      surf_stride = 0
     dst_surf_stride = 64 if is_matmul_64 else (256 if is_matmul_256 else out_width_stride)
     notch_blocks = min(13, align_out // 32)
     notch_val = 8 * notch_blocks - 1
@@ -329,10 +352,18 @@ class RockchipProgram:
         self.reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
         self.reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
 
-      self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON1,
-        self.reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
-        self.reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
-        self.reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+      is_kn_64 = p["k"] == 64 and p["n"] == 64
+      is_kn_256 = p["k"] == 256 and p["n"] == 256
+      is_kn_512 = p["k"] == 512 and p["n"] == 512
+      is_kn_lg_512 = p["k"] > 512 and p["n"] > 512
+      is_m_1_kn_768 = p["m"] == 1 and p["k"] == 768 and p["n"] == 768
+      is_m_1_k768_n2048 = p["m"] == 1 and p["k"] == 768 and p["n"] == 2048
+      is_m_1_kn_2048 = p["m"] == 1 and p["k"] == 2048 and p["n"] == 2048
+      conv_con1 = self.reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) | \
+                  self.reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK)
+      if not (is_kn_64 or is_kn_256 or is_kn_512 or is_kn_lg_512 or is_m_1_kn_768 or is_m_1_k768_n2048 or is_m_1_kn_2048):
+        conv_con1 |= self.reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK)
+      self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON1, conv_con1)
       self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON2,
         self.reg(p["feature_grains"], rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
       self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON3,
