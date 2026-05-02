@@ -318,7 +318,7 @@ class Scheduler:
     if self.ren.device != "ROCKCHIP" or len(self.reduceops) != 1: return False, None
     reduceop = self.reduceops[0]
     root = reduceop.src[0] if reduceop.src[0].op is not Ops.CAST else reduceop.src[0].src[0]
-    if reduceop.arg is not Ops.ADD or root.op is not Ops.MUL: return False, None
+    if (reduceop.arg[0] if isinstance(reduceop.arg, tuple) else reduceop.arg) is not Ops.ADD or root.op is not Ops.MUL: return False, None
     if os.getenv("ROCKCHIP_FUSED_MATMUL", "1") == "0": return False, "disabled"
 
     def parse_idx(idx:UOp) -> dict[UOp, int]|None:
@@ -372,8 +372,8 @@ class Scheduler:
     if reduceop.dtype.scalar() != dtypes.float: return fail("acc_not_fp32")
 
     dtype_code = {dtypes.half: 0, dtypes.float: 1}
-    if lhs.src[0].op is not Ops.DEFINE_GLOBAL or rhs.src[0].op is not Ops.DEFINE_GLOBAL: return fail("input_buffer_kind")
-    if out_idx.src[0].op is not Ops.DEFINE_GLOBAL: return fail("output_buffer_kind")
+    if lhs.src[0].op is not Ops.PARAM or rhs.src[0].op is not Ops.PARAM: return fail("input_buffer_kind")
+    if out_idx.src[0].op is not Ops.PARAM: return fail("output_buffer_kind")
     a_dt = cast(int|None, dtype_code.get(lhs.src[0].dtype.base.scalar()))
     b_dt = cast(int|None, dtype_code.get(rhs.src[0].dtype.base.scalar()))
     c_dt = cast(int|None, dtype_code.get(out_idx.src[0].dtype.base.scalar()))

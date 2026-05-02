@@ -718,7 +718,10 @@ class RockchipProgram:
         elif uop is Ops.STACK: values[i] = src_values
         elif uop is Ops.BITCAST: values[i] = [bitcast(x, src_dtypes[0], dtype) for x in src_values[0]]
         elif uop is Ops.CAST:
-          values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
+          if dtype.count > 1 and len(src_values[0]) == dtype.count and all(isinstance(x, list) for x in src_values[0]):
+            values[i] = [[truncate.get(dtype.scalar(), lambda dt: dt)(dtype.scalar().const(x)) for x in comp] for comp in src_values[0]]
+          else:
+            values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
         elif uop is Ops.LOAD:
           if dtype.count > 1:
             values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
@@ -887,6 +890,7 @@ class RockchipProgram:
                 stride_f32 = wmma_meta["align_out"]
                 result = [float(raw[r*stride_f32 + c]) for r in range(wmma_meta["m"]) for c in range(wmma_meta["n"])]
                 if len(c_full) == len(result): result = [x+y for x,y in zip(result, c_full.tolist())]
+                result = [[x] for x in result]
               else:
                 result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
               if self.lut_enable:
