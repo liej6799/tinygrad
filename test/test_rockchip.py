@@ -9,7 +9,6 @@ from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops
-from tinygrad.engine.realize import get_runner, CompiledRunner
 
 if getenv("TINY_BACKEND"):
   import tinygrad.nn.torch # noqa: F401 # pylint: disable=unused-import
@@ -98,12 +97,10 @@ class TestOps(unittest.TestCase):
     np.random.seed(0)
     return np.random.uniform(-2, 2, size=ash).astype(np.float32), np.random.uniform(-2, 2, size=bsh).astype(np.float32)
 
-  def _matmul_runner(self, out:Tensor) -> CompiledRunner:
+  def _matmul_runner(self, out:Tensor):
     sink_asts = [ei.ast for ei in out.schedule() if ei.ast.op is Ops.SINK]
     self.assertTrue(sink_asts)
-    runner = get_runner(Device.DEFAULT, sink_asts[-1])
-    self.assertIsInstance(runner, CompiledRunner)
-    return runner
+    return Device[Device.DEFAULT].get_runner(*sink_asts[-1])
 
   def _run_fused_case(self, ash, bsh):
     a_np, b_np = self._matmul_data(ash, bsh)

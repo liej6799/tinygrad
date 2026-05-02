@@ -4,9 +4,9 @@
 # this is the (living) definition of uops
 from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, struct, sys, functools, array, ctypes, mmap, os, math, numpy as np
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_to_fp16, float_to_bf16, float_to_fp8, fp8_to_float
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, EMULATE, mv_address, to_mv, DEBUG
-from tinygrad.device import Compiled, Compiler, Allocator, CompilerSet, CompilerPair, BufferSpec
+from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_to_fp16, float_to_bf16, float_to_fp8, fp8_to_float, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
+from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, DEBUG, Target
+from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, bitcast
 from tinygrad.renderer import Renderer
@@ -51,39 +51,46 @@ class RockchipProgram:
     if code == 1: return np.float32
     raise RuntimeError(f"dtype_code_{code}")
 
+  @staticmethod
+  def _pack_input_row_major(m, n, k, a_matrix, in_pack, align_in):
+    in_pack.reshape(m, align_in)[:, :k] = a_matrix[:, :k]
+  @staticmethod
+  def _pack_input_c2_8(m, n, k, a_matrix, in_pack, align_in):
+    in_pack[:] = a_matrix[:, :k].reshape(m, -1, 8).transpose(1, 0, 2).ravel()
+  @staticmethod
+  def _pack_weight_tile_16x32(m, n, k, b_matrix, wt_pack, align_in, align_out):
+    wt = np.zeros((align_out, align_in), dtype=np.float16)
+    wt[:n, :k] = b_matrix.T[:n, :k]
+    wt_pack[:] = wt.reshape(align_out // 16, 16, align_in // 32, 32).transpose(0, 2, 1, 3).ravel()
+  @staticmethod
+  def _decode_output_linear(m, n, k, raw, align_out):
+    row_start = np.arange(m) * align_out
+    return raw[row_start[:, None] + np.arange(n)]
+  @staticmethod
+  def _decode_output_c2_4(m, n, k, raw, align_out):
+    return raw[:n // 4 * m * 4].reshape(n // 4, m, 4).transpose(1, 0, 2).reshape(m, n).copy()
+
   def _run_wmma_matmul(self, a_matrix:np.ndarray, b_matrix:np.ndarray) -> np.ndarray:
     m, k = a_matrix.shape
     if b_matrix.shape[0] != k: raise RuntimeError("k_mismatch")
     n = int(b_matrix.shape[1])
     wmma_meta = self._wmma_params(int(m), int(n), int(k))
-    in_pack = np.zeros(wmma_meta["align_in"] * wmma_meta["m"], dtype=np.float16)
-    wt_pack = np.zeros(wmma_meta["align_out"] * wmma_meta["align_in"], dtype=np.float16)
-    if (wmma_meta["m"], wmma_meta["n"], wmma_meta["k"]) == (64, 64, 64):
-      for mm in range(1, 65):
-        for kk in range(1, 65):
-          plane = (kk - 1) // 8
-          offset = (kk - 1) % 8
-          in_pack[plane * 64 * 8 + (mm - 1) * 8 + offset] = a_matrix[mm - 1, kk - 1]
-      for nn in range(1, 65):
-        for kk in range(1, 65):
-          kpg, cpg = (nn - 1) // 16, (kk - 1) // 32
-          wt_idx = ((cpg * 32) * 16) + (kpg * 16 * wmma_meta["align_in"]) + ((kk - 1) % 32) + (((nn - 1) % 16) * 32)
-          wt_pack[wt_idx] = b_matrix[kk - 1, nn - 1]
+    align_in, align_out = wmma_meta["align_in"], wmma_meta["align_out"]
+    in_pack = np.zeros(align_in * m, dtype=np.float16)
+    wt_pack = np.zeros(align_in * align_out, dtype=np.float16)
+    pad_k = wmma_meta["k"] != k and align_in != align_out
+    if self._uses_c2_input(m, n, k) and not pad_k:
+      self._pack_input_c2_8(m, n, k, a_matrix, in_pack, align_in)
     else:
-      in_pack = in_pack.reshape(wmma_meta["m"], wmma_meta["align_in"])
-      wt_pack = wt_pack.reshape(wmma_meta["align_out"], wmma_meta["align_in"])
-      in_pack[:, :wmma_meta["k"]] = a_matrix
-      wt_pack[:wmma_meta["n"], :wmma_meta["k"]] = b_matrix.T
-      in_pack = in_pack.reshape(-1)
-      wt_pack = wt_pack.reshape(-1)
+      self._pack_input_row_major(m, n, k, a_matrix, in_pack, align_in)
+    self._pack_weight_tile_16x32(m, n, k, b_matrix, wt_pack, align_in, align_out)
     src = memoryview(bytearray(in_pack.tobytes()))
     src2 = memoryview(bytearray(wt_pack.tobytes()))
     self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
     self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
     self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
     self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
-    out_stride = wmma_meta["align_out"] * dtypes.float32.itemsize
-    out_nbytes = max(0x100, (wmma_meta["m"]-1)*out_stride + wmma_meta["n"]*dtypes.float32.itemsize)
+    out_nbytes = max(0x100, ((m - 1) * align_out + n) * 4)
     self.output_buf = self.device._gpu_alloc(out_nbytes, 0, name="output")
     try:
       ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
@@ -99,16 +106,10 @@ class RockchipProgram:
       dst = memoryview(bytearray(self.output_buf.size))
       ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
       raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
-      out = np.empty((m, n), dtype=np.float32)
-      if (wmma_meta["m"], wmma_meta["n"], wmma_meta["k"]) in {(64, 64, 64), (256, 256, 256)}:
-        c2 = 4
-        for col in range(n):
-          plane, offset = col // c2, col % c2
-          plane_base = plane * m * c2
-          for row in range(m): out[row, col] = raw[plane_base + row * c2 + offset]
+      if self._uses_c2_input(m, n, k):
+        out = self._decode_output_c2_4(m, n, k, raw, align_out)
       else:
-        stride = wmma_meta["align_out"]
-        for row in range(m): out[row, :] = raw[row * stride:row * stride + n]
+        out = self._decode_output_linear(m, n, k, raw, align_out)
       return out
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
@@ -170,55 +171,66 @@ class RockchipProgram:
     return op in (Ops.EXP2, Ops.TRUNC) or (op is Ops.CUSTOM and arg == "silu")
   def reg(self, val, shift, mask):
     return ((val) << shift) & mask
-  def _align_up(self, val:int, align:int) -> int:
-    if align <= 0: return val
-    return ((val + align - 1) // align) * align
-  def _wmma_params(self, m:int, n:int, k:int) -> dict[str, int]:
-    m = max(1, m)
-    n = max(1, n)
-    k = max(1, k)
-    align_in = max(32, self._align_up(k, 32))
-    align_out = max(32, self._align_up(n, 32))
-    data_in_width, data_in_height = 1, m
-    dataout_width, dataout_height = 1, m
-    out_width_stride = 1
-    is_kn_64 = k == 64 and n == 64
-    is_kn_256 = k == 256 and n == 256
-    is_kn_512 = k == 512 and n == 512
-    is_kn_lg_512 = k > 512 and n > 512
-    is_matmul_64 = m == 64 and k == 64 and n == 64
-    is_matmul_256 = m == 256 and k == 256 and n == 256
-    feature_grains = data_in_height + 1
-    if k > 7872:
-      feature_grains = 2
-    elif 128 < k <= 192:
-      feature_grains = data_in_height
-    elif k > 192 and k != 256:
-      denom = align_in * dtypes.float16.itemsize
-      grains = (2 * 32768 + denom - 1) // denom
-      grains = (grains + 1) & ~1
-      feature_grains = max(80, grains)
-    weight_bytes_per_kernel = align_in * dtypes.float16.itemsize
-    fd_bytes = data_in_width * data_in_height * align_in * dtypes.float16.itemsize
-    data_bank = max(1, min(11, (fd_bytes + 32768 - 1) // 32768))
-    line_stride = data_in_width * 4
-    if 32 < k < 512 and k not in (64, 256):
-      line_stride = min(13, (k + 31) // 32) * 4
-    surf_groups = data_in_height // 4
-    surf_stride = (line_stride * (surf_groups - 1) + int(surf_groups == 0)) * int(align_in >= 64)
-    if (32 < k < 64) or (64 < k <= 128) or (128 < k < 256) or (256 < k < 512):
-      surf_stride = 0
-    dst_surf_stride = 64 if is_matmul_64 else (256 if is_matmul_256 else out_width_stride)
+  # --- GEMM helpers (from ~/rk3588/examples/gemm.py) ---
+  @staticmethod
+  def _ceil_div(x, y): return (x + y - 1) // y
+  @staticmethod
+  def _align_up(x, align): return RockchipProgram._ceil_div(x, align) * align
+  @staticmethod
+  def _uses_c2_input(m, n, k):
+    cbuf_aligned = k % 64 == 0
+    cbuf_friendly = 64 <= k <= 256
+    return (m == n == k) and cbuf_aligned and cbuf_friendly
+  @staticmethod
+  def _rk_gemm_layout(m, n, k):
+    aligned_k = max(32, RockchipProgram._align_up(k, 32))
+    align_out = max(32, RockchipProgram._align_up(n, 32))
+    align_in = max(aligned_k, align_out)
+    pad_k = align_in != aligned_k
+    eff_k = align_in if pad_k else k
+    return align_in, align_out, eff_k, pad_k
+  @staticmethod
+  def _rk_data_bank_count(input_bytes):
+    return max(1, min(11, RockchipProgram._ceil_div(input_bytes, 32768)))
+  @staticmethod
+  def _rk_cbuf_data_entries(align_in):
+    return RockchipProgram._ceil_div(align_in, 32)
+  @staticmethod
+  def _rk_line_stride(m, n, k, eff_k):
+    if eff_k <= 32 or eff_k >= 512 or RockchipProgram._uses_c2_input(m, n, k): return 4
+    return min(13, RockchipProgram._ceil_div(eff_k, 32)) * 4
+  @staticmethod
+  def _rk_feature_grains(m, align_in, eff_k):
+    if eff_k > 7872: return 2
+    if m <= 80: return m + 1
+    denom = align_in * 2
+    grains = ((2 * 32768 + denom - 1) // denom + 1) & ~1
+    return max(80, grains)
+  @staticmethod
+  def _rk_notch_value(k, n, align_out, eff_k):
     notch_blocks = min(13, align_out // 32)
     notch_val = 8 * notch_blocks - 1
-    if is_kn_64 or is_kn_256 or is_kn_512 or is_kn_lg_512 or k > 7872:
-      notch_val = 0
+    if (k == n and align_out >= 64) or eff_k > 7872: return 0
+    return notch_val
+  def _wmma_params(self, m:int, n:int, k:int) -> dict[str, int]:
+    m, n, k = max(1, m), max(1, n), max(1, k)
+    align_in, align_out, eff_k, _ = self._rk_gemm_layout(m, n, k)
+    no_group_line_off = (k == n) and (align_in >= 64)
+    line_stride = self._rk_line_stride(m, n, k, eff_k)
+    surf_groups = m // 4
+    surf_stride = 0
+    if align_in >= 64 and self._uses_c2_input(m, n, k):
+      surf_stride = line_stride * (surf_groups - 1) + int(surf_groups == 0)
+    input_bytes = m * align_in * 2
+    data_bank = self._rk_data_bank_count(input_bytes)
+    data_entries = self._rk_cbuf_data_entries(align_in)
+    dst_surf_stride = align_out if no_group_line_off else 1
+    feature_grains = self._rk_feature_grains(m, align_in, eff_k)
+    notch_val = self._rk_notch_value(k, n, align_out, eff_k)
     return {
       "m":m, "n":n, "k":k, "align_in":align_in, "align_out":align_out,
-      "data_in_width":data_in_width, "data_in_height":data_in_height,
-      "dataout_width":dataout_width, "dataout_height":dataout_height,
-      "feature_grains":feature_grains, "weight_bytes_per_kernel":weight_bytes_per_kernel,
-      "data_bank":data_bank, "line_stride":line_stride, "surf_stride":surf_stride,
+      "feature_grains":feature_grains, "data_bank":data_bank, "data_entries":data_entries,
+      "line_stride":line_stride, "surf_stride":surf_stride,
       "dst_surf_stride":dst_surf_stride, "notch_val":notch_val,
     }
   def emit_raw(self, target, reg, value):
@@ -342,6 +354,14 @@ class RockchipProgram:
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
         self.reg(0x3C00, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
       # REG_DPU_OUT_CVT_SHIFT need manual reset to 0
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+        self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+    elif op is not Ops.WMMA:
+      # Comparison CUSTOM ops configure BS/BN; reset them so following WHERE math uses only EW.
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+        self.reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
         self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
     
@@ -792,8 +812,9 @@ class RockchipProgram:
           else: raise NotImplementedError(f"unimplemented tensor core {arg}")
         elif uop in [Ops.CUSTOM, Ops.WMMA] or uop in GroupOp.ALU:
           if uop is not Ops.WMMA: assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
-          assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE, Ops.WMMA}, f"dtype mismatch on {uop}"
-          if uop in self.hardware_ops and dtype.scalar() == dtypes.half:
+          hw_bool_cmp = uop is Ops.CUSTOM and arg in ("cmplt_diff2bool", "cmpeq_32800_to_bool") and dtype.scalar() == dtypes.bool
+          assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE, Ops.WMMA} or hw_bool_cmp, f"dtype mismatch on {uop}"
+          if uop in self.hardware_ops and (dtype.scalar() == dtypes.half or hw_bool_cmp):
             self.q = []
             self.lut_enable = self.check_lut_enable(uop, arg)
             if len(src_values) == 1:
@@ -882,6 +903,7 @@ class RockchipProgram:
                 if len(c_full) == len(result): result = [x+y for x,y in zip(result, c_full.tolist())]
               else:
                 result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
+                if hw_bool_cmp: result = [bool(x) for x in result]
               if self.lut_enable:
                 raw = np.rint(np.array(result, dtype=np.float32))
                 # q14 decode
@@ -922,64 +944,76 @@ class RockchipRenderer(Renderer):
     if x.tag == "rk_trunc": return None
     xh = x.src[0].cast(dtypes.half)
     zero = UOp.const(dtypes.half, 0)
-    neg = xh.alu(Ops.CMPLT, zero)
+    neg = xh.alu(Ops.CMPLT, zero).rtag("rk_cmp_src")
     shifted = xh.alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875))
-    absx = UOp(Ops.WHERE, dtypes.half, src=(shifted.alu(Ops.CMPLT, zero), shifted.alu(Ops.NEG), shifted))
+    absx = UOp(Ops.WHERE, dtypes.half, src=(shifted.alu(Ops.CMPLT, zero).rtag("rk_cmp_src"), shifted.alu(Ops.NEG), shifted))
     mag = absx.alu(Ops.TRUNC).rtag("rk_trunc")
     signed = UOp(Ops.WHERE, dtypes.half, src=(neg, mag.alu(Ops.NEG).alu(Ops.ADD, UOp.const(dtypes.half, 1)), mag))
     return signed.cast(x.dtype)
   pre_matcher = PatternMatcher([
     (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
-     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
+     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu").cast(x.dtype)),
   ])
   extra_matcher = PatternMatcher([
     (UPat(Ops.WMMA, dtype=dtypes.float.vec(4), name="x"),
      lambda x: UOp(Ops.WMMA, dtypes.half.vec(4), x.src,
                    (x.arg[0], x.arg[1], x.arg[2], dtypes.half, *x.arg[4:])).cast(dtypes.float.vec(4))),
+    # Signed index math is small enough for the NPU fp16 path; uint32 RNG/hash math is not.
     (UPat(Ops.MUL, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.SUB, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.SUB, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.MAX, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half)).cast(x.dtype)),
     (UPat(Ops.MAX, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half)).cast(x.dtype)),
     (UPat(Ops.NEG, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG).cast(x.dtype)),
     (UPat(Ops.EXP2, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2).cast(x.dtype)),
     (UPat(Ops.TRUNC, dtypes.floats, name="x"),
      _rk_trunc_fix),
-    (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
-      UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
-     lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
-    (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
-      UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
-     lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
+    (UPat(Ops.WHERE, name="w", src=(UPat(Ops.CMPLT, name="x"), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
+     lambda w,x,a,b: b.cast(dtypes.float16).alu(Ops.ADD, a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16)).alu(Ops.MUL,
+       UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),), arg="cmplt_diff2bool"))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat(Ops.CMPLT, name="x"), UPat.var("a", dtypes.int), UPat.var("b", dtypes.int))),
+     lambda w,x,a,b: b.cast(dtypes.float16).alu(Ops.ADD, a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16)).alu(Ops.MUL,
+       UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),), arg="cmplt_diff2bool"))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat(Ops.CUSTOM, arg="cmplt_diff2bool", name="c"), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
+     lambda w,c,a,b: b.cast(dtypes.float16).alu(Ops.ADD, a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16)).alu(Ops.MUL,
+       UOp(Ops.CUSTOM, dtypes.float16, src=c.src, arg=c.arg))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat(Ops.CUSTOM, arg="cmplt_diff2bool", name="c"), UPat.var("a", dtypes.int), UPat.var("b", dtypes.int))),
+     lambda w,c,a,b: b.cast(dtypes.float16).alu(Ops.ADD, a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16)).alu(Ops.MUL,
+       UOp(Ops.CUSTOM, dtypes.float16, src=c.src, arg=c.arg))).cast(w.dtype)),
     (UPat(Ops.CMPLT, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
-                   arg="cmplt_diff2bool").cast(dtypes.bool)),
+     lambda x: None if x.tag == "rk_cmp_src" else UOp(Ops.CUSTOM, dtypes.bool, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+                   arg="cmplt_diff2bool")),
     (UPat(Ops.CMPEQ, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
+     lambda x: UOp(Ops.CUSTOM, dtypes.bool, arg="cmpeq_32800_to_bool", src=(
        UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(
          x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
        ),
-     )).cast(dtypes.bool)),
-    # CMPNE(x) = 1 - CMPEQ(x)
+     ))),
     (UPat(Ops.CMPNE, name="x"),
       lambda x: UOp.const(dtypes.float16, 1).alu(
         Ops.SUB,
-        x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
+        UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
+          UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(
+            x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+          ),
+        )).cast(dtypes.float16)
       ).cast(dtypes.bool)),
-    # ax + b(1-x) 
+    # WHERE(mask, a, b) = b + (a-b)*mask; avoids constant-first 1-mask subtraction on RK3588.
     (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
-     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
-       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
-    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.ints), UPat.var("b", dtypes.ints))),
-     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
-       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
+     lambda w,c,a,b: b.cast(dtypes.float16).alu(Ops.ADD,
+       UOp(Ops.MUL, dtypes.float16, src=(c.cast(dtypes.float16), a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16))))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.int), UPat.var("b", dtypes.int))),
+     lambda w,c,a,b: b.cast(dtypes.float16).alu(Ops.ADD,
+       UOp(Ops.MUL, dtypes.float16, src=(c.cast(dtypes.float16), a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16))))).cast(w.dtype)),
   ])
 
   def __init__(self, target:Target):
@@ -1016,8 +1050,7 @@ class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
 
-    compilers = CompilerSet([CompilerPair(RockchipRenderer, RockchipCompiler)])
-    super().__init__(device, RockchipAllocator(self), compilers, functools.partial(RockchipProgram, self))
+    super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
     result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
