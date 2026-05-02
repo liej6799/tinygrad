@@ -15,6 +15,16 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, load, _store, generic_wmma_helper
 
+REGCMD_RESERVED = 16384
+FP16_ATOM_ELEMENTS = 16
+NPU_CBUF_BANK_SIZE = 32768
+NPU_CBUF_BANKS = 12
+RK_DPU_OUTPUT_GROUP = 8
+DPU_BYPASS_CFG = 0x53
+DPU_EW_BYPASS_CFG = 0x383
+CORE_RESERVED_ZERO_ADDR = 0x3030
+DPU_RESERVED_ZERO_ADDR = 0x40c4
+
 def _rk_env(name:str, default:int) -> int:
   try: return int(os.getenv(name, str(default)))
   except ValueError: return default
@@ -23,7 +33,8 @@ class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     prg = pickle.loads(lib)
     self.ew_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "elementwise" else None
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None else prg
+    self.conv_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "conv1x1" and not name.startswith("rkmm_v1_") else None
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None or self.conv_meta is not None else prg
     self.device = dev
     self.q = []
     self.hardware_ops = {Ops.WMMA:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
@@ -51,6 +62,100 @@ class RockchipProgram:
     if code == 0: return np.float16
     if code == 1: return np.float32
     raise RuntimeError(f"dtype_code_{code}")
+
+  def _conv_params(self, in_channels:int, out_channels:int, spatial:int) -> dict[str, int|bool]:
+    align_c = max(8, min(1 << (max(1, in_channels) - 1).bit_length(), 16))
+    align_out_c = max(FP16_ATOM_ELEMENTS, self._align_up(out_channels, FP16_ATOM_ELEMENTS))
+    width_stride = self._align_up(spatial, max(1, (16 + align_c - 1) // align_c))
+    row_bytes = width_stride * align_c * dtypes.float16.itemsize
+    feature_grains = min(2, max(2, (2 * NPU_CBUF_BANK_SIZE + row_bytes - 1) // row_bytes))
+    data_bytes = width_stride * feature_grains * align_c * dtypes.float16.itemsize
+    data_bank = max(1, min(NPU_CBUF_BANKS - 1, (data_bytes + NPU_CBUF_BANK_SIZE - 1) // NPU_CBUF_BANK_SIZE))
+    out_width_stride = spatial if spatial < 4 else self._align_up(spatial, 4)
+    return {
+      "in_channels":in_channels, "out_channels":out_channels, "spatial":spatial, "align_c":align_c, "align_out_c":align_out_c,
+      "width_stride":width_stride, "out_width_stride":out_width_stride, "data_bank":data_bank, "feature_grains":feature_grains,
+      "surface_add":out_width_stride * (align_out_c // RK_DPU_OUTPUT_GROUP),
+      "cbuf_entries":max(1, (width_stride * align_c + 31) // 32) * (4 if align_c < 16 else 1),
+      "use_nhwc":align_c // in_channels == 2,
+    }
+
+  def _pack_conv_input(self, src:memoryview, p:dict[str, int|bool]) -> np.ndarray:
+    in_channels, spatial, align_c, width_stride = (int(p[x]) for x in ("in_channels", "spatial", "align_c", "width_stride"))
+    nchw = np.frombuffer(src, dtype=np.float16, count=in_channels*spatial).reshape(1, in_channels, 1, spatial)
+    if p["use_nhwc"]:
+      packed = np.zeros((1, 1, width_stride, in_channels), dtype=np.float16)
+      packed[:, :, :spatial, :] = nchw.transpose(0, 2, 3, 1)
+      return packed.reshape(-1)
+    padded = np.zeros((1, align_c, 1, width_stride), dtype=np.float16)
+    padded[:, :in_channels, :, :spatial] = nchw
+    return padded.reshape(1, 1, align_c, 1, width_stride).transpose(0, 1, 3, 4, 2).reshape(-1)
+
+  def _pack_conv_weights(self, src:memoryview, p:dict[str, int|bool]) -> np.ndarray:
+    out_channels, in_channels, align_c = (int(p[x]) for x in ("out_channels", "in_channels", "align_c"))
+    weights = np.frombuffer(src, dtype=np.float16, count=out_channels*in_channels).reshape(out_channels, in_channels, 1, 1)
+    packed = np.zeros((out_channels, align_c, 1, 1), dtype=np.float16)
+    packed[:, :in_channels] = weights
+    return packed.transpose(0, 2, 3, 1).reshape(-1)
+
+  def _unpack_conv_output(self, src:memoryview, p:dict[str, int|bool]) -> np.ndarray:
+    out_channels, spatial, align_out_c, out_width_stride = (int(p[x]) for x in ("out_channels", "spatial", "align_out_c", "out_width_stride"))
+    c2 = 8 if align_out_c >= 8 else align_out_c
+    c1 = (out_channels + c2 - 1) // c2
+    packed = np.frombuffer(src, dtype=np.float16, count=c1*out_width_stride*c2).reshape(1, c1, 1, out_width_stride, c2)
+    return packed.transpose(0, 1, 4, 2, 3).reshape(1, c1*c2, 1, out_width_stride)[:, :out_channels, :, :spatial].reshape(-1)
+
+  def _emit_conv_regs(self, p:dict[str, int|bool], input_dma:int, weight_dma:int, output_dma:int) -> None:
+    out_channels, in_channels, spatial = (int(p[x]) for x in ("out_channels", "in_channels", "spatial"))
+    align_c, align_out_c = int(p["align_c"]), int(p["align_out_c"])
+    self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER, (1 << 3) | (1 << 2) | (1 << 1))
+    conv_con1 = (2 << 7) | (2 << 4)
+    if in_channels in (1, 3, 4): conv_con1 |= (1 << 30) | (1 << 29) | ((7 + in_channels) << 12)
+    self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON1, conv_con1)
+    self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON2, int(p["feature_grains"]) << 4)
+    self.emit_raw(rk.CNA, rk.REG_CNA_CONV_CON3, (1 << 3) | 1)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DATA_SIZE0, (int(p["width_stride"]) << 16) | 1)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DATA_SIZE1, ((in_channels - 1) << 16) | align_c)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DATA_SIZE2, spatial)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DATA_SIZE3, spatial)
+    self.emit_raw(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, out_channels * align_c * dtypes.float16.itemsize)
+    self.emit_raw(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1, align_c * dtypes.float16.itemsize)
+    self.emit_raw(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2, (1 << 24) | (1 << 16) | out_channels)
+    self.emit_raw(rk.CNA, rk.REG_CNA_CBUF_CON0, ((NPU_CBUF_BANKS - int(p["data_bank"])) << 4) | int(p["data_bank"]))
+    self.emit_raw(rk.CNA, rk.REG_CNA_CBUF_CON1, int(p["cbuf_entries"]))
+    self.emit_raw(rk.CNA, rk.REG_CNA_CVT_CON0, 0x1 if p["use_nhwc"] else 0xB)
+    for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4): self.emit_raw(rk.CNA, reg, 1 << 16)
+    self.emit_raw(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma & 0xFFFFFFFF)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DMA_CON0, (15 << 16) | 15)
+    line_stride = int(p["width_stride"]) if in_channels in (1, 3, 4) else int(p["width_stride"]) * 4
+    self.emit_raw(rk.CNA, rk.REG_CNA_DMA_CON1, line_stride)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DMA_CON2, 0)
+    self.emit_raw(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0, (spatial << 16) | 1)
+    self.emit_raw(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1, align_c)
+    self.emit_raw(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, (weight_dma + REGCMD_RESERVED) & 0xFFFFFFFF)
+    self.emit_raw(rk.CNA, rk.REG_CNA_CVT_CON5, (1 << max(1, min(in_channels if p["use_nhwc"] else align_c, 8))) - 1)
+    self.emit_raw(rk.CORE, rk.REG_CORE_MISC_CFG, 2 << 8)
+    self.emit_raw(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0, spatial - 1)
+    self.emit_raw(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out_c - 1)
+    self.q.append(((rk.CORE | 0x1) << 48) | CORE_RESERVED_ZERO_ADDR)
+    self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG, (15 << 5) | (2 << 1))
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT, (2 << 29) | (2 << 26) | 2)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, output_dma & 0xFFFFFFFF)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, int(p["out_width_stride"]) << 4)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH, spatial - 1)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((out_channels - 1) << 16) | (align_out_c - 1))
+    self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG, DPU_BYPASS_CFG)
+    self.emit_raw(rk.DPU, rk.REG_DPU_BS_OW_CFG, (1 << 8) | (1 << 5) | (1 << 2) | (1 << 1))
+    self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_0, align_out_c - 1)
+    self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_1, spatial - 1)
+    self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG, DPU_BYPASS_CFG)
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG, DPU_EW_BYPASS_CFG)
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
+    self.emit_raw(rk.DPU, rk.REG_DPU_SURFACE_ADD, int(p["surface_add"]) << 4)
+    self.q.append((0x1 << 48) | DPU_RESERVED_ZERO_ADDR)
+    self.q.append((0x81 << 48) | (0xD << 16) | rk.REG_PC_OPERATION_ENABLE)
 
   def _run_wmma_matmul(self, a_matrix:np.ndarray, b_matrix:np.ndarray) -> np.ndarray:
     m, k = a_matrix.shape
@@ -192,6 +297,43 @@ class RockchipProgram:
       self.submit(op)
       self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
+    finally:
+      self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
+
+  def _run_conv1x1(self, out_slot:int, in_slot:int, weight_slot:int, in_channels:int, out_channels:int, spatial:int, bufs:tuple[Any, ...]) -> None:
+    if in_channels == 1:
+      in_full = np.zeros(3 * spatial, dtype=np.float16)
+      wt_full = np.zeros(out_channels * 3, dtype=np.float16)
+      in_full[:spatial] = np.frombuffer(bufs[in_slot], dtype=np.float16, count=spatial)
+      wt_full.reshape(out_channels, 3)[:, 0] = np.frombuffer(bufs[weight_slot], dtype=np.float16, count=out_channels)
+      return self._run_conv1x1(0, 1, 2, 3, out_channels, spatial, (bufs[out_slot], in_full, wt_full))
+    p = self._conv_params(in_channels, out_channels, spatial)
+    input_packed = self._pack_conv_input(memoryview(bufs[in_slot]), p)
+    weight_packed = self._pack_conv_weights(memoryview(bufs[weight_slot]), p)
+    packed_input_size = ((in_channels + int(p["align_c"]) - 1) // int(p["align_c"])) * int(p["width_stride"]) * int(p["align_c"]) * 2
+    packed_weight_size = weight_packed.nbytes
+    packed_output_size = ((out_channels + int(p["align_out_c"]) - 1) // int(p["align_out_c"]))
+    packed_output_size *= int(p["out_width_stride"]) * int(p["align_out_c"]) * 2
+    self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+    self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
+    self.input_buf = self.device._gpu_alloc(packed_input_size, 0, name="input")
+    self.weight_buf = self.device._gpu_alloc(REGCMD_RESERVED + packed_weight_size, 0, name="weight")
+    self.output_buf = self.device._gpu_alloc(packed_output_size, 0, name="output")
+    try:
+      ctypes.memset(self.input_buf.va_addr, 0, packed_input_size)
+      ctypes.memmove(self.input_buf.va_addr, mv_address(memoryview(input_packed)), input_packed.nbytes)
+      ctypes.memmove(self.weight_buf.va_addr + REGCMD_RESERVED, mv_address(memoryview(weight_packed)), packed_weight_size)
+      self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.q = []
+      self._emit_conv_regs(p, self.input_buf.meta.dma_addr, self.weight_buf.meta.dma_addr, self.output_buf.meta.dma_addr)
+      self.submit_conv()
+      self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      dst = memoryview(bytearray(self.output_buf.size))
+      ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+      out = self._unpack_conv_output(dst, p)
+      ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:out.nbytes]), mv_address(memoryview(out)), out.nbytes)
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
 
@@ -630,6 +772,43 @@ class RockchipProgram:
     if uop is Ops.WMMA and DEBUG >= 7:
       os.system("cd ~/npu/ops_reg/ && python dump.py 5 > /tmp/tinygrad_output")
 
+  def submit_conv(self):
+    tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
+    assert len(self.q) <= self.cmd_buf_size
+    regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * self.cmd_buf_size)).contents
+    for i in range(len(self.q)): regcmd[i] = self.q[i]
+
+    tasks[0].flags = 0
+    tasks[0].op_idx = 1
+    tasks[0].enable_mask = 0xd
+    tasks[0].int_mask = 0x300
+    tasks[0].int_clear = 0x1ffff
+    tasks[0].int_status = 0
+    tasks[0].regcfg_amount = len(self.q)
+    tasks[0].regcfg_offset = 0
+    tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
+
+    submit_res = rk.struct_rknpu_submit(
+            flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+            timeout=6000,
+            task_start=0,
+            task_number=1,
+            task_counter=0,
+            priority=0,
+            task_obj_addr=self.task_buf.meta.obj_addr,
+            regcfg_obj_addr=0,
+            task_base_addr=0,
+            user_data=0,
+            core_mask=1,
+            fence_fd=-1,
+            subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+                rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+                rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+                rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
+            )
+    )
+    rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
+
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
     st = time.perf_counter()
@@ -645,6 +824,10 @@ class RockchipProgram:
       except Exception as e:
         reason = str(e)
         self.fused_matmul_fallbacks += 1
+    if self.conv_meta is not None:
+      out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = self.conv_meta
+      self._run_conv1x1(out_slot, in_slot, weight_slot, in_channels, out_channels, spatial, bufs)
+      return time.perf_counter() - st
 
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -1023,8 +1206,25 @@ class RockchipRenderer(Renderer):
         if lhs[2] is not None and lhs[2] != (j,): return None
     return (flat_op, size, 0, 1, 2) if flat_op is not None else None
 
+  def _conv1x1_meta(self, uops:list[UOp]):
+    if os.getenv("ROCKCHIP_NATIVE_CONV", "1") == "0": return None
+    params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
+    if len(params) != 3 or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
+    out_size, in_size, weight_size = (u.dtype.size for _,u in params)
+    candidates = []
+    for spatial in range(1, min(out_size, in_size) + 1):
+      if out_size % spatial == 0 and in_size % spatial == 0 and (out_size // spatial) * (in_size // spatial) == weight_size:
+        candidates.append(spatial)
+    if not candidates: return None
+    spatial = max(candidates)
+    out_channels, in_channels = out_size // spatial, in_size // spatial
+    if out_channels <= 0 or in_channels <= 0 or spatial <= 0 or in_channels > 4: return None
+    if not any(u.op is Ops.WMMA for u in uops): return None
+    return (params[0][1].arg, params[1][1].arg, params[2][1].arg, in_channels, out_channels, spatial)
+
   def render(self, uops:list[UOp]) -> str:
     if (ew_meta:=self._elementwise_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("elementwise", *ew_meta))).decode()
+    if (conv_meta:=self._conv1x1_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("conv1x1", *conv_meta))).decode()
     # the value of SPECIAL comes from local/global_size, not form its source
     uop_to_idx = {u:i for i,u in enumerate(uops)}
     lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
