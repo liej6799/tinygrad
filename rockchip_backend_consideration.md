@@ -6,6 +6,10 @@ Decide how to re-architect `tinygrad/runtime/ops_rockchip.py` so it looks more l
 
 The specific question is whether Rockchip should move from runtime register emission to a compiled backend where almost all register command streams are built ahead of time, stored as a binary artifact, and patched at runtime only for input, output, scratch, and constant addresses. The AMD backend is the main comparison point because it is also a low-level driver backend that writes hardware command packets directly.
 
+Important clarification: the 500-line target applies to the future refactored `tinygrad/runtime/ops_rockchip.py`, not to this planning document.
+This document should be as long as needed to make the refactor decision-complete. The final implementation should make `ops_rockchip.py`
+small by moving compiler policy, register templates, layout transforms, and debug tooling into support modules.
+
 ## Current Runtime Model In Tinygrad
 
 Most `ops_*.py` files have the same high-level contract:
@@ -87,6 +91,30 @@ The common lesson is that unusual devices can be supported, but their responsibi
 This makes it difficult to see the actual runtime boundary. The file is not just a runtime. It is also a partial compiler, a binary layout packer, a register emitter, a command submitter, and a software fallback path.
 
 The current memory model is also not a true device-buffer model. The public allocator returns CPU `memoryview(bytearray(...))`; launches copy data into short-lived RKNPU GEM buffers, run the NPU, then copy results back into CPU buffers. There is a `RockchipRegisterAllocator` that allocates `HCQBuffer`, but `RockchipDevice` does not use it. So tinygrad sees Rockchip as CPU-backed storage plus accelerator calls, not as a normal resident device.
+
+## What Must Leave `ops_rockchip.py`
+
+To keep the refactored runtime under 500 lines, the runtime file must stop being the owner of hardware policy. The current file has several
+large responsibilities that should move out:
+
+- Shape policy: `_wmma_params`, `_conv_params`, `_elementwise_meta`, `_conv1x1_meta`, and fused-matmul name parsing.
+- Data layout policy: `_pack_conv_input`, `_pack_conv_weights`, `_unpack_conv_output`, WMMA input/weight packing, and output swizzle unpacking.
+- Register policy: `_emit_conv_regs`, `boilerplate`, LUT register programming, `fill_lut`, and DPU/CNA/CORE field composition.
+- Compiler policy: renderer rewrites for half-only arithmetic, custom comparison tricks, silu, trunc, relu, and `WHERE` lowering.
+- Software execution policy: the generic Python uop interpreter in `RockchipProgram.__call__`.
+- Debug trace shell-outs: `os.system("cd ~/npu/ops_reg/...")` dumps should move behind support debug helpers or an explicit dev-only tool.
+
+The runtime should keep only the work that is genuinely launch-time:
+
+- open `/dev/dri/card1`;
+- allocate, mmap, sync, and free RKNPU GEM buffers;
+- load a compiled template package;
+- bind tinygrad buffers and scalar values to template patches;
+- submit one or more RKNPU tasks;
+- optionally block, sync, copy out, and profile.
+
+That boundary is the practical meaning of "match the style of `ops_*.py`". The file can be under 500 lines only if the compiler and register
+builder live elsewhere.
 
 ## How AMD's Register Backend Works
 
@@ -201,6 +229,87 @@ The target is for `tinygrad/runtime/ops_rockchip.py` to be under 500 lines. That
 
 If tinygrad maintainers prefer fewer files, `support/rockchip.py` can hold both template structures and register builder code, while `ops_rockchip.py` stays runtime-only.
 
+## Target Runtime Line Budget
+
+The refactored `ops_rockchip.py` should be budgeted before implementation. The budget is intentionally strict so new register features do not
+drift back into the runtime file.
+
+- Imports, constants, and tiny helpers: 35 lines.
+- `RockchipProgram`: 120 lines.
+  - decode template package;
+  - allocate per-launch temporary buffers;
+  - apply patches;
+  - submit and copy/unpack outputs through support helpers.
+- `RockchipCompiler`: 20 lines.
+  - base64/pickle or final binary decode;
+  - debug disassemble hook if cheap.
+- `RockchipRenderer` shim: 40 lines.
+  - ideally just imports or delegates to a renderer/support module;
+  - no large pattern matcher in the runtime file.
+- `RockchipAllocator`: 45 lines.
+  - Stage 1 CPU-backed memoryview allocator, or Stage 2 RKNPU `HCQBuffer` allocator;
+  - no register or layout logic.
+- `RockchipDevice`: 140 lines.
+  - file descriptor open;
+  - GEM create/map/flink/destroy;
+  - memory sync;
+  - reset;
+  - finalization.
+- Submit helpers: 60 lines.
+  - create `struct_rknpu_task`;
+  - create `struct_rknpu_submit`;
+  - call `DRM_IOCTL_RKNPU_SUBMIT`;
+  - no op-specific register generation.
+
+This leaves about 40 lines of slack under the hard cap. The acceptance gate should be:
+
+```sh
+test "$(wc -l < tinygrad/runtime/ops_rockchip.py)" -lt 500
+```
+
+If the runtime exceeds this, the implementation is not done. Move code to support/compiler modules instead of relaxing the limit.
+
+## Current Code Movement Map
+
+This is the concrete ownership map for the existing `ops_rockchip.py` functions.
+
+- Keep in `ops_rockchip.py`:
+  - `RockchipProgram.__init__`, rewritten to decode an `RKTemplatePackage`;
+  - `RockchipProgram.__call__`, rewritten as a short bind/patch/submit path;
+  - `RockchipCompiler`, only as package decode/cache glue;
+  - `RockchipAllocator`, either CPU-backed Stage 1 or RKNPU-backed Stage 2;
+  - `RockchipDevice.create_flink_name`, `_gpu_alloc`, `_gpu_sync`, `_gpu_free`, `_gpu_free_multiple`, `reset_npu`.
+
+- Move to `tinygrad/runtime/support/rockchip.py`:
+  - `reg`, `emit_raw`, `fill_lut`, and all register command packing;
+  - RKNPU task-template construction;
+  - patch application;
+  - command dump/disassemble helpers;
+  - reusable GEM buffer wrappers if `HCQBuffer` is not enough;
+  - `submit` and `submit_conv` internals, generalized into one `submit_template`.
+
+- Move to a Rockchip compiler/renderer support module:
+  - `RockchipRenderer.pre_matcher`;
+  - `RockchipRenderer.extra_matcher`;
+  - `_elementwise_meta`;
+  - `_conv1x1_meta`;
+  - fused matmul metadata currently encoded in the program name;
+  - conversion from tinygrad uops to `RKTemplatePackage`.
+
+- Move to a layout support module:
+  - `_pack_conv_input`, `_pack_conv_weights`, `_unpack_conv_output`;
+  - WMMA input/weight packing and output swizzle decoding;
+  - dtype conversions needed by half-only hardware paths;
+  - shape-derived temporary buffer size calculations.
+
+- Delete from `ops_rockchip.py` after templates cover the path:
+  - generic uop interpreter loop in `RockchipProgram.__call__`;
+  - runtime calls to `boilerplate`;
+  - runtime construction of op-specific DPU/CNA/CORE registers;
+  - hidden CPU fallback for unsupported hardware programs.
+
+The final runtime file may import many helpers, but it should not contain the logic those helpers implement.
+
 ## Proposed Compiled Package
 
 A minimal binary package can be pickled at first, matching the current Python backend style and avoiding premature format work. Once stable, replace it with a compact binary struct.
@@ -231,6 +340,77 @@ class RKTemplate:
 ```
 
 The important part is the patch table. It lets the compiler own register construction while the runtime owns only address resolution.
+
+## Compiled Package Contract
+
+The package must be explicit enough that `RockchipProgram.__call__` never asks "what op is this?" It should only ask "which buffers and scalar
+values patch this template?"
+
+Required package fields:
+
+- `magic`: constant such as `b"RKTP"` so runtime can reject old pickled uop lists.
+- `version`: integer, bumped whenever serialization or patch semantics change.
+- `target`: string such as `"rk3588-rknpu2"`; runtime rejects unknown targets unless a compatibility flag is set.
+- `families`: tuple of task families, usually one entry at first: `"elementwise"`, `"lut"`, `"wmma"`, or `"conv1x1"`.
+- `regcmd`: immutable tuple of 64-bit register commands with placeholder values already encoded.
+- `tasks`: task descriptors with `op_idx`, `enable_mask`, `int_mask`, `int_clear`, `core_mask`, and submit flags.
+- `patches`: patch table describing every runtime-written field.
+- `layouts`: buffer layout transforms needed before submit or after completion.
+- `temps`: temporary buffers required by this program, with size expressions resolved at compile time where possible.
+- `debug`: optional source uop hash, shape summary, register-name dump, and original tinygrad program name.
+
+Patch kinds should be deliberately small:
+
+- `dma32`: patch a 32-bit DMA address into a register command value field.
+- `dma32_add`: patch a 32-bit DMA address plus compile-time addend, for cases like weight data after `REGCMD_RESERVED`.
+- `obj64`: patch an RKNPU object address into a task or submit structure.
+- `u32`: patch a plain scalar value.
+- `regfield`: patch `((value + addend) << shift) & mask` into the value bits of an existing register command.
+- `task_regcmd_addr`: patch the command-buffer DMA address into the task descriptor.
+
+Avoid generic arbitrary Python callbacks in the package. If patching needs code execution, the template ABI is not precise enough.
+
+The initial serializer can be pickle because current Rockchip and Python renderers already use pickle-style blobs. The package should still have a
+magic/version wrapper so old blobs fail cleanly:
+
+```python
+payload = pickle.dumps(RKTemplatePackage(...))
+lib = b"RKTP" + bytes([RK_TEMPLATE_VERSION]) + payload
+```
+
+After the refactor is stable, replace pickle with a packed binary format only if startup cost, cache stability, or reviewability requires it.
+
+## Template Families
+
+Elementwise template:
+
+- compile DPU and DPU_RDMA register commands for one binary op over packed half values;
+- patch output, lhs, and rhs DMA addresses;
+- keep op-specific ALU mode, data cube width/channel, and output conversion in compile-time registers.
+
+LUT/custom template:
+
+- compile LUT data and all LUT setup registers;
+- treat relu, exp2, silu, trunc, cmplt, cmpeq, cmpne, and where lowerings as named template variants;
+- patch only input/output addresses and any scalar dimensions that are truly runtime symbolic.
+
+WMMA template:
+
+- compile CNA, CORE, and DPU register setup from `(m, n, k, dtype, layout)`;
+- patch feature, weight, and output addresses;
+- move current output swizzle handling into a layout descriptor;
+- replace name-encoded `rkmm_v1_...` metadata with structured package fields.
+
+Conv1x1 template:
+
+- compile `_conv_params` result into register commands;
+- patch packed input, packed weight, and packed output DMA addresses;
+- keep input/weight/output packers in layout support, not runtime.
+
+Generic uop template:
+
+- do not implement in v1. If a program does not match a hardware family, compilation should fail with an explicit unsupported message.
+- Future support should add more hardware template families, not reintroduce a Python interpreter into `ops_rockchip.py`.
 
 ## Register Builder Direction
 
@@ -279,6 +459,63 @@ Avoid a large generic abstraction. Rockchip only needs three or four families in
 
 This removes the Python uop interpreter from the runtime path. Unsupported programs should not silently execute by interpreting uops on CPU inside `ops_rockchip.py`; they should either fail compilation or use a normal tinygrad fallback outside this backend. Silent CPU fallback inside a device runtime makes correctness and performance hard to reason about.
 
+### Runtime Launch Flow
+
+The new runtime launch should be deterministic and short:
+
+1. Optionally reset the NPU if `ROCKCHIP_RESET_EACH_LAUNCH=1` or until stability proves reset is unnecessary.
+2. Create a launch context with the template package, tinygrad buffers, scalar values, and env-controlled debug flags.
+3. Ask layout helpers to prepare input buffers.
+   - Stage 1: pack from CPU `memoryview` into temporary RKNPU GEM buffers.
+   - Stage 2: use resident RKNPU buffers directly when layout-compatible.
+4. Allocate command and task buffers.
+5. Copy template `regcmd` into the command buffer.
+6. Apply patches in one helper call, using resolved DMA/object addresses and scalar values.
+7. Materialize `struct_rknpu_task` descriptors from task templates.
+8. Submit through `DRM_IOCTL_RKNPU_SUBMIT`.
+9. Sync output buffers if required.
+10. Ask layout helpers to unpack outputs.
+11. Free or cache temporary buffers.
+12. Return elapsed time only when `wait=True`, matching other tinygrad program APIs.
+
+No step above requires knowing whether the program is add, conv, WMMA, or silu. That knowledge belongs to the template.
+
+### Intended Runtime Skeleton
+
+The runtime file should roughly look like this after refactor:
+
+```python
+class RockchipProgram:
+  def __init__(self, dev, name, lib, **kwargs):
+    self.dev, self.name, self.pkg = dev, name, decode_template(lib)
+    validate_template(self.pkg, dev.target)
+
+  def __call__(self, *bufs, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kw):
+    with rockchip_launch(self.dev, self.pkg, bufs, vals, wait) as launch:
+      launch.prepare_layouts()
+      launch.copy_regcmd()
+      launch.apply_patches()
+      self.dev.submit_template(launch)
+      launch.finish_outputs()
+      return launch.elapsed if wait else None
+```
+
+The real code can be flatter than this if it is shorter, but the ownership should remain: `ops_rockchip.py` orchestrates; helpers decide layout,
+registers, and patch semantics.
+
+### Runtime Failure Modes
+
+The runtime should fail early and explicitly:
+
+- bad magic/version: `RuntimeError("unsupported Rockchip template version ...")`;
+- unsupported target: `RuntimeError("compiled for rk3588..., running on ...")`;
+- missing buffer role: `RuntimeError("template requires role input0 but only ... buffers were passed")`;
+- patch overflow: `RuntimeError("value ... does not fit patch ...")`;
+- submit ioctl failure: preserve the underlying `OSError` and include program name and task family;
+- output validation failure: only if an explicit verification env is enabled.
+
+These errors are more useful than falling into the Python interpreter or returning silently corrupted output.
+
 ## Memory Model Plan
 
 There are two viable stages.
@@ -299,6 +536,27 @@ Stage 2, real device residency:
 - Keep pack/unpack only for layouts that the NPU cannot consume directly.
 
 Stage 1 is the right first milestone. Stage 2 is more important for performance, but it changes tinygrad-visible memory behavior and should be done after the compiler/runtime boundary is clean.
+
+### Buffer Lifetime Policy
+
+Stage 1 should keep the current external behavior, even if it is not optimal:
+
+- tinygrad buffers stay CPU-backed;
+- each hardware launch allocates task, command, packed input, packed weight, and packed output RKNPU buffers;
+- helper code owns pack/unpack copies;
+- allocator behavior visible to the rest of tinygrad remains unchanged.
+
+Stage 1 can still cache internal temporary buffers after correctness is stable. Cache only by exact size and role, and clear the cache on device
+finalization. Do not let temporary caching change the public allocator contract.
+
+Stage 2 should change one thing at a time:
+
+- first make public allocations return RKNPU buffers while keeping pack/unpack temp paths;
+- then skip temp buffers for layout-compatible elementwise inputs;
+- then skip temp buffers for WMMA/conv only when template layouts can describe the resident format;
+- finally add `_transfer` only if peer devices or disk copy paths need it.
+
+This order prevents a memory-model refactor from being confused with the compiler/template refactor.
 
 ## Should Rockchip Use HCQ?
 
@@ -463,6 +721,9 @@ Most register policy, shape policy, and layout code should live outside the runt
 Exit criteria:
 
 - `wc -l tinygrad/runtime/ops_rockchip.py` is under 500.
+- `rg -n "def boilerplate|def _wmma_params|def _conv_params|for idxs in itertools.product" tinygrad/runtime/ops_rockchip.py` returns nothing.
+- `rg -n "emit_raw|fill_lut|_pack_conv|_unpack_conv" tinygrad/runtime/ops_rockchip.py` returns nothing, except imports if needed.
+- The only op-family branching in `RockchipProgram.__call__` is through template/layout helper dispatch, not hardcoded register emission.
 - No behavior-only code is hidden in giant data blobs without a debug dump.
 
 ### Phase 8: Optional Device-Resident Buffers
@@ -481,6 +742,65 @@ Exit criteria:
 
 - Elementwise and matmul no longer copy every tinygrad buffer through temporary bytearrays unless layout packing requires it.
 - Copy behavior is covered by direct copyin/copyout tests.
+
+## Acceptance Matrix
+
+The refactor is complete only when each current capability has a new owner and a test signal.
+
+- Add/sub/mul/max elementwise:
+  - owner: elementwise template builder;
+  - runtime responsibility: patch three DMA addresses and submit;
+  - tests: tiny add, add/sub/scalar mul, max/min where currently supported.
+- LUT/custom elementwise:
+  - owner: LUT template builder;
+  - runtime responsibility: patch addresses only;
+  - tests: exp2, silu, relu, trunc, cmplt, cmpeq, cmpne, where.
+- WMMA/fused matmul:
+  - owner: WMMA template builder and layout packer;
+  - runtime responsibility: allocate/patch feature, weight, output buffers;
+  - tests: current fused matmul test cases and optional `ROCKCHIP_VERIFY_WMMA=1`.
+- Conv1x1:
+  - owner: conv template builder and layout packer;
+  - runtime responsibility: allocate/patch packed input, weight, output buffers;
+  - tests: known passing conv1x1 cases, including `in_channels == 1` expansion path.
+- Unsupported uops:
+  - owner: compiler error path;
+  - runtime responsibility: none;
+  - tests: compile unsupported program and assert a clear unsupported error.
+- Runtime line cap:
+  - owner: test/check script;
+  - runtime responsibility: remain small;
+  - tests: `wc -l tinygrad/runtime/ops_rockchip.py < 500`.
+
+## Suggested Hardware-Free Tests
+
+Hardware-free tests are important because most contributors will not have RK3588 access.
+
+- `test_rockchip_template_pack`: verify `rkcmd(target, reg, value)` packs exactly the same 64-bit command as old `emit_raw`.
+- `test_rockchip_patch_dma32`: build a one-command template with a placeholder address and verify patching updates only value bits.
+- `test_rockchip_patch_regfield`: verify shift/mask/addend behavior and overflow rejection.
+- `test_rockchip_template_roundtrip`: serialize and deserialize an `RKTemplatePackage` and assert equality.
+- `test_rockchip_elementwise_compile_shape`: compile a tiny half add and assert the package family, roles, and patch kinds.
+- `test_rockchip_reject_old_pickle`: pass an old pickled uop list without magic and assert a clear version error.
+- `test_rockchip_runtime_line_count`: assert `ops_rockchip.py` remains under 500 lines after the refactor lands.
+
+These tests should not open `/dev/dri/card1`. Put hardware-open tests behind existing Rockchip env behavior.
+
+## Suggested Hardware Tests
+
+Hardware tests should preserve the current pass/fail reality instead of inventing new coverage first.
+
+- Smoke:
+  - `ROCKCHIP=1 FORWARD_ONLY=1 python3 test/test_rockchip.py TestOps.test_tiny_add`
+  - `ROCKCHIP=1 FORWARD_ONLY=1 python3 test/test_rockchip.py TestOps.test_tiny_mul`
+- Elementwise:
+  - add, sub, scalar mul, where, relu, exp2, silu, comparison tests that currently pass.
+- Matrix:
+  - fused matmul cases with and without `ROCKCHIP_VERIFY_WMMA=1`.
+- Conv:
+  - current conv1x1 cases, with `ROCKCHIP_NATIVE_CONV=1`.
+- Debug:
+  - run one program with template dump enabled and verify the dump can be disassembled without submitting again.
 
 ## Risk Register
 
