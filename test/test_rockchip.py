@@ -4,10 +4,9 @@ import torch
 
 if os.getenv("ROCKCHIP") == "1" and "DEV" not in os.environ: os.environ["DEV"] = "ROCKCHIP"
 
-from tinygrad.helpers import getenv, DEBUG, CI
+from tinygrad.helpers import getenv, CI, DEBUG, DEV
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
-from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops
 
 if getenv("TINY_BACKEND"):
@@ -119,7 +118,7 @@ class TestOps(unittest.TestCase):
     self.assertTrue(used or fallback)
 
   def helper_test_exception(self, shps, torch_fxn, tinygrad_fxn=None, expected=None, forward_only=False, exact=False, vals=None, low=-1.5, high=1.5):
-    if getenv("MOCKGPU") and Device.DEFAULT == "NV": self.skipTest('helper_test_exception fails in CI CUDA')
+    if DEV.interface.startswith("MOCK") and Device.DEFAULT == "NV": self.skipTest('helper_test_exception fails in CI CUDA')
     ts, tst = prepare_test_op(low, high, shps, vals, forward_only)
     if tinygrad_fxn is None:
       tinygrad_fxn = torch_fxn
