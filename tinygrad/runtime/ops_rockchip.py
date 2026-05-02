@@ -21,7 +21,9 @@ def _rk_env(name:str, default:int) -> int:
 
 class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
+    prg = pickle.loads(lib)
+    self.ew_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "elementwise" else None
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None else prg
     self.device = dev
     self.q = []
     self.hardware_ops = {Ops.WMMA:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
@@ -165,46 +167,8 @@ class RockchipProgram:
       if self.fused_matmul_meta["c_dt"] == 0: c_block[:] = out_matrix.astype(np.float16).reshape(-1)
       else: c_block[:] = out_matrix.reshape(-1)
 
-  def _flat_elementwise_op(self):
-    params = [(i,dtype) for i,(op,dtype,_,_) in enumerate(self.uops) if op is Ops.PARAM]
-    if len(params) != 3 or any(not isinstance(dtype, PtrDType) or dtype.base.scalar() is not dtypes.half for _,dtype in params): return None
-    size = params[0][1].size
-    if any(dtype.size != size for _,dtype in params): return None
-
-    def load_info(x:int):
-      op,_,srcs,arg = self.uops[x]
-      if op is Ops.GEP:
-        ret = load_info(srcs[0])
-        return None if ret is None else (*ret[:2], arg)
-      if op is Ops.LOAD:
-        idx = srcs[0]
-        if self.uops[idx][0] is Ops.CAST: idx = self.uops[idx][2][0]
-        if self.uops[idx][0] is not Ops.INDEX: return None
-        p,off = self.uops[idx][2][:2]
-        return (p, off, None)
-      return None
-
-    flat_op = None
-    for i,(op,dtype,srcs,_) in enumerate(self.uops):
-      if op is not Ops.STORE: continue
-      dst = srcs[0]
-      if self.uops[dst][0] is Ops.CAST: dst = self.uops[dst][2][0]
-      if self.uops[dst][0] is not Ops.INDEX or self.uops[dst][2][0] != params[0][0]: return None
-      dst_off = self.uops[dst][2][1]
-      vals = self.uops[srcs[1]][2] if self.uops[srcs[1]][0] is Ops.STACK else [srcs[1]]
-      for j,v in enumerate(vals):
-        vop,vdtype,vsrcs,_ = self.uops[v]
-        if vop not in self.hardware_ops or vdtype.scalar() is not dtypes.half or len(vsrcs) != 2: return None
-        if flat_op is None: flat_op = vop
-        if flat_op is not vop: return None
-        lhs, rhs = load_info(vsrcs[0]), load_info(vsrcs[1])
-        if lhs is None or rhs is None or lhs[0] != params[1][0] or rhs[0] != params[2][0]: return None
-        if lhs[1] != dst_off or rhs[1] != dst_off or lhs[2] != rhs[2]: return None
-        if lhs[2] is not None and lhs[2] != (j,): return None
-    return (flat_op, size) if flat_op is not None else None
-
-  def _run_flat_elementwise(self, op, size:int, bufs:tuple[Any, ...]) -> None:
-    src, src2 = memoryview(bufs[1])[:size*2], memoryview(bufs[2])[:size*2]
+  def _run_elementwise(self, op, size:int, out_slot:int, lhs_slot:int, rhs_slot:int, bufs:tuple[Any, ...]) -> None:
+    src, src2 = memoryview(bufs[lhs_slot])[:size*2], memoryview(bufs[rhs_slot])[:size*2]
     self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
     self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
     self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
@@ -227,7 +191,7 @@ class RockchipProgram:
                   rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
       self.submit(op)
       self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      ctypes.memmove(mv_address(memoryview(bufs[0])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
+      ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
 
@@ -669,6 +633,10 @@ class RockchipProgram:
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
     st = time.perf_counter()
+    if self.ew_meta is not None:
+      op, size, out_slot, lhs_slot, rhs_slot = self.ew_meta
+      self._run_elementwise(op, size, out_slot, lhs_slot, rhs_slot, bufs)
+      return time.perf_counter() - st
     if self.fused_matmul_meta is not None:
       try:
         self._run_fused_matmul(bufs)
@@ -677,9 +645,6 @@ class RockchipProgram:
       except Exception as e:
         reason = str(e)
         self.fused_matmul_fallbacks += 1
-    if (flat_op:=self._flat_elementwise_op()) is not None:
-      self._run_flat_elementwise(flat_op[0], flat_op[1], bufs)
-      return time.perf_counter() - st
 
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -955,6 +920,7 @@ class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
   has_threads = False
   tensor_cores = tc.rockchip
+  hardware_ops = {Ops.MUL, Ops.MAX, Ops.ADD, Ops.SUB}
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL, Ops.CMPNE]} | {Ops.FDIV: 0}
   # hacks, turned unsupported dtype to half and lut function to Ops.CUSTOM
   def _rk_trunc_fix(x):
@@ -1020,7 +986,41 @@ class RockchipRenderer(Renderer):
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
+  def _elementwise_meta(self, uops:list[UOp]):
+    params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
+    if len(params) != 3 or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
+    size = params[0][1].dtype.size
+    if any(u.dtype.size != size for _,u in params): return None
+
+    def load_info(u:UOp):
+      gep = None
+      if u.op is Ops.GEP:
+        gep, u = u.arg, u.src[0]
+      if u.op is not Ops.LOAD: return None
+      idx = u.src[0]
+      if idx.op is Ops.CAST: idx = idx.src[0]
+      if idx.op is not Ops.INDEX: return None
+      return (uops.index(idx.src[0]), idx.src[1], gep)
+
+    flat_op = None
+    for u in uops:
+      if u.op is not Ops.STORE: continue
+      dst = u.src[0]
+      if dst.op is Ops.CAST: dst = dst.src[0]
+      if dst.op is not Ops.INDEX or uops.index(dst.src[0]) != params[0][0]: return None
+      vals = u.src[1].src if u.src[1].op is Ops.STACK else (u.src[1],)
+      for j,v in enumerate(vals):
+        if v.op not in self.hardware_ops or v.dtype.scalar() is not dtypes.half or len(v.src) != 2: return None
+        if flat_op is None: flat_op = v.op
+        if flat_op is not v.op: return None
+        lhs, rhs = load_info(v.src[0]), load_info(v.src[1])
+        if lhs is None or rhs is None or lhs[0] != params[1][0] or rhs[0] != params[2][0]: return None
+        if lhs[1] is not dst.src[1] or rhs[1] is not dst.src[1] or lhs[2] != rhs[2]: return None
+        if lhs[2] is not None and lhs[2] != (j,): return None
+    return (flat_op, size, 0, 1, 2) if flat_op is not None else None
+
   def render(self, uops:list[UOp]) -> str:
+    if (ew_meta:=self._elementwise_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("elementwise", *ew_meta))).decode()
     # the value of SPECIAL comes from local/global_size, not form its source
     uop_to_idx = {u:i for i,u in enumerate(uops)}
     lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
