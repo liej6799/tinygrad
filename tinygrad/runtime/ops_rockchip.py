@@ -2,18 +2,18 @@
 # a python uops emulator
 # works to test the tensor cores, and all the uops in general
 # this is the (living) definition of uops
-from typing import Any, TYPE_CHECKING, cast
-import pickle, base64, itertools, time, struct, sys, functools, array, ctypes, mmap, os, math, numpy as np
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_to_fp16, float_to_bf16, float_to_fp8, fp8_to_float
+from typing import Any, TYPE_CHECKING
+import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, numpy as np
+from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate
 from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, DEBUG
 from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, bitcast
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
+from tinygrad.runtime.ops_python import storage_fmt_for_dtype, load, _store, generic_wmma_helper
 
 def _rk_env(name:str, default:int) -> int:
   try: return int(os.getenv(name, str(default)))
@@ -165,6 +165,72 @@ class RockchipProgram:
       if self.fused_matmul_meta["c_dt"] == 0: c_block[:] = out_matrix.astype(np.float16).reshape(-1)
       else: c_block[:] = out_matrix.reshape(-1)
 
+  def _flat_elementwise_op(self):
+    params = [(i,dtype) for i,(op,dtype,_,_) in enumerate(self.uops) if op is Ops.PARAM]
+    if len(params) != 3 or any(not isinstance(dtype, PtrDType) or dtype.base.scalar() is not dtypes.half for _,dtype in params): return None
+    size = params[0][1].size
+    if any(dtype.size != size for _,dtype in params): return None
+
+    def load_info(x:int):
+      op,_,srcs,arg = self.uops[x]
+      if op is Ops.GEP:
+        ret = load_info(srcs[0])
+        return None if ret is None else (*ret[:2], arg)
+      if op is Ops.LOAD:
+        idx = srcs[0]
+        if self.uops[idx][0] is Ops.CAST: idx = self.uops[idx][2][0]
+        if self.uops[idx][0] is not Ops.INDEX: return None
+        p,off = self.uops[idx][2][:2]
+        return (p, off, None)
+      return None
+
+    flat_op = None
+    for i,(op,dtype,srcs,_) in enumerate(self.uops):
+      if op is not Ops.STORE: continue
+      dst = srcs[0]
+      if self.uops[dst][0] is Ops.CAST: dst = self.uops[dst][2][0]
+      if self.uops[dst][0] is not Ops.INDEX or self.uops[dst][2][0] != params[0][0]: return None
+      dst_off = self.uops[dst][2][1]
+      vals = self.uops[srcs[1]][2] if self.uops[srcs[1]][0] is Ops.STACK else [srcs[1]]
+      for j,v in enumerate(vals):
+        vop,vdtype,vsrcs,_ = self.uops[v]
+        if vop not in self.hardware_ops or vdtype.scalar() is not dtypes.half or len(vsrcs) != 2: return None
+        if flat_op is None: flat_op = vop
+        if flat_op is not vop: return None
+        lhs, rhs = load_info(vsrcs[0]), load_info(vsrcs[1])
+        if lhs is None or rhs is None or lhs[0] != params[1][0] or rhs[0] != params[2][0]: return None
+        if lhs[1] != dst_off or rhs[1] != dst_off or lhs[2] != rhs[2]: return None
+        if lhs[2] is not None and lhs[2] != (j,): return None
+    return (flat_op, size) if flat_op is not None else None
+
+  def _run_flat_elementwise(self, op, size:int, bufs:tuple[Any, ...]) -> None:
+    src, src2 = memoryview(bufs[1])[:size*2], memoryview(bufs[2])[:size*2]
+    self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+    self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
+    self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
+    self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
+    self.output_buf = self.device._gpu_alloc(src.nbytes, 0, name="output")
+    try:
+      ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+      ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+      self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.q, self.lut_enable = [], False
+      self.boilerplate(op=op, size=size, arg=None)
+      self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+        self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+        self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
+                  rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+        self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
+                  rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+      self.submit(op)
+      self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      ctypes.memmove(mv_address(memoryview(bufs[0])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
+    finally:
+      self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
+
   def check_lut_enable(self, op, arg):
     return op in (Ops.EXP2, Ops.TRUNC) or (op is Ops.CUSTOM and arg == "silu")
   def reg(self, val, shift, mask):
@@ -244,7 +310,7 @@ class RockchipProgram:
         x_min, x_max = -2.0, 2.0
         step = (x_max - x_min) / (len(lut) - 1)
         index_scale = (1 << index_shift) / step
-        
+
         max_val = max(math.exp2(x_min), math.exp2(x_max))
         self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
         for i in range(len(lut)):
@@ -261,7 +327,7 @@ class RockchipProgram:
         self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
         for i in range(self.lut_size * 2):
           x = (i - self.lut_size + (i < self.lut_size)) * step
-          y = x / (1.0 + math.exp(-x)) * self.inv_scale 
+          y = x / (1.0 + math.exp(-x)) * self.inv_scale
           q = int(math.floor(y * (2**15 - 1) + 0.5)) if y >= 0.0 else int(math.ceil(y * (2**15 - 1) - 0.5))
           lut[i] = np.clip(q, -32768, 32767)
       elif op is Ops.TRUNC:
@@ -502,9 +568,9 @@ class RockchipProgram:
     ew_alu_algo = self.hardware_ops.get(op, 0)
     ew_op_src = 1
     erdma_data_size_16bit=2
-    if self.lut_enable: 
-      ew_data_mode = 0; ew_data_size = 0; ew_op_src = 0; 
-    
+    if self.lut_enable:
+      ew_data_mode = 0; ew_data_size = 0; ew_op_src = 0
+
     self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
         self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
         self.reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
@@ -551,7 +617,7 @@ class RockchipProgram:
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
     if uop not in (Ops.FDIV, Ops.WMMA):
       # EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN(1) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE(1));
-      self.q.append(0x2001000178495044), 
+      self.q.append(0x2001000178495044),
     # self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12))
     self.q.append(0x00810000000d0008 if uop is Ops.WMMA else 0x0081000000180008)
     tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
@@ -600,7 +666,7 @@ class RockchipProgram:
     if uop is Ops.WMMA and DEBUG >= 7:
       os.system("cd ~/npu/ops_reg/ && python dump.py 5 > /tmp/tinygrad_output")
 
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
     st = time.perf_counter()
     if self.fused_matmul_meta is not None:
@@ -611,27 +677,15 @@ class RockchipProgram:
       except Exception as e:
         reason = str(e)
         self.fused_matmul_fallbacks += 1
+    if (flat_op:=self._flat_elementwise_op()) is not None:
+      self._run_flat_elementwise(flat_op[0], flat_op[1], bufs)
+      return time.perf_counter() - st
 
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
     void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
     loop_ends: dict[int, int] = {srcs[1]:i for i, (uop, _, srcs, _) in enumerate(self.uops) if uop == Ops.END}
-    warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
-    warp_size = len(warp)
-    has_control_flow = any(op in (Ops.RANGE, Ops.IF, Ops.ENDIF) for op,_,_,_ in self.uops)
-    vectorize_global = False
-    global_iters = itertools.product(*[range(x) for x in global_size[::-1]])
-    # why has_control_flow
-    if not has_control_flow and all(x == 1 for x in local_size):
-      total_elems = math.prod(global_size)
-      # why 16384
-      if 1 < total_elems <= 16384:
-        warp = list(itertools.product(*[range(x) for x in global_size[::-1]]))
-        warp_size = len(warp)
-        global_iters = [tuple(0 for _ in global_size)]
-        vectorize_global = True
-
-    for idxs in global_iters:
+    for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
       values: dict[int, Any] = {}
       pbufs: list[memoryview] = list(bufs)
       pvals: list[int] = list(vals)
@@ -673,8 +727,8 @@ class RockchipProgram:
         elif uop is Ops.DEFINE_VAR:
           values[i] = [pvals.pop(0)] * warp_size
         elif uop is Ops.SPECIAL:
-          if arg[0] == 'g': values[i] = values[i] = [x[2-int(arg[-1])] for x in warp] if vectorize_global else [idxs[2-int(arg[-1])]] * warp_size
-          elif arg[0] == 'l': values[i] = values[i] = [0] * warp_size if vectorize_global else [x[2-int(arg[-1])] for x in warp]
+          if arg[0] == 'g': values[i] = [idxs[2-int(arg[-1])]] * warp_size
+          elif arg[0] == 'l': values[i] = [x[2-int(arg[-1])] for x in warp]
         elif uop is Ops.CONST: values[i] = [arg] * warp_size
         elif uop is Ops.INDEX:
           ret:list = []
@@ -697,37 +751,22 @@ class RockchipProgram:
             i = loop_ends[i] + 1
             continue
         elif uop is Ops.STACK: values[i] = src_values
-        elif uop is Ops.BITCAST:
-          packed = struct.pack(str(warp_size) + storage_fmt_for_dtype(src_dtypes[0].scalar()),
-                               *[to_storage_scalar(x, src_dtypes[0].scalar()) for x in src_values[0]])
-          values[i] = list(struct.unpack(str(warp_size) +  storage_fmt_for_dtype(dtype.scalar()), packed))
-          values[i] = [from_storage_scalar(x, dtype.scalar()) for x in values[i]]
+        elif uop is Ops.BITCAST: values[i] = [bitcast(x, src_dtypes[0], dtype) for x in src_values[0]]
         elif uop is Ops.CAST:
-          values[i] = [truncate.get(dtype, lambda dt: dt)(dtypes.as_const(x, dtype)) for x in src_values[0]]
+          values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
         elif uop is Ops.LOAD:
           if dtype.count > 1:
             values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
                                for i in range(len(src_values))], j, dtype.scalar()) for j in range(dtype.count)]
           else:
             values[i] = load(src_values, 0, dtype)
-        elif uop is Ops.GEP:
-          v = src_values[0][get_single_element(arg)]
-          values[i] = v if isinstance(v, (list, tuple)) else [v]
-        # elif uop is Ops.WMMA:
+        elif uop is Ops.GEP: values[i] = src_values[0][get_single_element(arg)]
         elif uop is Ops.WMMA and False:
           first_src_dtype = self.uops[srcs[0]][1]
           assert isinstance(first_src_dtype, DType) # mypy
           dims, dtype_in, device, threads = arg[1], first_src_dtype.scalar(), arg[4], arg[5]
           wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
           # TODO: refactor these to a shared TensorCoreLayout
-          # if device == "ROCKCHIP":
-          #   if threads == 1 and dims == (2,2,1):
-          #     def a_elem(x, _k, row, goff): return x[row][goff]
-          #     def b_elem(x, col, _k, goff): return x[col][goff]
-          #     def c_map(_lane, elem): return (elem%2, elem//2)
-          #     values[i] = wmma_helper(1, 1, 2, 4, 4, a_elem, b_elem, c_map)
-          #     i += 1
-          #     continue
           if device == "METAL":
             # A (2 elements on 32 threads): row major
             def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
@@ -794,12 +833,12 @@ class RockchipProgram:
         elif uop in [Ops.CUSTOM, Ops.WMMA] or uop in GroupOp.ALU:
           if uop is not Ops.WMMA: assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE, Ops.WMMA}, f"dtype mismatch on {uop}"
-          # Ops.CMPLT seperated out for dtype 
+          # Ops.CMPLT seperated out for dtype
           if uop in [Ops.CMPLT, Ops.WMMA] or (uop in self.hardware_ops and dtype.scalar() in [dtypes.float16]):
             self.device.reset_npu()
             self.q = []
             self.lut_enable = self.check_lut_enable(uop, arg)
-            if len(src_values)==1: 
+            if len(src_values)==1:
               if uop is Ops.NEG:
                 src_values.append([-1]*len(src_values[0]))
                 uop = Ops.MUL
@@ -973,7 +1012,7 @@ class RockchipRenderer(Renderer):
         Ops.SUB,
         x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
       ).cast(dtypes.bool)),
-    # ax + b(1-x) 
+    # ax + b(1-x)
     (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
