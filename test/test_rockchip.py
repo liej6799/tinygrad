@@ -4,7 +4,7 @@ import torch
 
 if os.getenv("ROCKCHIP") == "1" and "DEV" not in os.environ: os.environ["DEV"] = "ROCKCHIP"
 
-from tinygrad.helpers import getenv, CI, DEBUG, DEV
+from tinygrad.helpers import getenv, CI, DEBUG, DEV, IMAGE
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.uop.ops import Ops
@@ -320,6 +320,337 @@ class TestOps(unittest.TestCase):
 
 
 
+
+  def test_sd_big_conv(self):
+    helper_test_op([(1,256,64,64), (512,256,3,3)],
+                    lambda x,w: torch.nn.functional.conv2d(x, w),
+                    lambda x,w: x.conv2d(w), atol=1e-3)
+
+  @unittest.skip("slow")
+  def test_large_bs_conv(self):
+    helper_test_op([(4096,3,3,3), (1,3,3,3)],
+                    lambda x,w: torch.nn.functional.conv2d(x, w),
+                    lambda x,w: x.conv2d(w), atol=1e-3)
+
+  @unittest.skip("slow")
+  def test_large_ic_conv(self):
+    helper_test_op([(1,2048,3,3), (1,2048,3,3)],
+                    lambda x,w: torch.nn.functional.conv2d(x, w),
+                    lambda x,w: x.conv2d(w))
+
+  def test_biased_conv2d(self):
+    C = 8
+    helper_test_op([(1,C,5,5), (C,C,1,1), (C,)],
+      lambda x,w,b: torch.nn.functional.conv2d(torch.nn.functional.conv2d(x,w,b).relu(),w,b),
+      lambda x,w,b: Tensor.conv2d(x,w,b).relu().conv2d(w,b))
+
+  def test_simple_conv2d(self):
+    helper_test_op([(1,4,9,9), (4,4,3,3)],
+      lambda x,w: torch.nn.functional.conv2d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), grad_rtol=1e-5)
+
+  def test_simple_conv2d_bias(self):
+    helper_test_op([(1,4,9,9), (4,4,3,3), (4,)],
+      lambda x,w,b: torch.nn.functional.conv2d(x,w,b),
+      lambda x,w,b: Tensor.conv2d(x,w,b), grad_rtol=1e-5)
+
+  @slow_test
+  @unittest.skipIf(IMAGE>0, "no conv3d on images")
+  def test_simple_conv3d(self):
+    helper_test_op([(1,4,9,9,9), (4,4,3,3,3)],
+      lambda x,w: torch.nn.functional.conv3d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), grad_rtol=1e-5)
+
+  @slow_test
+  @unittest.skipIf(IMAGE>0, "no conv3d on images")
+  def test_padded_conv3d(self):
+    helper_test_op([(1,4,5,5,5), (4,4,3,3,3)],
+      lambda x,w: torch.nn.functional.conv3d(x,w,padding=1),
+      lambda x,w: Tensor.conv2d(x,w,padding=[1,1,1,1,1,1]), grad_rtol=1e-5)
+
+  def test_simple_conv2d_m4(self):
+    helper_test_op([(1,16,9,9), (16,16,3,3)],
+      lambda x,w: torch.nn.functional.conv2d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), atol=1e-05, grad_rtol=1e-5)
+
+  def test_simple_conv2d_1x1(self):
+    helper_test_op([(1,4,9,9), (4,4,1,1)],
+      lambda x,w: torch.nn.functional.conv2d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), grad_rtol=1e-5)
+
+  def test_simple_conv2d_1x1_m4(self):
+    helper_test_op([(1,16,32,32), (16,16,1,1)],
+      lambda x,w: torch.nn.functional.conv2d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), grad_rtol=1e-5)
+
+  @slow_test
+  def test_nested_conv2d(self):
+    helper_test_op([(1,32,9,9), (32,32,3,3), (32,32,3,3)],
+      lambda x,w1,w2: torch.nn.functional.conv2d(torch.nn.functional.conv2d(x,w1).relu(), w2),
+      lambda x,w1,w2: x.conv2d(w1).relu().conv2d(w2))
+
+  def test_simple_conv2d_nhwc(self):
+    helper_test_op([(2,9,9,10), (3,3,10,20)],
+      lambda x,w: torch.nn.functional.conv2d(x.permute(0,3,1,2),w.permute(3,2,0,1)),
+      lambda x,w: Tensor.conv2d(x.permute(0,3,1,2),w.permute(3,2,0,1)), atol=1e-5, grad_rtol=1e-5)
+
+  def test_simple_conv2d_batched(self):
+    helper_test_op([(2,4,9,9), (4,4,3,3)],
+      lambda x,w: torch.nn.functional.conv2d(x,w),
+      lambda x,w: Tensor.conv2d(x,w), grad_rtol=1e-5)
+
+  def test_simple_conv_transpose2d(self):
+    helper_test_op([(2,4,9,9), (4,4,3,3)],
+      lambda x,w: torch.nn.functional.conv_transpose2d(x,w),
+      lambda x,w: Tensor.conv_transpose2d(x,w), grad_rtol=1e-5)
+
+  def test_bias_conv_transpose2d(self):
+    helper_test_op([(2,4,9,9), (4,4,3,3), (4,)],
+      lambda x,w,b: torch.nn.functional.conv_transpose2d(x,w,b),
+      lambda x,w,b: Tensor.conv_transpose2d(x,w,b), grad_rtol=1e-5)
+
+  def test_grouped_conv_transpose2d(self):
+    helper_test_op([(2,4,9,9), (4,4,3,3)],
+      lambda x,w: torch.nn.functional.conv_transpose2d(x,w,groups=2),
+      lambda x,w: Tensor.conv_transpose2d(x,w,groups=2), grad_rtol=1e-5)
+
+  @slow_test
+  def test_padded_conv_transpose2d(self):
+    for padding in [(1,2), (2,1), 2, 1, 0]:
+      helper_test_op([(2,4,9,9), (4,4,3,3)],
+        lambda x,w: torch.nn.functional.conv_transpose2d(x,w,padding=padding),
+        lambda x,w: Tensor.conv_transpose2d(x,w,padding=padding), grad_rtol=1e-5)
+    self.helper_test_exception([(2,16,2,2), (32,16,3,3)], lambda x,w: torch.nn.functional.conv_transpose2d(x,w,padding=(1,1,1)),
+                   lambda x,w: Tensor.conv_transpose2d(x,w,padding=(1,1,1)), expected=(RuntimeError, ValueError))
+
+  @slow_test
+  def test_dilated_conv_transpose2d(self):
+    for dilation in [(1,2), (2,1), 2, 1]:
+      helper_test_op([(2,4,9,9), (4,4,3,3)],
+        lambda x,w: torch.nn.functional.conv_transpose2d(x,w,dilation=dilation),
+        lambda x,w: Tensor.conv_transpose2d(x,w,dilation=dilation), grad_rtol=1e-5)
+
+  def test_strided_conv_transpose2d(self):
+    for stride in [(2,1), (1,2), 1]:
+      helper_test_op([(2,4,4,5), (4,4,3,3)],
+        lambda x,w: torch.nn.functional.conv_transpose2d(x,w, stride=stride),
+        lambda x,w: Tensor.conv_transpose2d(x,w,stride=stride), atol=1e-5, grad_rtol=1e-5)
+
+  @slow_test
+  def test_output_padded_conv_transpose2d(self):
+    for output_padding, stride in [((1,1), (2,3)), ((2,1), (3,2))]:
+      helper_test_op([(2,4,6,5), (4,4,3,3),(4,)],
+        lambda x,w,b: torch.nn.functional.conv_transpose2d(x,w,b,output_padding=output_padding,stride=stride),
+        lambda x,w,b: Tensor.conv_transpose2d(x,w,b,output_padding=output_padding,stride=stride), grad_rtol=1e-5)
+
+  @slow_test
+  @unittest.skipIf(IMAGE>0, "no conv3d on images")
+  def test_simple_conv_transpose3d(self):
+    helper_test_op([(2,4,9,9,9), (4,4,3,3,3)],
+      lambda x,w: torch.nn.functional.conv_transpose3d(x,w),
+      lambda x,w: Tensor.conv_transpose2d(x,w), grad_rtol=1e-5)
+
+  @unittest.skipIf((IMAGE>0), "no conv1d on images")
+  def test_conv1d(self):
+    for bs in [1,8]:
+      for cin in [1,3]:
+        for H in [1,2,5]:
+          for groups in [1,3] if cin == 3 and H == 5 else [1]:
+            with self.subTest(batch_size=bs, channels=cin, groups=groups, height=H):
+              helper_test_op([(bs,cin,11), (6,cin//groups,H)],
+                lambda x,w: torch.nn.functional.conv1d(x,w,groups=groups),
+                lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  @unittest.skipIf(IMAGE>0, "no conv1d on images")
+  def test_simple_padding_conv1d(self):
+    bs = 6
+    cin = 2
+    groups = 1
+    H = 5
+    p = (1,1)
+    helper_test_op([(bs,cin,11), (6,cin//groups,H)],
+      lambda x,w: torch.nn.functional.conv1d(torch.nn.functional.pad(x, p),w),
+      lambda x,w: Tensor.conv2d(x,w,padding=p))
+
+  @unittest.skipIf(IMAGE>0, "no conv1d on images")
+  def test_strided_conv1d_simple(self):
+    bs, H = 2, 3
+    helper_test_op([(bs,1,5), (1,1,H)],
+      lambda x,w: torch.nn.functional.conv1d(x,w,stride=2),
+      lambda x,w: Tensor.conv2d(x,w,stride=2))
+
+  @unittest.skipIf(IMAGE>0, "no conv1d on images")
+  def test_asymmetric_padding_conv1d(self):
+    for p in [(0,1), (2,1), (2,0)]:
+      with self.subTest(p):
+        for n in [3,4]:
+          for k in [2]:
+            helper_test_op([(1,1,n), (1,1,k)],
+              lambda x,w: torch.nn.functional.conv1d(torch.nn.functional.pad(x, p),w),
+              lambda x,w: Tensor.conv2d(x,w,padding=p))
+
+  def _test_conv2d(self, bs=1, cin=1, cout=6):
+    for H in [2,3]:
+      for W in [1,3,5]:
+        for groups in [1,3] if cin == 3 and cout == 6 and H == 3 and W == 3 else [1]:
+          with self.subTest(batch_size=bs, channels=cin, groups=groups, height=H, width=W):
+            helper_test_op([(bs,cin,5,7), (cout,cin//groups,H,W)],
+              lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+              lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+  def test_conv2d(self): self._test_conv2d(bs=1, cin=3)
+  @slow_test
+  def test_conv2d_bs_4_cin_3(self): self._test_conv2d(bs=4, cin=3, cout=2)
+  def test_conv2d_bs_1_cin_1(self): self._test_conv2d(bs=1, cin=1)
+  @slow_test
+  def test_conv2d_bs_4_cin_1(self): self._test_conv2d(bs=4, cin=1)
+
+  def test_conv2d_errors(self):
+    self.helper_test_exception([(1,1,6,7), (6,1,3,3)],
+                               lambda x,w:torch.nn.functional.conv2d(x,w,dilation=3),
+                               lambda x,w: Tensor.conv2d(x,w,dilation=3), expected=(RuntimeError, AssertionError))
+    self.helper_test_exception([(2,16,2,2), (32,16,3,3)], lambda x,w:torch.nn.functional.conv2d(x,w), lambda x,w: Tensor.conv2d(x,w),
+                               expected=(RuntimeError, AssertionError))
+    self.helper_test_exception([(2,16,2,2), (32,16,3,3)], lambda x,w:torch.nn.functional.conv2d(x,w,padding=(1,1,1)),
+                               lambda x,w: Tensor.conv2d(x,w,padding=(1,1,1)), expected=(RuntimeError, ValueError))
+
+  @slow_test
+  def test_large_input_conv2d(self):
+    bs = 4
+    cin = 16
+    groups = 1
+    H = 5
+    W = 2
+    helper_test_op([(bs,cin,64,64), (6,cin//groups,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), atol=1e-4, grad_atol=3e-4, grad_rtol=1e-4)
+
+  def test_simple_grouped_conv2d(self):
+    bs = 1
+    groups = 2
+    rcout = 1
+    cin = 2
+    helper_test_op([(bs,groups*cin,1,1), (groups*rcout,cin,1,1)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  def test_medium_grouped_conv2d(self):
+    bs = 1
+    groups = 2
+    rcout = 2
+    cin = 2
+    helper_test_op([(bs,groups*cin,1,1), (groups*rcout,cin,1,1)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  def test_depthwise_conv2d(self):
+    bs = 1
+    groups = 32
+    rcout = 1
+    cin = 1
+    helper_test_op([(bs,groups*cin,32,32), (groups*rcout,cin,1,1)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  def test_grouped_conv2d(self):
+    bs = 4
+    groups = 5
+    rcout = 7
+    cin = 3
+    helper_test_op([(bs,groups*cin,5,5), (groups*rcout,cin,3,3)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  def test_fancy_conv2d(self):
+    bs = 2
+    cin = 3
+    cout = 1
+    groups = 3
+    H,W = 3,3
+    helper_test_op([(bs,cin,11,28), (groups*cout,cin//groups,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,groups=groups),
+      lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
+
+  @slow_test
+  def test_strided_conv2d_simple(self):
+    bs,H,W = 2,3,1
+    helper_test_op([(bs,1,5,1), (1,1,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,stride=2),
+      lambda x,w: Tensor.conv2d(x,w,stride=2))
+
+  @slow_test
+  def test_strided_conv2d(self):
+    bs = 4
+    cin = 3
+    H,W = 3,3
+    with self.subTest(stride := 2):
+      helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+        lambda x,w: torch.nn.functional.conv2d(x,w,stride=2),
+        lambda x,w: Tensor.conv2d(x,w,stride=stride))
+    with self.subTest(stride := (2,1)):
+      helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+        lambda x,w: torch.nn.functional.conv2d(x,w,stride=stride),
+        lambda x,w: Tensor.conv2d(x,w,stride=(2,1)))
+
+  def test_negative_padding_conv2d(self):
+    n,k = 10, 3
+    helper_test_op([(1,1,n,n), (1,1,k,k)],
+      lambda x,w: torch.nn.functional.conv2d(x[:, :, 1:-1, 1:-1],w),
+      lambda x,w: Tensor.conv2d(x,w,padding=-1))
+    helper_test_op([(1,1,n,n), (1,1,k,k)],
+      lambda x,w: torch.nn.functional.conv2d(x[:, :, 1:, 1:],w),
+      lambda x,w: Tensor.conv2d(x,w,padding=(-1,0,-1,0)))
+
+  def test_simple_padding_conv2d(self):
+    p = (1,1,1,1)
+    helper_test_op(None,
+      lambda x,w: torch.nn.functional.conv2d(torch.nn.functional.pad(x, p),w),
+      lambda x,w: Tensor.conv2d(x,w,padding=p), vals=[[[[[2.,3.]]]], [[[[1.]]]]])
+
+  def test_asymmetric_padding_conv2d(self):
+    for p in [(0,1,0,1), (2,1,2,1), (2,0,2,1)]:
+      with self.subTest(p):
+        for n in [3,4]:
+          for k in [2]:
+            helper_test_op([(1,1,n,n), (1,1,k,k)],
+              lambda x,w: torch.nn.functional.conv2d(torch.nn.functional.pad(x, p),w),
+              lambda x,w: Tensor.conv2d(x,w,padding=p))
+            helper_test_op([(1,1,n,n), (1,1,k,k)],
+              lambda x,w: torch.nn.functional.conv2d(torch.nn.functional.pad(x, p),w),
+              lambda x,w: Tensor.conv2d(x,w,padding=p))
+
+  def test_padded_conv2d_p21(self):
+    bs,cin,H,W,padding = 4, 3, 3, 3, (2,1)
+    helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding),
+      lambda x,w: Tensor.conv2d(x,w,padding=padding))
+
+  def test_padded_conv2d_p22(self):
+    bs,cin,H,W,padding = 4, 3, 3, 3, (2,2)
+    helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding),
+      lambda x,w: Tensor.conv2d(x,w,padding=padding))
+
+  def test_padded_conv2d_1x1(self):
+    bs,cin,H,W,padding = 4, 3, 1, 1, 2
+    helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding),
+      lambda x,w: Tensor.conv2d(x,w,padding=padding))
+
+  def test_padded_conv2d_bs1(self):
+    bs,cin,H,W,padding = 1, 3, 3, 3, 1
+    helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+      lambda x,w: torch.nn.functional.conv2d(x,w,padding=padding),
+      lambda x,w: Tensor.conv2d(x,w,padding=padding))
+
+  def test_dilated_conv2d(self):
+    bs = 4
+    cin = 3
+    H,W = 3,3
+    for d in [2, (2,1)]:
+      with self.subTest(dilation := d):
+        helper_test_op([(bs,cin,11,28), (4,cin,H,W)],
+          lambda x,w: torch.nn.functional.conv2d(x,w,dilation=dilation),
+          lambda x,w: Tensor.conv2d(x,w,dilation=dilation))
 
 if __name__ == '__main__':
   np.random.seed(1337)
