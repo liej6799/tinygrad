@@ -167,6 +167,9 @@ class RVVOps(FastEnum):
   # scalar float (F + D)
   FLW = auto(); FLD = auto(); FSW = auto(); FSD = auto()
   FADD_S = auto(); FSUB_S = auto(); FMUL_S = auto(); FDIV_S = auto(); FSQRT_S = auto()
+  FMIN_S = auto(); FMAX_S = auto()
+  # scalar float casts
+  FCVT_W_S = auto(); FCVT_S_W = auto()        # f32 <-> i32 (signed)
   FMV_W_X = auto(); FMV_X_W = auto()
   # ----- RVV -----
   VSETVLI = auto(); VSETIVLI = auto()
@@ -184,10 +187,15 @@ class RVVOps(FastEnum):
   VFDIV_VV = auto(); VFDIV_VF = auto(); VFRDIV_VF = auto()   # vfrdiv: vd = rs1_scalar / vs2
   VFMACC_VV = auto(); VFMACC_VF = auto()  # vd[i] += vs1[i]*vs2[i]
   VFMSAC_VV = auto()
+  VFMIN_VV = auto(); VFMAX_VV = auto()
+  VFSQRT_V = auto()
+  # vector casts (VFUNARY0 sub-ops via vs1 field)
+  VFCVT_X_F_V = auto()    # f32 -> i32 (truncate, rtz)
+  VFCVT_F_X_V = auto()    # i32 -> f32 (signed)
   # vector moves / broadcasts
   VMV_V_V = auto(); VMV_V_X = auto(); VMV_V_I = auto(); VMV_V_F = auto()
   # reduction (single-pass) — §14
-  VFREDOSUM_VS = auto(); VFREDUSUM_VS = auto()
+  VFREDOSUM_VS = auto(); VFREDUSUM_VS = auto(); VFREDMAX_VS = auto(); VFREDMIN_VS = auto()
   # scalar-from-vector move (vfmv.f.s — §16.2)
   VFMV_F_S = auto(); VFMV_S_F = auto()
   # pseudo lane extract: vfmv.f.s for lane0; vslidedown.vi v31, v, lane + vfmv.f.s for lane>0.
@@ -254,6 +262,15 @@ def _revec(expr:UOp, i:int, vec_dt:DType) -> UOp|None:
     # At least one side must be a vector for the result to be vector
     if a.dtype.count == 1 and b.dtype.count == 1: return None
     return expr.replace(dtype=vec_dt, src=(a, b))
+  # Unary ops over vectors: SQRT, CAST (only the f32<->i32 case here).
+  if expr.op is Ops.SQRT and len(expr.src) == 1:
+    a = _revec(expr.src[0], i, vec_dt)
+    if a is None or a.dtype.count == 1: return None
+    return expr.replace(dtype=vec_dt, src=(a,))
+  if expr.op is Ops.CAST and len(expr.src) == 1:
+    a = _revec(expr.src[0], i, expr.src[0].dtype.scalar().vec(vec_dt.count))
+    if a is None or a.dtype.count == 1: return None
+    return expr.replace(dtype=vec_dt, src=(a,))
   return None
 
 def _all_nested(stack:UOp) -> UOp|None:
@@ -314,6 +331,25 @@ def _broadcast_f32_to_vec(c:UOp, vec_dt:DType) -> UOp:
   """Emit a vector broadcast of a scalar float CONST. Chain ends in VMV_V_F INS of the vector dtype."""
   return UOp(Ops.INS, vec_dt, (_f32_const_to_freg(c),), RVVOps.VMV_V_F)
 
+def _is_single_use(ctx:IselContext, parent:UOp, src:UOp) -> bool:
+  """True if src is used exactly once (as a src of parent)."""
+  return len(ctx.uses[src]) == parent.src.count(src) == 1
+
+def _emit_vfmacc(ctx:IselContext, x:UOp) -> UOp|None:
+  """Detect ADD(MUL(a,b), c) (or symmetric) on vec f32 where all of a/b/c are vectors,
+  and fuse into vfmacc.vv. Semantics: vfmacc.vv vd, vs1, vs2  =>  vd[i] = vs1[i]*vs2[i] + vd[i].
+  Skips when any operand is a scalar CONST (would need vfmacc.vf, not yet implemented)."""
+  if x.dtype.count <= 1 or x.dtype.scalar() is not dtypes.float32: return None
+  for mul_idx in (0, 1):
+    mul = x.src[mul_idx]
+    other = x.src[1 - mul_idx]
+    if mul.op is not Ops.MUL or mul.dtype != x.dtype or len(mul.src) != 2: continue
+    # All three operands must already be vectors (not scalar CONSTs)
+    if any(s.dtype.count != x.dtype.count for s in (mul.src[0], mul.src[1], other)): continue
+    if not _is_single_use(ctx, x, mul): continue
+    return x.ins(RVVOps.VFMACC_VV, src=(other, mul.src[0], mul.src[1]))
+  return None
+
 def _collect_reduction_geps(expr:UOp) -> list[UOp]|None:
   """Walk a scalar ADD-tree, collecting all GEP leaves. Returns the list or None if the tree
   isn't a pure ADD-over-GEPs."""
@@ -326,15 +362,17 @@ def _collect_reduction_geps(expr:UOp) -> list[UOp]|None:
   return None
 
 def _detect_reduction(expr:UOp) -> UOp|None:
-  """If expr is `sum(GEP(v, i) for i in range(v.dtype.count))` (ADD-tree over all lanes of one
-  vector), emit a vfredusum chain and return the scalar VFMV_F_S extraction INS UOp."""
+  """If expr is `sum(GEP(v, i) for i in range(v.dtype.count))` (ADD-tree over ALL lanes of one
+  vector AND nothing else), emit a vfredusum chain. The strictness ensures we don't fire on
+  partial subtrees during a larger reduction (which would create a malformed graph mixing
+  vfredusum with the per-lane FADD_S chain that's already in place)."""
   geps = _collect_reduction_geps(expr)
-  if geps is None or len(geps) < 2: return None
+  if geps is None: return None
   vec = geps[0].src[0]
-  if not all(g.src[0] is vec for g in geps): return None
   if vec.dtype.count <= 1: return None
-  indices = sorted(g.arg[0] for g in geps)
-  if indices != list(range(vec.dtype.count)): return None
+  if len(geps) != vec.dtype.count: return None         # must cover EVERY lane
+  if not all(g.src[0] is vec for g in geps): return None
+  if sorted(g.arg[0] for g in geps) != list(range(vec.dtype.count)): return None
   # Emit: vmv.v.i v_init, 0 ; vfredusum.vs v_red, vec, v_init ; vfmv.f.s fd, v_red
   v_init = UOp(Ops.INS, vec.dtype, (UOp.const(dtypes.int32, 0).rtag(),), RVVOps.VMV_V_I)
   v_red  = UOp(Ops.INS, vec.dtype, (vec, v_init), RVVOps.VFREDUSUM_VS)
@@ -368,12 +406,14 @@ def _resolve_addr(a:UOp) -> UOp:
   scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, 2).rtag()), RVVOps.SLLI)
   return UOp(Ops.INS, dtypes.uint64, (ptr, scaled), RVVOps.ADD)
 
-def _scalar_mem_addr(base:UOp, idx:UOp) -> tuple[UOp, UOp]:
-  """Return (base_reg, imm_off) for scalar f32 memory ops. Static indices use FLW/FSW's
-  immediate field; dynamic element indices are converted to byte addresses with SLLI+ADD
-  and then use immediate 0."""
-  if idx.op is Ops.CONST: return base, UOp.const(dtypes.int32, idx.arg * 4).rtag()
-  scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, 2).rtag()), RVVOps.SLLI)
+def _scalar_mem_addr(base:UOp, idx:UOp, itemsize:int=4) -> tuple[UOp, UOp]:
+  """Return (base_reg, imm_off) for a scalar memory op. Static indices use the imm field
+  (with byte scaling); dynamic element indices are converted to byte addresses with SLLI+ADD."""
+  shift_amt = {1:0, 2:1, 4:2, 8:3}[itemsize]
+  if idx.op is Ops.CONST: return base, UOp.const(dtypes.int32, idx.arg * itemsize).rtag()
+  if shift_amt == 0:
+    return UOp(Ops.INS, dtypes.uint64, (base, idx), RVVOps.ADD), UOp.const(dtypes.int32, 0).rtag()
+  scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, shift_amt).rtag()), RVVOps.SLLI)
   return UOp(Ops.INS, dtypes.uint64, (base, scaled), RVVOps.ADD), UOp.const(dtypes.int32, 0).rtag()
 
 def _extract_f32_lane(x:UOp) -> UOp|None:
@@ -414,13 +454,19 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.COPY, dtype=dtypes.ints+(dtypes.bool,), name="x"), lambda x: x.ins(RVVOps.ADDI, src=(x.src[0], imm(dtypes.int32, 0)))),
   (UPat(Ops.COPY, name="x"), lambda x: x.ins(RVVOps.ADDI, src=(x.src[0], imm(dtypes.int32, 0))) if isinstance(x.dtype, PtrDType) else (
      x.ins(RVVOps.VMV_V_V, src=(x.src[0],)) if x.dtype.count > 1 else None)),
-  # Scalar LOAD/STORE for spill/fill on stack: STORE(INDEX(sp, disp), val) -> SD/FSW
+  # Scalar LOAD/STORE: pick width-correct instruction. SD=8B for ptr/i64, SW=4B for i32, FSW=4B float.
   (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))), UPat.var("val")), name="x"),
-   lambda base, disp, val, x: x.ins(RVVOps.SD, src=(val, base, disp)) if val.dtype in dtypes.ints+(dtypes.bool,) or isinstance(val.dtype, PtrDType) else (
-     x.ins(RVVOps.FSW, src=(val, *_scalar_mem_addr(base, disp))) if val.dtype is dtypes.float32 else None)),
+   lambda base, disp, val, x:
+     x.ins(RVVOps.SD, src=(val, *_scalar_mem_addr(base, disp, 8))) if isinstance(val.dtype, PtrDType) or val.dtype in (dtypes.int64, dtypes.uint64) else (
+     x.ins(RVVOps.SW, src=(val, *_scalar_mem_addr(base, disp, 4))) if val.dtype in (dtypes.int32, dtypes.uint32) else (
+     x.ins(RVVOps.SB, src=(val, *_scalar_mem_addr(base, disp, 1))) if val.dtype is dtypes.bool else (
+     x.ins(RVVOps.FSW, src=(val, *_scalar_mem_addr(base, disp, 4))) if val.dtype is dtypes.float32 else None)))),
   (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))),), name="x"),
-   lambda base, disp, x: x.ins(RVVOps.LD, src=(base, disp)) if x.dtype in dtypes.ints+(dtypes.bool,) or isinstance(x.dtype, PtrDType) else (
-     x.ins(RVVOps.FLW, src=_scalar_mem_addr(base, disp)) if x.dtype is dtypes.float32 else None)),
+   lambda base, disp, x:
+     x.ins(RVVOps.LD, src=_scalar_mem_addr(base, disp, 8)) if isinstance(x.dtype, PtrDType) or x.dtype in (dtypes.int64, dtypes.uint64) else (
+     x.ins(RVVOps.LW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype in (dtypes.int32, dtypes.uint32) else (
+     x.ins(RVVOps.LBU, src=_scalar_mem_addr(base, disp, 1)) if x.dtype is dtypes.bool else (
+     x.ins(RVVOps.FLW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype is dtypes.float32 else None)))),
   # small int constant -> ADDI(zero, imm). Larger constants would need LUI+ADDI (not yet).
   (UPat.cvar("x", dtypes.ints+(dtypes.bool,)), lambda x:
    x.ins(RVVOps.ADDI, src=(def_reg(dtypes.uint64, ZERO), imm(x.dtype, x.arg))) if not x.tag and -2048 <= int(x.arg) <= 2047 else None),
@@ -432,12 +478,34 @@ isel_matcher = PatternMatcher([
   # Scalar int ops needed for address arithmetic inside loop bodies.
   (UPat(Ops.SHL, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
    lambda a,c,x: x.ins(RVVOps.SLLI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())) if x.dtype.count == 1 else None),
+  # int ADD with const (e.g. stack-pointer adjustments emitted by regalloc prologue)
+  (UPat(Ops.ADD, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
+   lambda a,c,x: x.ins(RVVOps.ADDI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())) if x.dtype.count == 1 and -2048 <= int(c.arg) <= 2047 else None),
+  # int SUB with const -> ADDI with negated imm
+  (UPat(Ops.SUB, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
+   lambda a,c,x: x.ins(RVVOps.ADDI, src=(a, UOp.const(dtypes.int32, -int(c.arg)).rtag())) if x.dtype.count == 1 and -2047 <= int(c.arg) <= 2048 else None),
   (UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda a,b,x: x.ins(RVVOps.ADD) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
+  (UPat(Ops.SUB, src=(UPat.var("a"), UPat.var("b")), name="x"),
+   lambda a,b,x: x.ins(RVVOps.SUB) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
   (UPat(Ops.MUL, src=(UPat.var("a"), UPat.var("b")), name="x"),
    lambda a,b,x: x.ins(RVVOps.MUL) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
   # Scalar lane extraction from vector values left over after pre-isel (small matmul/reductions).
   (UPat(Ops.GEP, name="x"), lambda x: _extract_f32_lane(x)),
+  # Scalar f32 binary ALU with a CONST operand: load const to an f-reg first.
+  # These must come BEFORE the generic scalar f32 patterns or else they get masked.
+  (UPat(Ops.SUB, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FSUB_S, src=(_f32_const_to_freg(c), v)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.SUB, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FSUB_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.ADD, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FADD_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.ADD, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FADD_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.MUL, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.MUL, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
   # Scalar f32 ALU needed by reductions and small matmul kernels.
   (UPat(Ops.ADD, name="x"), lambda x:
    x.ins(RVVOps.FADD_S) if x.dtype is dtypes.float32 else None),
@@ -447,6 +515,38 @@ isel_matcher = PatternMatcher([
    x.ins(RVVOps.FSUB_S) if x.dtype is dtypes.float32 else None),
   (UPat(Ops.FDIV, name="x"), lambda x:
    x.ins(RVVOps.FDIV_S) if x.dtype is dtypes.float32 else None),
+  # Scalar f32 binary ALU with a CONST operand: load const to an f-reg first.
+  (UPat(Ops.SUB, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FSUB_S, src=(_f32_const_to_freg(c), v)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.SUB, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FSUB_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.ADD, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FADD_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.ADD, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FADD_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.MUL, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.MUL, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  # max via WHERE(CMPLT(a,b), b, a) -> fmax.s ; min via WHERE(CMPLT(a,b), a, b) -> fmin.s
+  (UPat(Ops.WHERE, src=(UPat(Ops.CMPLT, src=(UPat.var("a"), UPat.var("b"))), UPat.var("c"), UPat.var("d")), name="x"),
+   lambda a,b,c,d,x: (x.ins(RVVOps.FMAX_S, src=(a, b)) if (c is b and d is a) else
+                      (x.ins(RVVOps.FMIN_S, src=(a, b)) if (c is a and d is b) else None))
+                     if x.dtype is dtypes.float32 else None),
+  # vec(N) fmax/fmin: vfmax.vv / vfmin.vv (same pattern but on vector dtypes)
+  (UPat(Ops.WHERE, src=(UPat(Ops.CMPLT, src=(UPat.var("a"), UPat.var("b"))), UPat.var("c"), UPat.var("d")), name="x"),
+   lambda a,b,c,d,x: (x.ins(RVVOps.VFMAX_VV, src=(a, b)) if (c is b and d is a) else
+                      (x.ins(RVVOps.VFMIN_VV, src=(a, b)) if (c is a and d is b) else None))
+                     if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None),
+  # scalar sqrt + casts
+  (UPat(Ops.SQRT, name="x"), lambda x:
+   x.ins(RVVOps.FSQRT_S) if x.dtype is dtypes.float32 else
+   (x.ins(RVVOps.VFSQRT_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None)),
+  (UPat(Ops.CAST, name="x"), lambda x:
+   x.ins(RVVOps.FCVT_W_S) if x.dtype is dtypes.int32 and x.src[0].dtype is dtypes.float32 else
+   (x.ins(RVVOps.FCVT_S_W) if x.dtype is dtypes.float32 and x.src[0].dtype is dtypes.int32 else
+    (x.ins(RVVOps.VFCVT_X_F_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.int32 and x.src[0].dtype.scalar() is dtypes.float32 else
+     (x.ins(RVVOps.VFCVT_F_X_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 and x.src[0].dtype.scalar() is dtypes.int32 else None)))),
   # vec(N) LOAD f32 -> VLE32_V. Unwraps NOOP(ptr, idx) to compute the byte address.
   (UPat(Ops.LOAD, src=(UPat.var("a"),), name="x"), lambda a,x:
    x.ins(RVVOps.VLE32_V, src=(_resolve_addr(a),)) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None),
@@ -471,6 +571,8 @@ isel_matcher = PatternMatcher([
    lambda v,c,x: _emit_vf(x, v, c, RVVOps.VFDIV_VF) if x.dtype.count > 1 else None),
   (UPat(Ops.FDIV, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
    lambda v,c,x: _emit_vf(x, v, c, RVVOps.VFRDIV_VF) if x.dtype.count > 1 else None),
+  # vec(N) FMA fusion: ADD(MUL(a,b), c) -> vfmacc.vv (only when MUL is single-use).
+  (UPat(Ops.ADD, name="x"), _emit_vfmacc),
   # vec(N) ADD/MUL/SUB f32 -> .vv (both sources are vectors). vm=1 baked into encoding.
   (UPat(Ops.ADD, name="x"), lambda x:
    x.ins(RVVOps.VFADD_VV) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None),
@@ -515,9 +617,18 @@ def _lower_end(ctx, x:UOp):
   out = UOp(Ops.INS, arg=RVVOps.LABEL, tag=f".LOOP_OUT_{label}")
   return (jal, [inc, jal, out])
 
+def _strip_two_addr(ctx, x:UOp):
+  """For two-address INS ops: strip the first src (= accumulator, coalesced with vd). If regalloc
+  failed to coalesce (vd reg != src[0] reg), prepend a COPY to put src[0] in vd. Mirrors x86.py."""
+  if x.arg not in RVVRenderer.TWO_ADDRESS: return None
+  nx = x.replace(src=x.src[1:])
+  if x.reg != x.src[0].reg: return (nx, [ctx.ren.copy(x.src[0], x.reg), nx])
+  return (nx, [nx])
+
 post_regalloc_matcher = PatternMatcher([
   (UPat(Ops.RANGE, name="x"), _lower_range),
   (UPat(Ops.END, name="x"), _lower_end),
+  (UPat(Ops.INS, name="x"), _strip_two_addr),
 ])
 
 # ***** RVV instruction encoding *****
@@ -597,10 +708,18 @@ encodings = {
   RVVOps.JAL:  lambda x: enc_J(0, 0 if isinstance(x.tag, str) else _idx(x), 0x6F),
   RVVOps.JALR: lambda x: enc_I(_imm(x,1), _r(x,0), 0x0, _idx(x), 0x67),
   # scalar float (F): src=(rs1, rs2)
+  # scalar float (F): src=(rs1, rs2). funct3 in {7=DYN rounding, 0=fmin, 1=fmax}
+  RVVOps.FMIN_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x0, _idx(x), 0x53),
+  RVVOps.FMAX_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x1, _idx(x), 0x53),
+  # scalar f32 casts (rs2 field selects the variant). FCVT.W.S funct7=0x60 rs2=0. FCVT.S.W funct7=0x68 rs2=0. funct3=7=DYN rm.
+  RVVOps.FCVT_W_S: lambda x: enc_R(0x60, 0, _r(x,0), 0x7, _idx(x), 0x53),
+  RVVOps.FCVT_S_W: lambda x: enc_R(0x68, 0, _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FADD_S: lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FSUB_S: lambda x: enc_R(0x04, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FMUL_S: lambda x: enc_R(0x08, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FDIV_S: lambda x: enc_R(0x0C, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
+  # FSQRT.S: funct7=0x2C, rs2=0, funct3=7 (dyn rm). src=(rs1,)
+  RVVOps.FSQRT_S: lambda x: enc_R(0x2C, 0, _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FLW:    lambda x: enc_I(_imm(x,1), _r(x,0), 0x2, _idx(x), 0x07),
   RVVOps.FSW:    lambda x: enc_S(_imm(x,2), _r(x,0), _r(x,1), 0x2, 0x27),
   RVVOps.FMV_W_X: lambda x: enc_R(0x78, 0, _r(x,0), 0x0, _idx(x), 0x53),
@@ -625,6 +744,13 @@ encodings = {
   RVVOps.VFMUL_VV:  lambda x: enc_vop(0x24, 1, _r(x,0), _r(x,1), 1, _idx(x)),
   RVVOps.VFDIV_VV:  lambda x: enc_vop(0x20, 1, _r(x,0), _r(x,1), 1, _idx(x)),
   RVVOps.VFMACC_VV: lambda x: enc_vop(0x2C, 1, _r(x,0), _r(x,1), 1, _idx(x)),
+  RVVOps.VFMIN_VV:  lambda x: enc_vop(0x04, 1, _r(x,0), _r(x,1), 1, _idx(x)),
+  RVVOps.VFMAX_VV:  lambda x: enc_vop(0x06, 1, _r(x,0), _r(x,1), 1, _idx(x)),
+  # VFUNARY1 unary float ops: funct6=0x13, vs1 field selects sub-op. vfsqrt.v: vs1=0b00000.
+  RVVOps.VFSQRT_V: lambda x: enc_vop(0x13, 1, _r(x,0), 0, 1, _idx(x)),
+  # VFUNARY0 conversions: funct6=0x12, vs1=0b00111 for vfcvt.rtz.x.f.v ; vs1=0b00011 for vfcvt.f.x.v.
+  RVVOps.VFCVT_X_F_V: lambda x: enc_vop(0x12, 1, _r(x,0), 0b00111, 1, _idx(x)),
+  RVVOps.VFCVT_F_X_V: lambda x: enc_vop(0x12, 1, _r(x,0), 0b00011, 1, _idx(x)),
   RVVOps.VFADD_VF:  lambda x: enc_vop(0x00, 1, _r(x,0), _r(x,1), 5, _idx(x)),
   RVVOps.VFSUB_VF:  lambda x: enc_vop(0x02, 1, _r(x,0), _r(x,1), 5, _idx(x)),
   RVVOps.VFRSUB_VF: lambda x: enc_vop(0x27, 1, _r(x,0), _r(x,1), 5, _idx(x)),
@@ -644,6 +770,8 @@ encodings = {
   # reductions — §14. src=(vs2_input_vec, vs1_init_vec); vd[0] holds the reduced scalar.
   RVVOps.VFREDUSUM_VS: lambda x: enc_vop(0x01, 1, _r(x,0), _r(x,1), 1, _idx(x)),
   RVVOps.VFREDOSUM_VS: lambda x: enc_vop(0x03, 1, _r(x,0), _r(x,1), 1, _idx(x)),
+  RVVOps.VFREDMAX_VS:  lambda x: enc_vop(0x07, 1, _r(x,0), _r(x,1), 1, _idx(x)),
+  RVVOps.VFREDMIN_VS:  lambda x: enc_vop(0x05, 1, _r(x,0), _r(x,1), 1, _idx(x)),
   # vfmv.f.s — §16.2
   RVVOps.VFMV_F_S: lambda x: enc_vop(0x10, 1, _r(x,0), 0, 1, _idx(x)),
   RVVOps.VFMV_S_F: lambda x: enc_vop(0x10, 1, 0, _r(x,0), 5, _idx(x)),
@@ -673,7 +801,9 @@ class RVVRenderer(ISARenderer):
     from tinygrad.runtime.support.compiler_cpu import RVVCompiler
     self.compiler = RVVCompiler()
 
-  def is_two_address(self, x:UOp) -> bool: return False  # RVV is 3-operand; base RV is 3-register R-type
+  # Two-address ops: vd is both source AND destination (the accumulator). vfmacc.vv: vd += vs1*vs2.
+  TWO_ADDRESS = {RVVOps.VFMACC_VV, RVVOps.VFMACC_VF}
+  def is_two_address(self, x:UOp) -> bool: return x.arg in RVVRenderer.TWO_ADDRESS
   def stack_pointer(self) -> UOp: return UOp(Ops.DEFINE_REG, dtypes.uint64, tag=(SP,))
 
   # Regalloc hooks. Follow the X86 pattern: build a UOp expressing the operation and re-run isel on it.
