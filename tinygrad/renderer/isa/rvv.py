@@ -20,7 +20,7 @@
 #   §19   Vector Instruction Listing (funct6 table)
 
 import struct
-from tinygrad.dtype import dtypes, DType, PtrDType
+from tinygrad.dtype import dtypes, DType, PtrDType, AddrSpace
 from tinygrad.uop import FastEnum, auto, Ops
 from tinygrad.uop.ops import UOp, UPat, PatternMatcher, GroupOp
 from tinygrad.renderer.isa import ISARenderer, IselContext, Register
@@ -489,12 +489,15 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.COPY, name="x"), lambda x: x.ins(RVVOps.ADDI, src=(x.src[0], imm(dtypes.int32, 0))) if isinstance(x.dtype, PtrDType) else (
      x.ins(RVVOps.VMV_V_V, src=(x.src[0],)) if x.dtype.count > 1 else None)),
   # Scalar LOAD/STORE: pick width-correct instruction. SD=8B for ptr/i64, SW=4B for i32, FSW=4B float.
+  # For float CONST values (e.g. accumulator init `acc = 0.0`) we must materialize to an f-reg via
+  # LUI+ADDI+FMV.W.X first — FSW takes a register source, not an immediate.
   (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))), UPat.var("val")), name="x"),
    lambda base, disp, val, x:
      x.ins(RVVOps.SD, src=(val, *_scalar_mem_addr(base, disp, 8))) if isinstance(val.dtype, PtrDType) or val.dtype in (dtypes.int64, dtypes.uint64) else (
      x.ins(RVVOps.SW, src=(val, *_scalar_mem_addr(base, disp, 4))) if val.dtype in (dtypes.int32, dtypes.uint32) else (
      x.ins(RVVOps.SB, src=(val, *_scalar_mem_addr(base, disp, 1))) if val.dtype is dtypes.bool else (
-     x.ins(RVVOps.FSW, src=(val, *_scalar_mem_addr(base, disp, 4))) if val.dtype is dtypes.float32 else None)))),
+     x.ins(RVVOps.FSW, src=(val if val.op is not Ops.CONST else _f32_const_to_freg(val), *_scalar_mem_addr(base, disp, 4)))
+       if val.dtype is dtypes.float32 else None)))),
   (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))),), name="x"),
    lambda base, disp, x:
      x.ins(RVVOps.LD, src=_scalar_mem_addr(base, disp, 8)) if isinstance(x.dtype, PtrDType) or x.dtype in (dtypes.int64, dtypes.uint64) else (
@@ -628,8 +631,16 @@ isel_matcher = PatternMatcher([
   (UPat.var("a").store(UPat.var("b"), name="x"), lambda a,b,x:
    x.ins(RVVOps.VSE32_V, src=(b, _resolve_addr(a)))
    if b.dtype.count > 1 and b.dtype.scalar() in (dtypes.float32, dtypes.int32) else None),
+  # Register-accumulator DEFINE_REG (from UOp.placeholder(AddrSpace.REG), arg=int slot) -> DEFINE_LOCAL on
+  # the stack. The regalloc allocates stack space for DEFINE_LOCAL and rewrites it into sp.index(offset),
+  # giving the accumulator a real address. Without this conversion, DEFINE_REG just gets a GPR with no
+  # initialization and FSW/FLW dereference garbage. (Mirrors x86.py.)
+  # Skip when tag is set (already a real reg like callee-saved or SP from def_reg).
+  (UPat(Ops.DEFINE_REG, name="x"), lambda x:
+   x.replace(op=Ops.DEFINE_LOCAL, dtype=x.dtype.base.ptr(x.dtype.size, AddrSpace.LOCAL))
+   if isinstance(x.arg, int) and x.tag is None else None),
   # alloc vregs to anything that defines a value
-  (UPat((Ops.INS, Ops.DEFINE_REG), name="x"), alloc_vregs),
+  (UPat((Ops.INS, Ops.DEFINE_REG, Ops.DEFINE_LOCAL), name="x"), alloc_vregs),
 ])
 
 # ***** RVV post-register-allocation *****
