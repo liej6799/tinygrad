@@ -24,8 +24,11 @@ def linearize(sink:UOp) -> list[UOp]:
       # the order and placement of these defines is important
       case Ops.PARAM: priority, extra = -20, u.arg
       case Ops.DEFINE_VAR: priority, extra = -19, u.arg
-      case Ops.DEFINE_REG: priority = -18
-      case Ops.DEFINE_LOCAL: priority = -17
+      # ISA backends can introduce DEFINE_REG with arg=None (callee-saved scratch defs); UOp.placeholder
+      # creates them with arg=<int slot>. Tie-break on arg with None as -1 so the sort short-circuits on
+      # this field instead of falling through into tuplize where None vs int can't be compared.
+      case Ops.DEFINE_REG: priority, extra = -18, -1 if u.arg is None else u.arg
+      case Ops.DEFINE_LOCAL: priority, extra = -17, -1 if u.arg is None else u.arg
       case Ops.LOAD: priority = -1    # place loads early
       case Ops.STORE: priority = 1    # place stores late
       case Ops.RANGE: priority = 5    # placing RANGE is good

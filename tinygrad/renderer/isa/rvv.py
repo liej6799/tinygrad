@@ -271,6 +271,25 @@ def _revec(expr:UOp, i:int, vec_dt:DType) -> UOp|None:
     a = _revec(expr.src[0], i, expr.src[0].dtype.scalar().vec(vec_dt.count))
     if a is None or a.dtype.count == 1: return None
     return expr.replace(dtype=vec_dt, src=(a,))
+  # Scalar LOAD<INDEX<base, CONST=i>> at lane i -> the "underlying" vec LOAD reads N
+  # consecutive elements starting at base[0]. For all lanes 0..N-1 this constructs the
+  # SAME UOp (tinygrad interns by structural equality), so _all_nested's identity check
+  # passes. This handles kernels where the schedule emits per-lane scalar loads instead
+  # of a single vec load (e.g. for the i32 input to a CAST).
+  #
+  # The new address is wrapped in a CAST<ptr, ptr> so the existing pre_isel CAST<ptr, ptr>
+  # rewrite converts it to NOOP<base, CONST=0> (n_src=2), which keeps `base` as a real
+  # child of the NOOP. Without the CAST wrapper the isel INDEX<base, CONST=0> matcher
+  # would fire on bare INDEX and produce NOOP<empty_src> (it replaces op on base directly),
+  # swallowing the PARAM/leaf so abi() never tags it.
+  if expr.op is Ops.LOAD and len(expr.src) == 1 and expr.dtype.count == 1:
+    addr = expr.src[0]
+    if addr.op is Ops.INDEX and len(addr.src) == 2 and addr.src[1].op is Ops.CONST and addr.src[1].arg == i:
+      base = addr.src[0]
+      new_idx = UOp(Ops.INDEX, base.dtype, (base, UOp.const(dtypes.int, 0)))  # PtrDType, preserves srcs
+      casted = UOp(Ops.CAST, new_idx.dtype, (new_idx,))                        # CAST<ptr, ptr> -> NOOP via pre_isel
+      return UOp(Ops.LOAD, expr.dtype.vec(vec_dt.count), (casted,))
+    return None
   return None
 
 def _all_nested(stack:UOp) -> UOp|None:
@@ -547,9 +566,11 @@ isel_matcher = PatternMatcher([
    (x.ins(RVVOps.FCVT_S_W) if x.dtype is dtypes.float32 and x.src[0].dtype is dtypes.int32 else
     (x.ins(RVVOps.VFCVT_X_F_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.int32 and x.src[0].dtype.scalar() is dtypes.float32 else
      (x.ins(RVVOps.VFCVT_F_X_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 and x.src[0].dtype.scalar() is dtypes.int32 else None)))),
-  # vec(N) LOAD f32 -> VLE32_V. Unwraps NOOP(ptr, idx) to compute the byte address.
+  # vec(N) LOAD f32/i32 -> VLE32_V. Element-size-based (32-bit) op handles both float32 and int32.
+  # Unwraps NOOP(ptr, idx) to compute the byte address.
   (UPat(Ops.LOAD, src=(UPat.var("a"),), name="x"), lambda a,x:
-   x.ins(RVVOps.VLE32_V, src=(_resolve_addr(a),)) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None),
+   x.ins(RVVOps.VLE32_V, src=(_resolve_addr(a),))
+   if x.dtype.count > 1 and x.dtype.scalar() in (dtypes.float32, dtypes.int32) else None),
   # vec(N) ADD/MUL f32 with one scalar CONST operand -> .vf variant.
   # Constant is materialized into a fresh f-reg via LUI [+ ADDI w/ sign correction] + FMV.W.X.
   # Handles ANY 32-bit float bit pattern (including negative and lo12 != 0).
@@ -587,9 +608,11 @@ isel_matcher = PatternMatcher([
   (UPat.var("a").store(UPat.cvar("c", dtypes.float32), name="x"), lambda a,c,x:
    x.ins(RVVOps.VSE32_V, src=(_broadcast_f32_to_vec(c, dtypes.float32.vec(a.dtype.size if isinstance(a.dtype, PtrDType) else 4)),
                               _resolve_addr(a)))),
-  # STORE vec(N) f32 -> VSE32_V. Resolves NOOP(ptr, idx) and swaps srcs (orig: ptr, val) -> (val, addr).
+  # STORE vec(N) f32/i32 -> VSE32_V. Element-size-based (32-bit) op handles both float32 and int32.
+  # Resolves NOOP(ptr, idx) and swaps srcs (orig: ptr, val) -> (val, addr).
   (UPat.var("a").store(UPat.var("b"), name="x"), lambda a,b,x:
-   x.ins(RVVOps.VSE32_V, src=(b, _resolve_addr(a))) if b.dtype.count > 1 and b.dtype.scalar() is dtypes.float32 else None),
+   x.ins(RVVOps.VSE32_V, src=(b, _resolve_addr(a)))
+   if b.dtype.count > 1 and b.dtype.scalar() in (dtypes.float32, dtypes.int32) else None),
   # alloc vregs to anything that defines a value
   (UPat((Ops.INS, Ops.DEFINE_REG), name="x"), alloc_vregs),
 ])
@@ -848,7 +871,8 @@ class RVVRenderer(ISARenderer):
     VEC_OPS = {RVVOps.VLE32_V, RVVOps.VSE32_V, RVVOps.VFADD_VV, RVVOps.VFSUB_VV, RVVOps.VFMUL_VV, RVVOps.VFDIV_VV,
                RVVOps.VFMACC_VV, RVVOps.VFMACC_VF, RVVOps.VFADD_VF, RVVOps.VFSUB_VF, RVVOps.VFRSUB_VF, RVVOps.VFMUL_VF,
                RVVOps.VFDIV_VF, RVVOps.VFRDIV_VF, RVVOps.VADD_VV, RVVOps.VSUB_VV, RVVOps.VMUL_VV,
-               RVVOps.VMV_V_V, RVVOps.VMV_V_X, RVVOps.VMV_V_I, RVVOps.VMV_V_F, RVVOps.VFREDUSUM_VS}
+               RVVOps.VMV_V_V, RVVOps.VMV_V_X, RVVOps.VMV_V_I, RVVOps.VMV_V_F, RVVOps.VFREDUSUM_VS,
+               RVVOps.VFSQRT_V, RVVOps.VFCVT_X_F_V, RVVOps.VFCVT_F_X_V}
     vec_uops = [u for u in uops if u.op is Ops.INS and u.arg in VEC_OPS]
     if vec_uops:
       # Find the first vec LOAD/STORE/ALU and use its dtype.count as the AVL. f32 / m1 for now.
