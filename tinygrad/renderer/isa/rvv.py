@@ -271,23 +271,38 @@ def _revec(expr:UOp, i:int, vec_dt:DType) -> UOp|None:
     a = _revec(expr.src[0], i, expr.src[0].dtype.scalar().vec(vec_dt.count))
     if a is None or a.dtype.count == 1: return None
     return expr.replace(dtype=vec_dt, src=(a,))
-  # Scalar LOAD<INDEX<base, CONST=i>> at lane i -> the "underlying" vec LOAD reads N
-  # consecutive elements starting at base[0]. For all lanes 0..N-1 this constructs the
-  # SAME UOp (tinygrad interns by structural equality), so _all_nested's identity check
-  # passes. This handles kernels where the schedule emits per-lane scalar loads instead
-  # of a single vec load (e.g. for the i32 input to a CAST).
+  # Scalar LOAD<INDEX<base, idx>> at lane i -> a vec LOAD reading N consecutive elements.
+  # The per-lane idx structure is one of:
+  #   lane 0: idx = X                        (any expression — possibly a single CONST=0,
+  #                                            or a dynamic expression like SHL<RANGE, 2>)
+  #   lane i: idx = ADD(X, CONST(i))         (X is the SAME expression as lane 0's idx)
+  # The "underlying" vec LOAD then reads N elements starting at base[X]. All N lanes
+  # construct the SAME LOAD UOp (UOps are interned by structural equality), so
+  # _all_nested's identity check passes.
   #
   # The new address is wrapped in a CAST<ptr, ptr> so the existing pre_isel CAST<ptr, ptr>
-  # rewrite converts it to NOOP<base, CONST=0> (n_src=2), which keeps `base` as a real
-  # child of the NOOP. Without the CAST wrapper the isel INDEX<base, CONST=0> matcher
-  # would fire on bare INDEX and produce NOOP<empty_src> (it replaces op on base directly),
-  # swallowing the PARAM/leaf so abi() never tags it.
+  # rewrite converts it to NOOP<base, X> (n_src=2), which keeps `base` as a real child
+  # of the NOOP. Without the CAST wrapper the isel INDEX<base, CONST=0> matcher would
+  # fire on a bare INDEX with CONST=0 idx and produce NOOP<empty_src> (it replaces op
+  # on base directly), swallowing the PARAM/leaf so abi() never tags it.
   if expr.op is Ops.LOAD and len(expr.src) == 1 and expr.dtype.count == 1:
     addr = expr.src[0]
-    if addr.op is Ops.INDEX and len(addr.src) == 2 and addr.src[1].op is Ops.CONST and addr.src[1].arg == i:
-      base = addr.src[0]
-      new_idx = UOp(Ops.INDEX, base.dtype, (base, UOp.const(dtypes.int, 0)))  # PtrDType, preserves srcs
-      casted = UOp(Ops.CAST, new_idx.dtype, (new_idx,))                        # CAST<ptr, ptr> -> NOOP via pre_isel
+    if addr.op is Ops.INDEX and len(addr.src) == 2:
+      base, idx = addr.src[0], addr.src[1]
+      if i == 0:
+        base_idx = idx
+      elif idx.op is Ops.CONST and idx.arg == i:
+        # fully-unrolled small kernel: lane i has bare CONST=i, base_idx = CONST(0)
+        base_idx = UOp.const(idx.dtype, 0)
+      elif idx.op is Ops.ADD and len(idx.src) == 2:
+        # loop kernel: lane i has ADD(X, CONST(i)) or symmetric — strip the +i
+        a, b = idx.src
+        if a.op is Ops.CONST and a.arg == i: base_idx = b
+        elif b.op is Ops.CONST and b.arg == i: base_idx = a
+        else: return None
+      else: return None
+      new_idx = UOp(Ops.INDEX, base.dtype, (base, base_idx))   # PtrDType, preserves srcs
+      casted = UOp(Ops.CAST, new_idx.dtype, (new_idx,))         # CAST<ptr, ptr> -> NOOP via pre_isel
       return UOp(Ops.LOAD, expr.dtype.vec(vec_dt.count), (casted,))
     return None
   return None
