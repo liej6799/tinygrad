@@ -13,7 +13,7 @@ class ClangJITCompiler(Compiler):
       # on arm march means "runs on this arch and superset" instead of "optimize for this arch". x86 march == arm mcpu
       # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm
       case "arm64": self.args = ["-ffixed-x18", "-mcpu=" + "+".join([cpu] + ["no"+f[1:] if f.startswith("-") else f for f in feats])]
-      case "riscv64": self.args = ["-march=" + "_".join(["rv64g" if cpu == "native" else cpu] + feats)]
+      case "riscv64": self.args = ["-march=" + "_".join([getenv("RISCV_MARCH","") or ("rv64g" if cpu == "native" else cpu)] + feats)]
       case _: raise RuntimeError(f"unsupported arch: {self.arch!r}")
     super().__init__(f"{cachekey}_{'_'.join(arch)}")
 
@@ -107,3 +107,8 @@ class X86Compiler(Compiler):
   def __init__(self): super().__init__(None)
   def compile(self, src:str) -> bytes: return bytes.fromhex(src)
   def disassemble(self, lib:bytes): return capstone_flatdump(lib, "x86_64")
+
+class RVVCompiler(Compiler):
+  def __init__(self): super().__init__(None)
+  def compile(self, src:str) -> bytes: return bytes.fromhex(src)
+  def disassemble(self, lib:bytes): return capstone_flatdump(lib, "riscv64")

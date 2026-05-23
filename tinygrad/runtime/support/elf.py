@@ -38,20 +38,31 @@ def elf_loader(blob:bytes, force_section_align:int=1, link_libs:list[str]|None=N
       sh.header.sh_addr = len(image) - len(sh.content)
 
   # Relocations
+  # Some relocation types are pure annotations (e.g. R_RISCV_RELAX) and reference the NULL symbol by
+  # convention — we mustn't try to resolve those via link_sym.
+  NO_SYM_RELOC_TYPES = {getattr(libc, n, -1) for n in ("R_RISCV_RELAX", "R_RISCV_ALIGN")} - {-1}
   relocs = []
   for sh, trgt_sh_name, c_rels in rel + rela:
     if trgt_sh_name == ".eh_frame": continue
     target_image_off = next(tsh for tsh in sections if tsh.name == trgt_sh_name).header.sh_addr
     rels = [(r.r_offset, unwrap(symtab)[getattr(libc, f"{ecls.upper()}_R_SYM")(r.r_info)], getattr(libc, f"{ecls.upper()}_R_TYPE")(r.r_info),
              getattr(r, "r_addend", 0)) for r in c_rels]
-    relocs += [(target_image_off + roff, link_sym(_strtab(sh_strtab, sym.st_name), link_libs or []) if sym.st_shndx == 0 else
-                sections[sym.st_shndx].header.sh_addr + sym.st_value, rtype, raddend) for roff, sym, rtype, raddend in rels]
+    relocs += [(target_image_off + roff,
+                0 if rtype in NO_SYM_RELOC_TYPES else
+                (link_sym(_strtab(sh_strtab, sym.st_name), link_libs or []) if sym.st_shndx == 0 else
+                 sections[sym.st_shndx].header.sh_addr + sym.st_value),
+                rtype, raddend) for roff, sym, rtype, raddend in rels]
 
   return memoryview(image), sections, relocs
 
 def jit_loader(obj: bytes, base:int=0, link_libs:list[str]|None=None) -> bytes:
   image_, _, relocs = elf_loader(obj, link_libs=link_libs)
   image = bytearray(image_)
+
+  # RISC-V PCREL_HI20/PCREL_LO12 are paired: the LO12 relocation's symbol is the address of the
+  # matching HI20 instruction, NOT the actual target. Build a HI20-pc -> target map so LO12 can
+  # look up the real address it's resolving against.
+  hi20_targets = {ploc: tgt + r_addend for ploc, tgt, r_type, r_addend in relocs if r_type == libc.R_RISCV_PCREL_HI20}
 
   def relocate(instr: int, base: int, ploc: int, tgt: int, r_type: int):
     match r_type:
@@ -74,6 +85,34 @@ def jit_loader(obj: bytes, base:int=0, link_libs:list[str]|None=None) -> bytes:
         # create trampoline:         LDR x17, 8  BR x17
         image += struct.pack("<IIQ", 0x58000051, 0xD61F0220, tgt)
         return instr | getbits(len(image)-ploc-16, 2, 27)
+      # https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc for definitions of relocations
+      # https://github.com/riscv/riscv-isa-manual for instruction encodings
+      case libc.R_RISCV_BRANCH:
+        # B-type immediate: imm[12|10:5] in instr[31|30:25], imm[4:1|11] in instr[11:8|7]; offset is in bytes
+        off = tgt - ploc
+        return instr | (getbits(off, 12, 12) << 31) | (getbits(off, 5, 10) << 25) | (getbits(off, 1, 4) << 8) | (getbits(off, 11, 11) << 7)
+      case libc.R_RISCV_JAL:
+        # J-type immediate: imm[20|10:1|11|19:12] in instr[31|30:21|20|19:12]
+        off = tgt - ploc
+        return instr | (getbits(off, 20, 20) << 31) | (getbits(off, 1, 10) << 21) | (getbits(off, 11, 11) << 20) | (getbits(off, 12, 19) << 12)
+      case libc.R_RISCV_PCREL_HI20:
+        # U-type AUIPC: imm[31:12] = upper 20 bits of (target - PC), rounded so the paired
+        # LO12 (sign-extended) reconstructs the exact target. mask out the existing imm bits.
+        off = tgt - ploc
+        hi20 = ((off + 0x800) >> 12) & 0xFFFFF
+        return (instr & 0xFFF) | (hi20 << 12)
+      case libc.R_RISCV_PCREL_LO12_I:
+        # I-type imm[11:0] in instr[31:20]. `tgt` here is the AUIPC's PC (per psABI spec); the
+        # real target comes from the paired HI20 reloc. Offset is measured at the HI20's PC.
+        if tgt not in hi20_targets: raise RuntimeError(f"PCREL_LO12_I at {ploc:#x} has no paired HI20 at {tgt:#x}")
+        lo12 = (hi20_targets[tgt] - tgt) & 0xFFF
+        return (instr & 0x000FFFFF) | (lo12 << 20)
+      case libc.R_RISCV_PCREL_LO12_S:
+        # S-type: imm split as instr[31:25]=imm[11:5], instr[11:7]=imm[4:0].
+        if tgt not in hi20_targets: raise RuntimeError(f"PCREL_LO12_S at {ploc:#x} has no paired HI20 at {tgt:#x}")
+        lo12 = (hi20_targets[tgt] - tgt) & 0xFFF
+        return (instr & 0x01FFF07F) | (getbits(lo12, 5, 11) << 25) | (getbits(lo12, 0, 4) << 7)
+      case libc.R_RISCV_RELAX: return instr  # linker relaxation hint; we don't relax, treat as no-op
     raise NotImplementedError(f"Encountered unknown relocation type {r_type}")
 
   # This is needed because we have an object file, not a .so that has all internal references (like loads of constants from .rodata) resolved.
