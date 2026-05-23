@@ -107,9 +107,14 @@ class LinearScanRegallocContext:
         for v,r in live_ins.pop().items():
           if v not in live or live[v] != r: live[v] = fill(v, i, (r,))
 
+_HANDLED_OPS = {Ops.INS, Ops.RANGE, Ops.END, Ops.DEFINE_REG, Ops.DEFINE_LOCAL, Ops.PARAM, Ops.DEFINE_VAR, Ops.SPECIAL} | PSEUDO_OPS
+
 def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
+  # idx MUST stay in lockstep with the pre-pass's enumerate(uops). Any op in lst that this matcher
+  # doesn't handle still consumes an idx tick (returning None below) so subsequent handled ops see
+  # the correct lst position in ctx.reals[i].
   i = next(ctx.idx)
-  if x.op in PSEUDO_OPS: return None
+  if x.op in PSEUDO_OPS or x.op not in _HANDLED_OPS: return None
   nsrc = []
   for j,s in enumerate(x.src):
     # v here is the virtual defined by the original s as s is the rewritten version
@@ -132,6 +137,7 @@ def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
   return nx, before + [nx] + after
 
 pm_regalloc_rewrite = PatternMatcher([
-  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.DEFINE_REG, Ops.DEFINE_LOCAL, Ops.PARAM, Ops.DEFINE_VAR, Ops.SPECIAL} | PSEUDO_OPS, name="x"),
-   regalloc_rewrite),
+  # Match every UOp so regalloc_rewrite is called for each — the function ticks ctx.idx (which must
+  # stay aligned with the pre-pass's enumerate(uops)) and returns None for ops it doesn't rewrite.
+  (UPat(set(Ops), name="x"), regalloc_rewrite),
 ])
