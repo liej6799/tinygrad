@@ -15,3 +15,12 @@ Never mix functionality changes with whitespace changes. All functionality chang
 ## style
 
 Use **2-space indentation**, and keep lines to a maximum of **150 characters**. Match the existing style.
+
+## task handling
+
+Only make minmal line of code changes related, use git diff to check and ensure minimal code change while still finish the coding task or bug fixing
+
+## Python venv
+
+use python venv at ~/tinygrad
+source ~/tinygrad/.venv/bin/activate

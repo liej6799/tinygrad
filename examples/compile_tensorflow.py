@@ -8,7 +8,7 @@ import numpy as np
 import subprocess
 import tensorflow as tf
 import tf2onnx
-from tinygrad.frontend.onnx import OnnxRunner
+from tinygrad.nn.onnx import OnnxRunner
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import to_mv
 from extra.export_model import export_model_clang, compile_net, jit_model
@@ -35,12 +35,11 @@ def compile_onnx_model(onnx_model):
   tinyonnx = TinyOnnx(onnx_model)
   the_input = Tensor.randn(1,32)
 
-  run, special_names = jit_model(tinyonnx, the_input)
+  linear, output_bufs = jit_model(tinyonnx, the_input)
+  the_output = [tinyonnx.forward(the_input)]
 
-  functions, statements, bufs, bufs_to_save = compile_net(run, special_names)
+  functions, statements, bufs, bufs_to_save = compile_net(linear, output_bufs)
   prg = export_model_clang(functions, statements, bufs, {}, ["input0"], ["output0"])
-
-  the_output = run(the_input)
   cprog = ["#include <string.h>", "#include <stdio.h>", "#include <stdlib.h>"]
   cprog.append(prg)
 

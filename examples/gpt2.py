@@ -5,8 +5,9 @@ with contextlib.suppress(ImportError): import tiktoken
 from tinygrad import Tensor, TinyJit, Device, GlobalCounters, Variable, dtypes
 from tinygrad.uop.ops import UOp
 from tinygrad.helpers import Timing, DEBUG, JIT, getenv, fetch, colored, trange
+from tinygrad.llm.gguf import gguf_load
 from tinygrad.nn import Embedding, Linear, LayerNorm
-from tinygrad.nn.state import gguf_load, torch_load, load_state_dict, get_state_dict
+from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 from extra.bench_log import BenchEvent, WallTimeEvent
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 128)
@@ -26,8 +27,8 @@ class Attention:
       start_pos = start_pos.val
 
     if HALF: x = x.half()
-    xqkv = self.c_attn(x)
-    xq, xk, xv = [xqkv.shrink((None, None, (i*self.dim, (i+1)*self.dim))).reshape(None, None, self.n_heads, self.head_dim) for i in range(3)]
+    xqkv = self.c_attn(x).reshape(None, None, 3, self.n_heads, self.head_dim)
+    xq, xk, xv = [xqkv[:, :, i, :, :] for i in range(3)]
     bsz, seqlen, _, _ = xq.shape
 
     # create kv cache
@@ -35,11 +36,11 @@ class Attention:
       self.cache_kv = Tensor.zeros(2, bsz, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
 
     # update the cache
-    self.cache_kv.shrink((None, None,(start_pos,start_pos+seqlen),None,None)).assign(Tensor.stack(xk, xv)).realize()
+    self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :].assign(Tensor.stack(xk, xv)).realize()
 
     if start_pos > 0:
-      keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None))
-      values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None))
+      keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
+      values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
     else:
       keys = xk
       values = xv
@@ -134,8 +135,7 @@ class GPT2:
     transposed = ('attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight')
     for k in weights:
       if k.endswith(transposed):
-        # TODO: it should not silently break without that .to(None)
-        weights[k] = weights[k].to(None).T
+        weights[k] = weights[k].T
     # lm head and wte are tied
     weights['lm_head.weight'] = weights['wte.weight']
 
@@ -233,7 +233,7 @@ if __name__ == "__main__":
   gpt2 = GPT2.build_gguf(args.model_size) if args.model_size.startswith("gpt2_gguf_") else GPT2.build(args.model_size)
 
   if args.benchmark != -1:
-    gpt2.model(Tensor.rand(args.batch_size, args.benchmark), Variable("a", 0, MAX_CONTEXT).bind(0)).realize()
+    gpt2.model(Tensor.randint(args.batch_size, args.benchmark), Variable("a", 0, MAX_CONTEXT).bind(0)).realize()
   else:
     texts = gpt2.generate(args.prompt, args.count, args.temperature, timing=args.timing, batch_size=args.batch_size)
     if not args.noshow:

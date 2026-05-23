@@ -1,7 +1,10 @@
 import gc
-from tinygrad import Tensor, UOp, Device
-from tinygrad.shape.shapetracker import views_to_valid_uop
-from tinygrad.engine.realize import method_cache, get_program
+from tinygrad import Tensor, UOp, Device, nn
+from tinygrad.schedule import schedule_cache
+from tinygrad.codegen import to_program, to_program_cache
+from tinygrad.schedule.indexing import apply_movement_op, _apply_reshape
+from tinygrad.uop.divandmod import fold_divmod_general
+from test.test_tiny import TestTiny
 
 def uops_allocated(): return sum([isinstance(x, UOp) for x in gc.get_objects()])
 def print_uops():
@@ -11,13 +14,13 @@ def print_uops():
 def start(): pass
 def single_tensor(): Tensor([2])
 def two_plus_two(): Tensor([2])+Tensor([2])
-def two_plus_two_schedule(): (Tensor([2])+Tensor([2])).schedule()
+def two_plus_two_schedule(): (Tensor([2])+Tensor([2])).schedule_linear()
 def two_plus_two_kernel():
-  si = (Tensor([2])+Tensor([2])).schedule()[-1]
-  get_program(si.ast, Device.default.renderer)
+  linear = (Tensor([2])+Tensor([2])).schedule_linear()
+  to_program(linear.src[-1].src[0], Device.default.renderer)
 def two_plus_two_linearize():
-  si = (Tensor([2])+Tensor([2])).schedule()[-1]
-  get_program(si.ast, Device.default.renderer)
+  linear = (Tensor([2])+Tensor([2])).schedule_linear()
+  to_program(linear.src[-1].src[0], Device.default.renderer)
 def two_plus_two_realize(): (Tensor([2])+Tensor([2])).realize()
 def two_plus_two_item(): (Tensor([2])+Tensor([2])).item()
 def gradient_test():
@@ -33,8 +36,8 @@ def kernel_matmul():
   x = Tensor.eye(3, requires_grad=True)
   y = Tensor([[2.0,0,-2.0]], requires_grad=True)
   z = y.matmul(x)
-  si = z.schedule()[-1]
-  get_program(si.ast, Device.default.renderer)
+  linear = z.schedule_linear()
+  to_program(linear.src[-1].src[0], Device.default.renderer)
 def realized_matmul():
   x = Tensor.eye(3, requires_grad=True)
   y = Tensor([[2.0,0,-2.0]], requires_grad=True)
@@ -46,9 +49,16 @@ def realized_gradient():
   z = y.matmul(x).sum()
   z.backward()
   Tensor.realize(x, y, z, x.grad, y.grad)
+def nn_batchnorm(): nn.BatchNorm(64)
+def nn_conv2d(): nn.Conv2d(64, 64, 3)
+def plus(): TestTiny().test_plus()
+def mnist(): TestTiny().test_mnist()
+def mnist_backward(): TestTiny().test_mnist_backward()
+
 tests = [start, single_tensor, two_plus_two, two_plus_two_schedule, two_plus_two_kernel,
          two_plus_two_linearize, two_plus_two_realize, two_plus_two_item, gradient_test,
-         realized_eye, realized_list, kernel_matmul, realized_matmul, realized_gradient]
+         realized_eye, realized_list, kernel_matmul, realized_matmul, realized_gradient,
+         nn_batchnorm, nn_conv2d, plus, mnist, mnist_backward]
 
 if __name__ == "__main__":
   gc.disable()
@@ -59,12 +69,17 @@ if __name__ == "__main__":
     t()
 
     # these caches will keep uops alive
-    method_cache.clear()
-    views_to_valid_uop.cache_clear()
+    schedule_cache.clear()
+    to_program_cache.clear()
+    apply_movement_op.cache_clear()
+    _apply_reshape.cache_clear()
+    fold_divmod_general.cache_clear()
+    Tensor._device_seeds.clear()
+    Tensor._device_rng_counters.clear()
 
     new_uops = uops_allocated()
     gc.collect()
     new_uops_gc = uops_allocated()
     print(f"{t.__name__:30s}: {new_uops:3d} -> {new_uops_gc:3d}")
+    if new_uops != start_uops: print_uops()
     assert new_uops == start_uops
-  #print_uops()

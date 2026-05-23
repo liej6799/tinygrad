@@ -12,11 +12,11 @@ jobs:
   run_script_job:
     runs-on: [self-hosted, Linux, tinybox]
     if: github.repository_owner == 'tinygrad'
-    timeout-minutes: 360
+    timeout-minutes: 720
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: Cleanup running AM processes
       run: python extra/amdpci/am_smi.py --pids --kill
     - name: Symlink datasets

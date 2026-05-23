@@ -10,7 +10,7 @@ Directories are listed in order of how they are processed.
 
 Group UOps into kernels.
 
-::: tinygrad.schedule.kernelize.get_kernelize_map
+::: tinygrad.schedule.rangeify.get_kernel_graph
     options:
         members: false
         show_labels: false
@@ -26,9 +26,9 @@ Transforms the ast into an optimized ast. This is where BEAM search and heuristi
 
 ## tinygrad/codegen
 
-Transform the optimized ast into a linearized list of UOps.
+Transform the optimized ast into a linearized and rendered program.
 
-::: tinygrad.codegen.full_rewrite
+::: tinygrad.codegen.to_program
     options:
         members: false
         show_labels: false
@@ -53,7 +53,7 @@ Transform the linearized list of UOps into a program, represented as a string.
 
 Abstracted high level interface to the runtimes.
 
-::: tinygrad.engine.realize.get_program
+::: tinygrad.engine.realize.to_program
     options:
         members: false
         show_labels: false

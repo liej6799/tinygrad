@@ -1,7 +1,6 @@
 import math, functools
 from dataclasses import dataclass
 from tinygrad.dtype import DType, dtypes
-from tinygrad.helpers import getenv
 
 @dataclass(frozen=True)
 class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x N)
@@ -80,6 +79,10 @@ cuda_81616 = [TensorCore(dims=(8,16,16), threads=32, elements_per_thread=(8,4,4)
   swizzle=((('r1', 'r2', 'l2', 'l3', 'l4'), ('u1', 'r3'), ('l0', 'l1', 'u0', 'r0')),
            (('r1', 'r2', 'u0', 'l0', 'l1'), ('r0', 'r3'), ('l2', 'l3', 'l4', 'u1'))))
   for di,do in [(dtypes.half,dtypes.float), (dtypes.bfloat16,dtypes.float), (dtypes.half,dtypes.half)]]
+cuda_81632_f8 = [TensorCore(dims=(8,16,32), threads=32, elements_per_thread=(16,8,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
+  swizzle=((('r2', 'r3', 'l2', 'l3', 'l4'), ('u1', 'r4'), ('l0', 'l1', 'u0', 'r0', 'r1')),
+           (('r2', 'r3', 'u0', 'l0', 'l1'), ('r1', 'r4'), ('l2', 'l3', 'l4', 'u1', 'r0'))))
+  for di,do in [(dtypes.fp8e4m3,dtypes.float),(dtypes.fp8e5m2,dtypes.float)]]
 cuda_8168_f16 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
   swizzle=((('r1', 'r2', 'l2', 'l3', 'l4'), ('r0', 'u1'), ('l0', 'l1', 'u0')),
            (('r1', 'r2', 'u0', 'l0', 'l1'), ('u1', 'r0'), ('l2', 'l3', 'l4'))))
@@ -87,9 +90,11 @@ cuda_8168_f16 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,
 cuda_8168_tf32 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,4), dtype_in=dtypes.float, dtype_out=dtypes.float, opts=cuda_tc_opts,
   swizzle=((('r0', 'r1', 'l2', 'l3', 'l4'), ('u1', 'r2'), ('l0', 'l1', 'u0')),
            (('r0', 'r1', 'u0', 'l0', 'l1'), ('u1', 'r2'), ('l2', 'l3', 'l4'))))]
-cuda_sm80: list[TensorCore] = cuda_81616 + cuda_8168_f16
-if getenv("ALLOW_TF32", 0): cuda_sm80 += cuda_8168_tf32
 cuda_sm75: list[TensorCore] = cuda_8168_f16
+cuda_sm80: list[TensorCore] = cuda_81616 + cuda_8168_f16 + cuda_8168_tf32
+cuda_sm89: list[TensorCore] = cuda_sm80 + cuda_81632_f8
+
+def get_cuda(arch): return cuda_sm89 if (ver:=int(arch[3:])) >= 89 else cuda_sm80 if ver >= 80 else cuda_sm75 if ver >= 75 else []
 
 # ***** AMD *****
 
@@ -106,11 +111,29 @@ amd_rdna4 = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(8,8,8)
   for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
 
 # https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
-amd_cdna = [TensorCore(dims=(16,16,16), threads=64, elements_per_thread=(4,4,4), dtype_in=di, dtype_out=do,
+amd_cdna_161616 = [TensorCore(dims=(16,16,16), threads=64, elements_per_thread=(4,4,4), dtype_in=di, dtype_out=do,
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
   swizzle=((('u0', 'u1', 'l4', 'l5', 'r2', 'r3'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3')),
            (('l0', 'l1', 'l2', 'l3', 'r2', 'r3'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1'))))
   for di,do in [(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float)]]
+
+amd_cdna_161632 = [TensorCore(dims=(16,16,32), threads=64, elements_per_thread=(8,8,4), dtype_in=di, dtype_out=do,
+  opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
+  swizzle=((('u0', 'u1', 'l4', 'l5', 'r3', 'r4'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3', 'r2')),
+           (('l0', 'l1', 'l2', 'l3', 'r3', 'r4'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1', 'r2'))))
+  for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float),(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float)]]
+
+amd_cdna_1616128 = [TensorCore(dims=(16,16,128), threads=64, elements_per_thread=(32,32,4), dtype_in=di, dtype_out=do,
+  opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
+  swizzle=((('u0', 'u1', 'l4', 'l5', 'r5', 'r6'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3', 'r2', 'r3', 'r4')),
+           (('l0', 'l1', 'l2', 'l3', 'r5', 'r6'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1', 'r2', 'r3', 'r4'))))
+  for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float)]]
+
+amd_cdna3 = amd_cdna_161632[:2] + amd_cdna_161616
+
+amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
+
+def get_amd(arch): return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
 
 # ***** Apple Metal *****
 
@@ -134,3 +157,83 @@ intel = [TensorCore(dims=(8,8,16), threads=8, elements_per_thread=(16,16,8), dty
                     opts=("l0","l0","l0","u1","u1","u1"),
                     swizzle=((('r1', 'r2', 'r3'), ('u0', 'u1', 'u2'), ('l0', 'l1', 'l2', 'r0')),
                              (('l0', 'l1', 'l2'), ('r1', 'r2', 'r3'), ('u0', 'u1', 'u2', 'r0'))))]
+
+# ***** Rockchip *****
+
+rockchip = [
+  TensorCore(dims=(8192,8192,1), threads=1, elements_per_thread=(8192,8192,67108864), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11', 'u12',
+                             'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21', 'u22', 'u23', 'u24', 'u25'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11', 'u12',
+                             'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21', 'u22', 'u23', 'u24', 'u25'), ()))),
+  TensorCore(dims=(4096,4096,1), threads=1, elements_per_thread=(4096,4096,16777216), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11',
+                             'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21', 'u22', 'u23'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11',
+                             'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21', 'u22', 'u23'), ()))),
+  TensorCore(dims=(2048,2048,1), threads=1, elements_per_thread=(2048,2048,4194304), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10',
+                             'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10',
+                             'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19', 'u20', 'u21'), ()))),
+  TensorCore(dims=(1024,1024,1), threads=1, elements_per_thread=(1024,1024,1048576), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9',
+                             'u10', 'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9',
+                             'u10', 'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17', 'u18', 'u19'), ()))),
+  TensorCore(dims=(512,512,1), threads=1, elements_per_thread=(512,512,262144), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8',
+                             'u9', 'u10', 'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8',
+                             'u9', 'u10', 'u11', 'u12', 'u13', 'u14', 'u15', 'u16', 'u17'), ()))),
+  TensorCore(dims=(256,256,1), threads=1, elements_per_thread=(256,256,65536), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7',
+                             'u8', 'u9', 'u10', 'u11', 'u12', 'u13', 'u14', 'u15'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7',
+                             'u8', 'u9', 'u10', 'u11', 'u12', 'u13', 'u14', 'u15'), ()))),
+  TensorCore(dims=(128,128,1), threads=1, elements_per_thread=(128,128,16384), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6',
+                             'u7', 'u8', 'u9', 'u10', 'u11', 'u12', 'u13'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6',
+                             'u7', 'u8', 'u9', 'u10', 'u11', 'u12', 'u13'), ()))),
+  TensorCore(dims=(64,64,1), threads=1, elements_per_thread=(64,64,4096), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9', 'u10', 'u11'), ()))),
+  TensorCore(dims=(32,32,1), threads=1, elements_per_thread=(32,32,1024), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0","u0",
+                   "u1","u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7', 'u8', 'u9'), ()))),
+  TensorCore(dims=(16,16,1), threads=1, elements_per_thread=(16,16,256), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0","u0",
+                   "u1","u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'), ()))),
+  TensorCore(dims=(8,8,1), threads=1, elements_per_thread=(8,8,64), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u0",
+                   "u1","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5'), ()),
+                      ((), ('u0', 'u1', 'u2', 'u3', 'u4', 'u5'), ()))),
+  TensorCore(dims=(4,4,1), threads=1, elements_per_thread=(4,4,16), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u0","u1","u1"),
+             swizzle=(((), ('u0', 'u1', 'u2', 'u3'), ()), ((), ('u0', 'u1', 'u2', 'u3'), ()))),
+  TensorCore(dims=(2,2,1), threads=1, elements_per_thread=(2,4,4), dtype_in=dtypes.half, dtype_out=dtypes.float,
+             opts=("u0","u1"),
+             swizzle=(((), ('u0', 'u1'), ()), ((), ('u0', 'u0'), ()))),
+]

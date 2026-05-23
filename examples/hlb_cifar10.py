@@ -19,8 +19,8 @@ cifar_std = [0.24703225141799082, 0.24348516474564, 0.26158783926049628]
 BS, STEPS = getenv("BS", 512), getenv("STEPS", 1000)
 EVAL_BS = getenv("EVAL_BS", BS)
 GPUS = [f'{Device.DEFAULT}:{i}' for i in range(getenv("GPUS", 1))]
-assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}, uneven multi GPU is slow"
-assert EVAL_BS % len(GPUS) == 0, f"{EVAL_BS=} is not a multiple of {len(GPUS)=}, uneven multi GPU is slow"
+assert BS % len(GPUS) == 0, f"{BS=} is not a multiple of {len(GPUS)=}"
+assert EVAL_BS % len(GPUS) == 0, f"{EVAL_BS=} is not a multiple of {len(GPUS)=}"
 
 class UnsyncedBatchNorm:
   def __init__(self, sz:int, eps=1e-5, affine=True, track_running_stats=True, momentum=0.1, num_devices=len(GPUS)):
@@ -145,7 +145,6 @@ hyp = {
   },
 }
 
-@Context(FUSE_ARANGE=getenv("FUSE_ARANGE", 1))
 def train_cifar():
 
   def set_seed(seed):
@@ -229,7 +228,8 @@ def train_cifar():
     if getenv("RANDOM_CROP", 1):
       X = random_crop(X, crop_size=32)
     if getenv("RANDOM_FLIP", 1):
-      X = (Tensor.rand(X.shape[0],1,1,1) < 0.5).where(X.flip(-1), X) # flip LR
+      # NOTE: RANGEIFY=1 needs this contiguous or the X[perms] is very slow
+      X = (Tensor.rand(X.shape[0],1,1,1) < 0.5).where(X.flip(-1), X).contiguous() # flip LR
     X, Y = X[perms], Y[perms]
     return X, Y, *cutmix(X, Y, perms, mask_size=hyp['net']['cutmix_size'])
 
