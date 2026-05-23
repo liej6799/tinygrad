@@ -3,7 +3,7 @@ import math, sys, struct
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
-from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, CPU_COUNT
+from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, CPU_COUNT, IMAGE, FLOAT16
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, AddrSpace, truncate, float_to_bf16
 from tinygrad.renderer import Renderer
 from tinygrad.codegen.late.devectorizer import no_vectorized_alu
@@ -44,12 +44,10 @@ base_rewrite = PatternMatcher([
   # default const render
   (UPat(Ops.CONST, name="x"), lambda ctx,x: str(x.arg)),
   # new load/store
-  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var('idx')), allow_any_len=True),
-   lambda ctx,buf,idx: f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
-  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(), UPat(), UPat.var("gate"))).or_casted("bidx"), UPat.var("var"))),
-   lambda ctx,bidx,var,gate: f"({ctx[gate]}?*{ctx[bidx]}:{ctx[var]})"),
+  (UPat.var("buf").index(UPat.var('idx')), lambda ctx,buf,idx: f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
   (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"(*{ctx[bidx]})"),
-  (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var"))), lambda ctx,bidx,var: f"*{ctx[bidx]} = {ctx[var]};"),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate"))), lambda ctx,bidx,var,gate: f"({ctx[gate]}?*{ctx[bidx]}:{ctx[var]})"),
+  (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var")), allow_any_len=True), lambda ctx,bidx,var: f"*{ctx[bidx]} = {ctx[var]};"),
   # alu/gep
   # TODO: look for left-associative
   (UPat(GroupOp.ALU, name="x"), lambda ctx,x: ctx.code_for_op[x.op](
@@ -126,7 +124,7 @@ class CStyleLanguage(Renderer):
     Ops.TRUNC: lambda x,dtype: f"trunc({x})",
     Ops.AND: lambda a,b,dtype: f"({a}&{b})", Ops.XOR: lambda a,b,dtype: f"({a}^{b})", Ops.OR: lambda a,b,dtype: f"({a}|{b})",
     Ops.ADD: lambda a,b,dtype: f"({a}+{b})", Ops.SUB: lambda a,b,dtype: f"({a}-{b})", Ops.MUL: lambda a,b,dtype: f"({a}*{b})",
-    Ops.MOD: lambda a,b,dtype: f"({a}%{b})", Ops.IDIV: lambda a,b,dtype: f"({a}/{b})", Ops.CMPNE: lambda a,b,dtype: f"({a}!={b})",
+    Ops.CMOD: lambda a,b,dtype: f"({a}%{b})", Ops.CDIV: lambda a,b,dtype: f"({a}/{b})", Ops.CMPNE: lambda a,b,dtype: f"({a}!={b})",
     Ops.SHR: lambda a,b,dtype: f"({a}>>{b})", Ops.SHL: lambda a,b,dtype: f"({a}<<{b})", Ops.CMPLT: lambda a,b,dtype: f"({a}<{b})",
     Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})", Ops.CMPEQ: lambda a,b,dtype: f"({a}=={b})"}
 
@@ -274,6 +272,9 @@ class ClangRenderer(CStyleLanguage):
     defines = '\n'.join(self._render_defines(uops))
     return defines + "\n" + self._render_body(function_name, kernel, bufs, uops, prefix) + "\n" + self._render_entry(function_name, bufs)
 
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if (d != dtypes.bfloat16 or self.target.arch.startswith(("x86", "arm"))) and d not in dtypes.fp8s}
+
 class ClangJITRenderer(ClangRenderer):
   def __init__(self, target:Target):
     super().__init__(target)
@@ -302,13 +303,14 @@ class OpenCLRenderer(CStyleLanguage):
     (UPat(Ops.CONST, dtypes.bfloat16, name="x"),
       lambda ctx,x: f"{(struct.unpack('I', struct.pack('f', float_to_bf16(x.arg)))[0] >> 16)}u"),
     # load/store image (OpenCL)
-    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2)), UPat.var("gate")), UPat.var("var"))),
-      lambda ctx,buf,idx,var,gate: f"({ctx[gate]}?read_imagef({ctx[buf]}, smp, {ctx[idx]}):{ctx[var]})"),
-    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2))),)),
-      lambda ctx,buf,idx: f"read_imagef({ctx[buf]}, smp, {ctx[idx]})"),
-    (UPat(Ops.STORE, src=(UPat.var('buf').index(UPat.var('idx', dtypes.int.vec(2)), allow_any_len=True),
-                          UPat.var("var", dtypes.float.vec(4)))),
-      lambda ctx,buf,idx,var: f"write_imagef({ctx[buf]}, {ctx[idx]}, {ctx[var]});"),
+    (UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')), lambda ctx,buf,idx_y,idx_x: f"IMAGE<{ctx[buf]}, {ctx[idx_y]}, {ctx[idx_x]}>"),
+    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("var"), UPat.var("gate"))),
+      lambda ctx,buf,idx_y,idx_x,var,gate: f"({ctx[gate]}?read_imagef({ctx[buf]}, smp, (int2)({ctx[idx_x]},{ctx[idx_y]})):{ctx[var]})"),
+    (UPat(Ops.LOAD, dtype=dtypes.float.vec(4), src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')),)),
+      lambda ctx,buf,idx_y,idx_x: f"read_imagef({ctx[buf]}, smp, (int2)({ctx[idx_x]},{ctx[idx_y]}))"),
+    (UPat(Ops.STORE, src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')),
+                          UPat.var("var", dtypes.float.vec(4))), allow_any_len=True),
+      lambda ctx,buf,idx_y,idx_x,var: f"write_imagef({ctx[buf]}, (int2)({ctx[idx_x]},{ctx[idx_y]}), {ctx[var]});"),
   ]) + base_rewrite
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
@@ -321,6 +323,10 @@ class OpenCLRenderer(CStyleLanguage):
       if len(arg_dtypes) >= u.arg: arg_dtypes.append([])
       arg_dtypes[u.arg].append((i, u.dtype))
     return tuple(tuple(a) for a in arg_dtypes),
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes()
+                                      if (d != dtypes.half or "cl_khr_fp16" in self.target.arch) and
+                                      (d != dtypes.double or "cl_khr_fp64" in self.target.arch) and d not in dtypes.fp8s}
 
 class IntelRenderer(OpenCLRenderer):
   suffix, kernel_typedef = "INTEL", "__attribute__((intel_reqd_sub_group_size(8)))\n" + "__kernel void"
@@ -344,7 +350,7 @@ class MetalRenderer(CStyleLanguage):
   def __init__(self, target:Target):
     super().__init__(target)
     from tinygrad.runtime.ops_metal import MetalCompiler
-    self.compiler, self.tensor_cores = MetalCompiler(), tc.metal if target.arch == "arm64" else []
+    self.compiler, self.tensor_cores = MetalCompiler(), tc.metal if target.arch.startswith("Apple") and int(target.arch[5:]) >= 7 else []
 
   # language options
   kernel_typedef = "kernel void"
@@ -382,6 +388,10 @@ class MetalRenderer(CStyleLanguage):
   mat_a.thread_elements()[1] = a[1]; mat_b.thread_elements()[1] = b[1]; mat_c.thread_elements()[1] = c[1];
   simdgroup_multiply_accumulate(mat_c, mat_a, mat_b, mat_c);\n  return {dstr_out}(mat_c.thread_elements()[0], mat_c.thread_elements()[1]);\n}}""")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if (d != dtypes.bfloat16 or ((arch:=self.target.arch).startswith("Apple") and int(arch[5:]) >= 6))
+            and d not in dtypes.fp8s+(dtypes.double,)}
 
 _nms = list("xyzwabcdefghijkl") + [f'v{i}' for i in range(16, 32)]
 
@@ -456,6 +466,11 @@ class CUDARenderer(CStyleLanguage):
   return c;\n}}""")
 
     return super().render_kernel(function_name, kernel, bufs, uops, prefix=prefix)
+
+  def supported_dtypes(self):
+    ver = int(self.target.arch[3:])
+    return {d for d in super().supported_dtypes() if (d != dtypes.half or ver >= 53) and (d != dtypes.bfloat16 or ver >= 80)
+            and (d not in dtypes.fp8_ocp or ver >= 89) and d not in dtypes.fp8_fnuz}
 
 class NVCCRenderer(CUDARenderer):
   def __init__(self, target:Target): super().__init__(target, use_nvcc=True)
@@ -560,6 +575,9 @@ class HIPRenderer(CStyleLanguage):
   for (int n = 0; n < 8; n++) { d[n] = c_frag[n*2]; } return d;\n}""")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
+  def supported_dtypes(self): return {d for d in super().supported_dtypes()
+                                      if (d not in dtypes.fp8_ocp or self.target.arch == "gfx950") and d not in dtypes.fp8_fnuz}
+
 class HIPCCRenderer(HIPRenderer):
   def __init__(self, target:Target): super().__init__(target, use_hipcc=True)
 
@@ -568,3 +586,8 @@ class QCOMCLRenderer(OpenCLRenderer):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
     self.compiler = QCOMCompiler(target.arch)
+
+  # QCOM compiler is flaky with half
+  def supported_dtypes(self):
+    return {d for d in Renderer.supported_dtypes(self)
+            if (d != dtypes.float16 or (bool(IMAGE) and bool(FLOAT16))) and d not in dtypes.fp8s+(dtypes.bfloat16,dtypes.double)}

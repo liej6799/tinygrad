@@ -2,17 +2,16 @@ from typing import Optional, Any
 import unittest, math
 import numpy as np
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.helpers import CI, Context
+from tinygrad.helpers import Context
 from tinygrad.dtype import dtypes, DType, AddrSpace, ConstFloat  # noqa: F401
 from tinygrad.device import Buffer, Device
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, AxisType, buffers
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.engine.realize import run_linear
 from tinygrad.codegen import to_program
-from tinygrad.device import is_dtype_supported
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
-from test.helpers import to_uops_list
+from test.helpers import to_uops_list, CI
 
 def run_uops(uops_list:list[UOp], bufs:list[Buffer]):
   buf_uops = [UOp.new_buffer(b.device, b.size, b.dtype) for b in bufs]
@@ -133,17 +132,15 @@ class TestNonFloatUOps(TestUOps):
   @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, (PTXRenderer, CStyleLanguage)), "only ptx and cstyle use bitshifts")
   def test_shl_int32(self): self._test_bop_fxn(Ops.SHL, lambda a,b: int(a)<<int(b), (dtypes.int32, dtypes.int32), no_b_neg=True)
   def test_div_int32(self):
-    self._test_bop_fxn(Ops.IDIV, lambda a,b: int(a/b), (dtypes.int32, dtypes.int32), no_b_zero=True)
+    self._test_bop_fxn(Ops.CDIV, lambda a,b: int(a/b), (dtypes.int32, dtypes.int32), no_b_zero=True)
   def test_and_int32(self): self._test_bop_fxn(Ops.AND, lambda a,b: int(a)&int(b), (dtypes.int32, dtypes.int32))
   def test_or_int32(self): self._test_bop_fxn(Ops.OR, lambda a,b: int(a)|int(b), (dtypes.int32, dtypes.int32))
   def test_mod_int32(self):
-    self._test_bop_fxn(Ops.MOD,
+    self._test_bop_fxn(Ops.CMOD,
                        lambda a,b: abs(int(a))%abs(int(b))*(1,-1)[a<0], (dtypes.int32, dtypes.int32), no_b_zero=True)
   def test_cmplt_int32(self): self._test_bop_fxn(Ops.CMPLT, lambda a,b: int(a)<int(b), (dtypes.int32, dtypes.int32))
   def test_cmpne_int32(self): self._test_bop_fxn(Ops.CMPNE, lambda a,b: int(a)!=int(b), (dtypes.int32, dtypes.int32))
-  @unittest.skipUnless(is_dtype_supported(dtypes.bool), "dtype not supported")
   def test_mul_bool(self): self._test_bop_fxn(Ops.MUL, lambda a,b: bool(a) and bool(b), (dtypes.bool, dtypes.bool))
-  @unittest.skipUnless(is_dtype_supported(dtypes.float16), "dtype not supported")
   def test_where_float16(self):
     self._test_top_fxn(Ops.WHERE, lambda a,b,c: b if a!=0 else c, (dtypes.bool, dtypes.float16, dtypes.float16))
 
@@ -226,12 +223,14 @@ class TestLocalAccess(unittest.TestCase):
 class TestAssembly(unittest.TestCase):
   def test_bitshift_left(self):
     g1 = UOp(Ops.PARAM, dtypes.int32.ptr(), (), 0)
+    out = UOp(Ops.PARAM, dtypes.int32.ptr(), (), 1)
     c1 = UOp.const(dtypes.int, 2)
     c2 = UOp.const(dtypes.int, 3)
     l1 = g1.index(c1)
     a1 = UOp(Ops.MUL, dtypes.int, (l1, c1))
     a2 = UOp(Ops.MUL, dtypes.int, (l1, c2))
-    uops = to_uops_list([a1,a2], ren=Device[Device.DEFAULT].renderer)
+    uops = to_uops_list([out.index(UOp.const(dtypes.int, 0)).store(a1), out.index(UOp.const(dtypes.int, 1)).store(a2)],
+                        ren=Device[Device.DEFAULT].renderer)
     Device[Device.DEFAULT].renderer.render(uops)
     ops = [x.op for x in uops]
     self.assertIn(Ops.SHL, ops)
@@ -278,7 +277,7 @@ class TestZeroRange(unittest.TestCase):
 
 class TestUOpPrograms(unittest.TestCase):
   def _run(self, prog:UOp, *tensors:Tensor):
-    run_linear(UOp(Ops.LINEAR, src=(prog.call(*[t.uop.buf_uop for t in tensors]),)), do_update_stats=False)
+    run_linear(UOp(Ops.LINEAR, src=(prog.call(*[t.uop.buf_uop for t in tensors]),)), update_stats=False)
 
   def test_simple(self):
     out = Tensor.empty(10,10,dtype=dtypes.int)

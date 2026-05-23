@@ -68,6 +68,8 @@ class DSPRenderer(ClangRenderer):
     msrc += ["return 0; }"]
     return '\n'.join(msrc)
 
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
+
 def rpc_sc(method=0, ins=0, outs=0, fds=0): return (method << 24) | (ins << 16) | (outs << 8) | fds
 def rpc_prep_args(ins=None, outs=None, in_fds=None):
   ins, outs, in_fds = ins or list(), outs or list(), in_fds or list()
@@ -297,9 +299,7 @@ class MockDSPProgram:
       dsp_lib.write(self.lib)
       dsp_lib.flush()
       os.chmod(dsp_lib.name, 0o0777)
-      # NOTE: this timing includes a docker launch
-      proc = subprocess.run(["docker", "run", "--rm", "-i", "-v", f"{os.path.abspath(os.path.dirname(dsp_lib.name))}:/work", "-w", "/work",
-        "qemu-hexagon", "-c", f"qemu-hexagon {'-strace' if DEBUG >= 5 else ''} /work/"+os.path.basename(dsp_lib.name)],
+      proc = subprocess.run(["qemu-hexagon-static", *(['-strace'] if DEBUG >= 5 else []), dsp_lib.name],
         input=b''.join([bytes(to_mv(x.va_addr, x.size)) for x in bufs] + [struct.pack("I", x) for x in vals]), stdout=subprocess.PIPE, check=True)
     offset = 4
     for x in bufs:
