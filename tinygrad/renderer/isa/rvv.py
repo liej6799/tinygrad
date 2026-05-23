@@ -749,8 +749,11 @@ encodings = {
   # scalar float (F): src=(rs1, rs2). funct3 in {7=DYN rounding, 0=fmin, 1=fmax}
   RVVOps.FMIN_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x0, _idx(x), 0x53),
   RVVOps.FMAX_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x1, _idx(x), 0x53),
-  # scalar f32 casts (rs2 field selects the variant). FCVT.W.S funct7=0x60 rs2=0. FCVT.S.W funct7=0x68 rs2=0. funct3=7=DYN rm.
-  RVVOps.FCVT_W_S: lambda x: enc_R(0x60, 0, _r(x,0), 0x7, _idx(x), 0x53),
+  # scalar f32 casts (rs2 field selects the variant). FCVT.W.S funct7=0x60 rs2=0. FCVT.S.W funct7=0x68 rs2=0.
+  # FCVT.W.S uses funct3=1 (RTZ) to truncate toward zero, matching tinygrad/Python/C/NumPy f32->i32 semantics
+  # (DYN reads fcsr.frm which defaults to RNE on this hardware — would round 1.5→2 instead of 1.5→1).
+  # FCVT.S.W uses funct3=7 (DYN) since i32->f32 is exact for values fitting in the mantissa (no rounding needed).
+  RVVOps.FCVT_W_S: lambda x: enc_R(0x60, 0, _r(x,0), 0x1, _idx(x), 0x53),
   RVVOps.FCVT_S_W: lambda x: enc_R(0x68, 0, _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FADD_S: lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FSUB_S: lambda x: enc_R(0x04, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
