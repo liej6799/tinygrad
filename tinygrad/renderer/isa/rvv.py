@@ -307,6 +307,36 @@ def _revec(expr:UOp, i:int, vec_dt:DType) -> UOp|None:
     return None
   return None
 
+def _scalarize_stack_store(a:UOp, s:UOp, x:UOp) -> UOp|None:
+  """Fallback for STORE<addr, STACK<v0..vN-1>> when pre_isel _all_nested couldn't re-vectorize the
+  STACK (e.g. strided/transposed loads from a matmul accumulator buffer). Expand into N scalar STOREs
+  at consecutive element offsets, chained via AFTER. The scalar STORE isel pattern then emits FSWs
+  per lane.
+
+  Addr forms handled:
+    - CAST<INDEX<base, idx>, PtrDType>  (original AST, before CAST->NOOP rewrite)
+    - INDEX<base, idx>                  (bare INDEX, no CAST wrap)
+  """
+  if s.op is not Ops.STACK or not s.src: return None
+  if a.op is Ops.CAST and len(a.src) == 1 and a.src[0].op is Ops.INDEX and len(a.src[0].src) == 2:
+    base, idx = a.src[0].src
+  elif a.op is Ops.INDEX and len(a.src) == 2:
+    base, idx = a.src
+  else:
+    return None
+  if not isinstance(base.dtype, PtrDType): return None
+  # Build N scalar STOREs: STORE<INDEX<base, idx + i>, s.src[i]> for i in 0..N-1
+  stores = []
+  for i, val in enumerate(s.src):
+    lane_idx = idx if i == 0 else (idx + UOp.const(dtypes.int, i))
+    lane_addr = UOp(Ops.INDEX, base.dtype, (base, lane_idx))
+    stores.append(UOp(Ops.STORE, dtypes.void, (lane_addr, val)))
+  # Chain via AFTER: each subsequent store happens AFTER the previous.
+  chain = stores[0]
+  for nxt in stores[1:]:
+    chain = UOp(Ops.AFTER, dtypes.void, (nxt, chain))
+  return chain
+
 def _all_nested(stack:UOp) -> UOp|None:
   if stack.op is not Ops.STACK or not stack.src: return None
   ref = _revec(stack.src[0], 0, stack.dtype)
@@ -328,6 +358,10 @@ pre_isel_matcher = PatternMatcher([
   (UPat(Ops.ADD, name="x"), lambda x: _detect_reduction(x)),
   # Re-vectorize STACK(<nested ALU over GEPs, CONSTs>, ...)
   (UPat(Ops.STACK, name="x"), lambda x: _all_nested(x)),
+  # Fallback: STORE<addr, STACK<...>> where the STACK couldn't be re-vectorized (e.g. strided
+  # transposed loads from a matmul accumulator buffer) -> expand into N consecutive scalar STOREs.
+  # The scalar STORE isel pattern then emits FSWs per lane.
+  (UPat.var("a").store(UPat(Ops.STACK, name="s"), name="x"), _scalarize_stack_store),
 ])
 
 # ***** RVV instruction selection *****
