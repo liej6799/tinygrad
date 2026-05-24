@@ -155,7 +155,9 @@ class RVVOps(FastEnum):
   # pseudo-ops
   LABEL = auto(); FRAME_INDEX = auto()
   # scalar GPR ops (RV64I subset we need)
-  ADD = auto(); ADDI = auto(); SUB = auto(); MUL = auto()
+  ADD = auto(); ADDI = auto(); SUB = auto(); MUL = auto(); SLT = auto(); SLTU = auto()
+  # RV64M integer divide/remainder (used by sin/cos transcendental reduction)
+  DIV = auto(); DIVU = auto(); REM = auto(); REMU = auto()
   AND = auto(); ANDI = auto(); OR = auto(); ORI = auto(); XOR = auto(); XORI = auto()
   SLL = auto(); SLLI = auto(); SRL = auto(); SRLI = auto(); SRA = auto(); SRAI = auto()
   LUI = auto(); AUIPC = auto()
@@ -168,8 +170,11 @@ class RVVOps(FastEnum):
   FLW = auto(); FLD = auto(); FSW = auto(); FSD = auto()
   FADD_S = auto(); FSUB_S = auto(); FMUL_S = auto(); FDIV_S = auto(); FSQRT_S = auto()
   FMIN_S = auto(); FMAX_S = auto()
+  FEQ_S = auto(); FLT_S = auto()
   # scalar float casts
   FCVT_W_S = auto(); FCVT_S_W = auto()        # f32 <-> i32 (signed)
+  FCVT_L_S = auto(); FCVT_S_L = auto()        # f32 <-> i64 (signed) — RV64 only
+  FCVT_LU_S = auto(); FCVT_S_LU = auto()      # f32 <-> u64 — RV64 only
   FMV_W_X = auto(); FMV_X_W = auto()
   # ----- RVV -----
   VSETVLI = auto(); VSETIVLI = auto()
@@ -222,7 +227,7 @@ T3, T4, T5, T6 = (Register(f"t{i+3}", 28+i) for i in range(4))
 GPR = (ZERO, RA, SP, GP, TP, T0, T1, T2, FP, S1, A0, A1, A2, A3, A4, A5, A6, A7,
        S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, T3, T4, T5, T6)
 # GPRs available for general allocation (excluding zero/ra/sp/gp/tp/fp). regalloc should treat saved (s*) as callee-saved.
-WGPR = (T0, T1, T2, S1, A0, A1, A2, A3, A4, A5, A6, A7, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, T3, T4, T5, T6)
+WGPR = (T0, T1, T2, S1, A0, A1, A2, A3, A4, A5, A6, A7, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, T3, T4, T5)
 
 # scalar FPRs
 FT = tuple(Register(f"ft{i}", i) for i in range(8))            # f0-f7
@@ -395,6 +400,126 @@ def _f32_const_to_freg(c:UOp) -> UOp:
   intreg = lui if addi_imm == 0 else UOp(Ops.INS, dtypes.uint64, (lui, UOp.const(dtypes.int32, addi_imm).rtag()), RVVOps.ADDI)
   return UOp(Ops.INS, dtypes.float32, (intreg,), RVVOps.FMV_W_X)
 
+def _as_f32_reg(x:UOp) -> UOp:
+  return _f32_const_to_freg(x) if x.op is Ops.CONST and x.dtype is dtypes.float32 else x
+
+def _int_const_to_gpr(c:UOp) -> UOp|None:
+  if c.tag or c.dtype not in dtypes.ints+(dtypes.bool,): return None
+  bits = 1 if c.dtype is dtypes.bool else c.dtype.itemsize * 8
+  v = int(c.arg)
+  if c.dtype in dtypes.uints or c.dtype is dtypes.bool: v &= (1 << bits) - 1
+  if -2048 <= v <= 2047: return UOp(Ops.INS, c.dtype, (def_reg(dtypes.uint64, ZERO), imm(dtypes.int32, v)), RVVOps.ADDI)
+  # Build a 32-bit-wide value (sign-extended to 64 by RV64 LUI/ADDI) in a temp reg.
+  def _lui_addi(v32:int, dt:DType) -> UOp:
+    v32 &= 0xFFFFFFFF
+    lo12 = v32 & 0xFFF
+    hi20 = (v32 >> 12) & 0xFFFFF
+    if lo12 & 0x800:
+      hi20 = (hi20 + 1) & 0xFFFFF
+      lo12 -= 0x1000
+    lui = UOp(Ops.INS, dt, (UOp.const(dtypes.int32, hi20).rtag(),), RVVOps.LUI)
+    return lui if lo12 == 0 else UOp(Ops.INS, dt, (lui, UOp.const(dtypes.int32, lo12).rtag()), RVVOps.ADDI)
+  if bits <= 32: return _lui_addi(v, c.dtype)
+  # 64-bit immediate: build low/high halves, zero-extend low, shift high<<32, OR them.
+  # Used by sin/cos for masks like 0x3fffffffffffffff. Up to 8 instructions; collapses when a half is 0.
+  u64 = v & 0xFFFFFFFFFFFFFFFF
+  lo32, hi32 = u64 & 0xFFFFFFFF, (u64 >> 32) & 0xFFFFFFFF
+  low: UOp|None
+  if lo32 == 0: low = None
+  else:
+    low = _lui_addi(lo32, dtypes.uint64)
+    # SLLI 32 / SRLI 32 to drop the sign-extension bits ADDI may have set.
+    low = UOp(Ops.INS, dtypes.uint64, (low, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SLLI)
+    low = UOp(Ops.INS, dtypes.uint64, (low, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SRLI)
+  if hi32 == 0:
+    return low.replace(dtype=c.dtype) if low is not None else \
+           UOp(Ops.INS, c.dtype, (def_reg(dtypes.uint64, ZERO), imm(dtypes.int32, 0)), RVVOps.ADDI)
+  high = _lui_addi(hi32, dtypes.uint64)
+  high = UOp(Ops.INS, dtypes.uint64, (high, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SLLI)
+  if low is None: return high.replace(dtype=c.dtype)
+  return UOp(Ops.INS, c.dtype, (low, high), RVVOps.OR)
+
+def _zext_u32_to_u64(x:UOp) -> UOp:
+  shl = UOp(Ops.INS, dtypes.ulong, (x, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SLLI)
+  return UOp(Ops.INS, dtypes.ulong, (shl, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SRLI)
+
+def _zext_u32(x:UOp) -> UOp:
+  shl = UOp(Ops.INS, dtypes.uint32, (x, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SLLI)
+  return UOp(Ops.INS, dtypes.uint32, (shl, UOp.const(dtypes.int32, 32).rtag()), RVVOps.SRLI)
+
+def _wrap_uint32(x:UOp, ret:UOp) -> UOp:
+  if x.dtype is dtypes.uint32: return _zext_u32(ret)
+  if x.dtype in (dtypes.uint8, dtypes.uint16):
+    return UOp(Ops.INS, x.dtype, (ret, _int_const_to_gpr(UOp.const(x.dtype, (1 << (x.dtype.itemsize*8)) - 1))), RVVOps.AND)
+  return ret
+
+def _int_ins(x:UOp, op:RVVOps, src:tuple[UOp, ...]|None=None) -> UOp|None:
+  if x.dtype.count != 1 or x.dtype not in dtypes.ints+(dtypes.bool,): return None
+  ret = x.ins(op, src=src) if src is not None else x.ins(op)
+  return _wrap_uint32(x, ret)
+
+def _addi_const(a:UOp, c:UOp, x:UOp) -> UOp|None:
+  if x.dtype.count != 1: return None
+  v = int(c.arg)
+  if -2048 <= v <= 2047: return _wrap_uint32(x, x.ins(RVVOps.ADDI, src=(a, UOp.const(dtypes.int32, v).rtag())))
+  if -4096 <= v <= 4094:
+    step = -2048 if v < 0 else 2047
+    first = UOp(Ops.INS, x.dtype, (a, UOp.const(dtypes.int32, step).rtag()), RVVOps.ADDI, tag=x.tag)
+    return _wrap_uint32(x, UOp(Ops.INS, x.dtype, (first, UOp.const(dtypes.int32, v-step).rtag()), RVVOps.ADDI, tag=x.tag))
+  return None
+
+def _subi_const(a:UOp, c:UOp, x:UOp) -> UOp|None:
+  if x.dtype.count != 1: return None
+  return _addi_const(a, UOp.const(c.dtype, -int(c.arg)), x)
+
+def _shli_const(a:UOp, c:UOp, x:UOp) -> UOp|None:
+  if x.dtype.count != 1: return None
+  return _wrap_uint32(x, x.ins(RVVOps.SLLI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())))
+
+def _shr_uint(a:UOp, c:UOp, x:UOp) -> UOp|None:
+  if x.dtype.count != 1: return None
+  a = _zext_u32(a) if a.dtype is dtypes.uint32 else a
+  return _wrap_uint32(x, x.ins(RVVOps.SRLI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())))
+
+def _cmplt_uint(a:UOp, b:UOp, x:UOp) -> UOp|None:
+  if x.dtype is not dtypes.bool or a.dtype.count != 1: return None
+  return x.ins(RVVOps.SLTU, src=(_zext_u32(a) if a.dtype is dtypes.uint32 else a, _zext_u32(b) if b.dtype is dtypes.uint32 else b))
+
+def _cmpne(x:UOp) -> UOp|None:
+  if x.dtype is not dtypes.bool or len(x.src) != 2 or x.src[0].dtype.scalar() not in dtypes.ints+(dtypes.bool,): return None
+  neq = UOp(Ops.INS, x.src[0].dtype, x.src, RVVOps.XOR)
+  return UOp(Ops.INS, dtypes.bool, (def_reg(dtypes.uint64, ZERO), neq), RVVOps.SLTU)
+
+def _cmpeq(x:UOp) -> UOp|None:
+  if (neq:=_cmpne(x)) is None: return None
+  return UOp(Ops.INS, dtypes.bool, (neq, UOp.const(dtypes.int32, 1).rtag()), RVVOps.XORI)
+
+def _cmplt_float(a:UOp, b:UOp, x:UOp) -> UOp|None:
+  return x.ins(RVVOps.FLT_S, src=(_as_f32_reg(a), _as_f32_reg(b))) if x.dtype is dtypes.bool else None
+
+def _cmpne_float(a:UOp, b:UOp, x:UOp) -> UOp|None:
+  if x.dtype is not dtypes.bool: return None
+  eq = x.ins(RVVOps.FEQ_S, src=(_as_f32_reg(a), _as_f32_reg(b)))
+  return UOp(Ops.INS, dtypes.bool, (eq, UOp.const(dtypes.int32, 1).rtag()), RVVOps.XORI)
+
+def _cmod_pow2(a:UOp, c:UOp, x:UOp) -> UOp|None:
+  v = int(c.arg)
+  if v <= 0 or v & (v-1): return None
+  return UOp(Ops.AND, x.dtype, (a, UOp.const(x.dtype, v-1)))
+
+def _where_int(c:UOp, t:UOp, f:UOp, x:UOp) -> UOp|None:
+  if c.dtype is not dtypes.bool or x.dtype not in dtypes.ints or x.dtype.count != 1: return None
+  mask = UOp(Ops.INS, x.dtype, (def_reg(dtypes.uint64, ZERO), c), RVVOps.SUB)
+  diff = UOp(Ops.INS, x.dtype, (t, f), RVVOps.XOR)
+  return _wrap_uint32(x, UOp(Ops.INS, x.dtype, (f, UOp(Ops.INS, x.dtype, (mask, diff), RVVOps.AND)), RVVOps.XOR))
+
+def _where_float(c:UOp, t:UOp, f:UOp, x:UOp) -> UOp|None:
+  if c.dtype is not dtypes.bool or x.dtype is not dtypes.float32: return None
+  ti = UOp(Ops.INS, dtypes.uint32, (_as_f32_reg(t),), RVVOps.FMV_X_W)
+  fi = UOp(Ops.INS, dtypes.uint32, (_as_f32_reg(f),), RVVOps.FMV_X_W)
+  sel = _where_int(c, ti, fi, x.replace(dtype=dtypes.uint32))
+  return None if sel is None else UOp(Ops.INS, dtypes.float32, (sel,), RVVOps.FMV_W_X)
+
 def _emit_vf(x:UOp, v:UOp, c:UOp, vf_op) -> UOp:
   """Emit `<materialize const into f-reg>; <vf_op> vd, v, ft` for any float CONST."""
   return x.ins(vf_op, src=(v, _f32_const_to_freg(c)))
@@ -489,6 +614,8 @@ def _resolve_addr(a:UOp) -> UOp:
   # ADDI<zero, imm> first, then ADD<ptr, that>. Mirroring the SLLI+ADD structure of the PtrDType case
   # keeps the INS chain in the form alloc_vregs already handles correctly.
   if idx.op is Ops.CONST:
+    if -2048 <= int(idx.arg) <= 2047:
+      return UOp(Ops.INS, dtypes.uint64, (ptr, UOp.const(dtypes.int32, idx.arg).rtag()), RVVOps.ADDI)
     idx_reg = UOp(Ops.INS, dtypes.uint64, (def_reg(dtypes.uint64, ZERO), UOp.const(dtypes.int32, idx.arg).rtag()), RVVOps.ADDI)
     return UOp(Ops.INS, dtypes.uint64, (ptr, idx_reg), RVVOps.ADD)
   return UOp(Ops.INS, dtypes.uint64, (ptr, idx), RVVOps.ADD)
@@ -500,11 +627,32 @@ def _scalar_mem_addr(base:UOp, idx:UOp, itemsize:int=4) -> tuple[UOp, UOp]:
   scaling — otherwise spill slots would be at off*8 instead of off and clobber the surrounding frame."""
   effective_itemsize = itemsize if isinstance(base.dtype, PtrDType) else 1
   shift_amt = {1:0, 2:1, 4:2, 8:3}[effective_itemsize]
-  if idx.op is Ops.CONST: return base, UOp.const(dtypes.int32, idx.arg * effective_itemsize).rtag()
+  if idx.op is Ops.CONST:
+    off = int(idx.arg) * effective_itemsize
+    if -2048 <= off <= 2047: return base, UOp.const(dtypes.int32, off).rtag()
+    if -4096 <= off <= 4094:
+      step = -2048 if off < 0 else 2047
+      addr = UOp(Ops.INS, dtypes.uint64, (base, UOp.const(dtypes.int32, step).rtag()), RVVOps.ADDI, tag=(T6,))
+      if off != step: addr = UOp(Ops.INS, dtypes.uint64, (addr, UOp.const(dtypes.int32, off-step).rtag()), RVVOps.ADDI, tag=(T6,))
+      return addr, UOp.const(dtypes.int32, 0).rtag()
+    return UOp(Ops.INS, dtypes.uint64, (base, _int_const_to_gpr(UOp.const(dtypes.int32, off))), RVVOps.ADD, tag=(T6,)), UOp.const(dtypes.int32, 0).rtag()
   if shift_amt == 0:
     return UOp(Ops.INS, dtypes.uint64, (base, idx), RVVOps.ADD), UOp.const(dtypes.int32, 0).rtag()
   scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, shift_amt).rtag()), RVVOps.SLLI)
   return UOp(Ops.INS, dtypes.uint64, (base, scaled), RVVOps.ADD), UOp.const(dtypes.int32, 0).rtag()
+
+def _scalar_load(base:UOp, disp:UOp, x:UOp) -> UOp|None:
+  return x.ins(RVVOps.LD, src=_scalar_mem_addr(base, disp, 8)) if isinstance(x.dtype, PtrDType) or x.dtype in (dtypes.int64, dtypes.uint64) else (
+         x.ins(RVVOps.LW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype in (dtypes.int32, dtypes.uint32) else (
+         x.ins(RVVOps.LH if x.dtype is dtypes.int16 else RVVOps.LHU, src=_scalar_mem_addr(base, disp, 2)) if x.dtype in (dtypes.int16, dtypes.uint16) else (
+         x.ins(RVVOps.LB if x.dtype is dtypes.int8 else RVVOps.LBU, src=_scalar_mem_addr(base, disp, 1)) if x.dtype in (dtypes.int8, dtypes.uint8, dtypes.bool) else (
+         x.ins(RVVOps.FLW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype is dtypes.float32 else None))))
+
+def _gated_scalar_load(base:UOp, disp:UOp, alt:UOp, gate:UOp, x:UOp) -> UOp|None:
+  if (load:=_scalar_load(base, disp, x)) is None: return None
+  if x.dtype in dtypes.ints+(dtypes.bool,): return _where_int(gate, load, alt, x)
+  if x.dtype is dtypes.float32: return _where_float(gate, load, alt, x)
+  return None
 
 def _extract_f32_lane(x:UOp) -> UOp|None:
   if x.op is not Ops.GEP or len(x.arg) != 1 or x.src[0].dtype.count <= 1 or x.src[0].dtype.scalar() is not dtypes.float32: return None
@@ -551,38 +699,68 @@ isel_matcher = PatternMatcher([
    lambda base, disp, val, x:
      x.ins(RVVOps.SD, src=(val, *_scalar_mem_addr(base, disp, 8))) if isinstance(val.dtype, PtrDType) or val.dtype in (dtypes.int64, dtypes.uint64) else (
      x.ins(RVVOps.SW, src=(val, *_scalar_mem_addr(base, disp, 4))) if val.dtype in (dtypes.int32, dtypes.uint32) else (
-     x.ins(RVVOps.SB, src=(val, *_scalar_mem_addr(base, disp, 1))) if val.dtype is dtypes.bool else (
+     x.ins(RVVOps.SH, src=(val, *_scalar_mem_addr(base, disp, 2))) if val.dtype in (dtypes.int16, dtypes.uint16) else (
+     x.ins(RVVOps.SB, src=(val, *_scalar_mem_addr(base, disp, 1))) if val.dtype in (dtypes.int8, dtypes.uint8, dtypes.bool) else (
      x.ins(RVVOps.FSW, src=(val if val.op is not Ops.CONST else _f32_const_to_freg(val), *_scalar_mem_addr(base, disp, 4)))
-       if val.dtype is dtypes.float32 else None)))),
-  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))),), name="x"),
-   lambda base, disp, x:
-     x.ins(RVVOps.LD, src=_scalar_mem_addr(base, disp, 8)) if isinstance(x.dtype, PtrDType) or x.dtype in (dtypes.int64, dtypes.uint64) else (
-     x.ins(RVVOps.LW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype in (dtypes.int32, dtypes.uint32) else (
-     x.ins(RVVOps.LBU, src=_scalar_mem_addr(base, disp, 1)) if x.dtype is dtypes.bool else (
-     x.ins(RVVOps.FLW, src=_scalar_mem_addr(base, disp, 4)) if x.dtype is dtypes.float32 else None)))),
-  # small int constant -> ADDI(zero, imm). Larger constants would need LUI+ADDI (not yet).
-  (UPat.cvar("x", dtypes.ints+(dtypes.bool,)), lambda x:
-   x.ins(RVVOps.ADDI, src=(def_reg(dtypes.uint64, ZERO), imm(x.dtype, x.arg))) if not x.tag and -2048 <= int(x.arg) <= 2047 else None),
+       if val.dtype is dtypes.float32 else None))))),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))), UPat.var("alt"), UPat.var("gate")), name="x"),
+   _gated_scalar_load),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("base"), UPat.var("disp"))),), name="x"), _scalar_load),
+  # scalar int constants -> ADDI(zero, imm) or LUI+ADDI for 32-bit immediates.
+  (UPat.cvar("x", dtypes.ints+(dtypes.bool,)), lambda x: _int_const_to_gpr(x)),
   # INDEX(ptr, scalar_idx) -> ptr + idx*itemsize.  For now only handle CONST 0 (no-offset)
   (UPat(Ops.INDEX, name="x"), lambda x:
    x.src[0].replace(op=Ops.NOOP) if x.src[1].op is Ops.CONST and x.src[1].arg == 0 else None),
+  (UPat(Ops.INDEX, name="x"), lambda x:
+   (addr.replace(dtype=x.dtype, tag=x.tag) if (addr:=_resolve_addr(x)) is not x else None)),
   # Ops.RANGE: tag the loop counter with a vreg (WGPR); the actual init/cmp/jmp sequence is emitted in post_regalloc.
   (UPat(Ops.RANGE, name="x"), lambda ctx,x: x.replace(tag=(ctx.vreg(WGPR),)) if not isinstance(x.tag, tuple) else None),
   # Scalar int ops needed for address arithmetic inside loop bodies.
-  (UPat(Ops.SHL, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
-   lambda a,c,x: x.ins(RVVOps.SLLI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())) if x.dtype.count == 1 else None),
+  (UPat(Ops.SHL, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"), _shli_const),
   # int ADD with const (e.g. stack-pointer adjustments emitted by regalloc prologue)
-  (UPat(Ops.ADD, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
-   lambda a,c,x: x.ins(RVVOps.ADDI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())) if x.dtype.count == 1 and -2048 <= int(c.arg) <= 2047 else None),
+  (UPat(Ops.ADD, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"), _addi_const),
   # int SUB with const -> ADDI with negated imm
-  (UPat(Ops.SUB, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"),
-   lambda a,c,x: x.ins(RVVOps.ADDI, src=(a, UOp.const(dtypes.int32, -int(c.arg)).rtag())) if x.dtype.count == 1 and -2047 <= int(c.arg) <= 2048 else None),
+  (UPat(Ops.SUB, src=(UPat.var("a"), UPat.cvar("c", dtypes.ints)), name="x"), _subi_const),
   (UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("b")), name="x"),
-   lambda a,b,x: x.ins(RVVOps.ADD) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
+   lambda a,b,x: _int_ins(x, RVVOps.ADD)),
   (UPat(Ops.SUB, src=(UPat.var("a"), UPat.var("b")), name="x"),
-   lambda a,b,x: x.ins(RVVOps.SUB) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
+   lambda a,b,x: _int_ins(x, RVVOps.SUB)),
   (UPat(Ops.MUL, src=(UPat.var("a"), UPat.var("b")), name="x"),
-   lambda a,b,x: x.ins(RVVOps.MUL) if x.dtype.count == 1 and x.dtype in dtypes.ints else None),
+   lambda a,b,x: _int_ins(x, RVVOps.MUL)),
+  (UPat(Ops.AND, src=(UPat.var("a"), UPat.var("b")), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.AND)),
+  (UPat(Ops.OR, src=(UPat.var("a"), UPat.var("b")), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.OR)),
+  (UPat(Ops.XOR, src=(UPat.var("a"), UPat.var("b")), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.XOR)),
+  (UPat(Ops.SHR, src=(UPat.var("a", dtypes.uints), UPat.cvar("c", dtypes.ints)), name="x"), _shr_uint),
+  (UPat(Ops.SHR, src=(UPat.var("a", dtypes.sints), UPat.cvar("c", dtypes.ints)), name="x"),
+   lambda a,c,x: x.ins(RVVOps.SRAI, src=(a, UOp.const(dtypes.int32, c.arg).rtag())) if x.dtype.count == 1 else None),
+  (UPat(Ops.CMOD, src=(UPat.var("a", dtypes.uints), UPat.cvar("c", dtypes.uints)), name="x"), _cmod_pow2),
+  (UPat(Ops.CMOD, src=(UPat.var("a", dtypes.sints), UPat.cvar("c", dtypes.sints)), name="x"), _cmod_pow2),
+  # Generic REMU/DIVU/REM/DIV via RV64M. Used by sin/cos transcendental (uint64 // uint64).
+  # uint32 operands are zero-extended to 64 bits so the high half doesn't perturb the result.
+  (UPat(Ops.CMOD, src=(UPat.var("a", dtypes.uints), UPat.var("b", dtypes.uints)), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.REMU, src=(_zext_u32(a) if a.dtype is dtypes.uint32 else a,
+                                                _zext_u32(b) if b.dtype is dtypes.uint32 else b))),
+  (UPat(Ops.CDIV, src=(UPat.var("a", dtypes.uints), UPat.var("b", dtypes.uints)), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.DIVU, src=(_zext_u32(a) if a.dtype is dtypes.uint32 else a,
+                                                _zext_u32(b) if b.dtype is dtypes.uint32 else b))),
+  (UPat(Ops.CMOD, src=(UPat.var("a", dtypes.sints), UPat.var("b", dtypes.sints)), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.REM, src=(a, b))),
+  (UPat(Ops.CDIV, src=(UPat.var("a", dtypes.sints), UPat.var("b", dtypes.sints)), name="x"),
+   lambda a,b,x: _int_ins(x, RVVOps.DIV, src=(a, b))),
+  (UPat(Ops.CMPLT, src=(UPat.var("a", dtypes.uints), UPat.var("b")), name="x"), _cmplt_uint),
+  (UPat(Ops.CMPLT, src=(UPat.var("a", dtypes.sints), UPat.var("b")), name="x"),
+   lambda a,b,x: x.ins(RVVOps.SLT, src=(a, b)) if x.dtype is dtypes.bool and a.dtype.count == 1 else None),
+  (UPat(Ops.CMPLT, src=(UPat.var("a", dtypes.float32), UPat.var("b", dtypes.float32)), name="x"), _cmplt_float),
+  (UPat(Ops.CMPEQ, src=(UPat.var("a", dtypes.float32), UPat.var("b", dtypes.float32)), name="x"),
+   lambda a,b,x: x.ins(RVVOps.FEQ_S, src=(_as_f32_reg(a), _as_f32_reg(b))) if x.dtype is dtypes.bool else None),
+  (UPat(Ops.CMPNE, src=(UPat.var("a", dtypes.float32), UPat.var("b", dtypes.float32)), name="x"), _cmpne_float),
+  (UPat(Ops.CMPNE, name="x"), _cmpne),
+  (UPat(Ops.CMPEQ, name="x"), _cmpeq),
+  (UPat(Ops.WHERE, src=(UPat.var("c", dtypes.bool), UPat.var("t"), UPat.var("f")), name="x"), _where_int),
+  (UPat(Ops.WHERE, src=(UPat.var("c", dtypes.bool), UPat.var("t", dtypes.float32), UPat.var("f", dtypes.float32)), name="x"), _where_float),
   # Scalar lane extraction from vector values left over after pre-isel (small matmul/reductions).
   (UPat(Ops.GEP, name="x"), lambda x: _extract_f32_lane(x)),
   # Scalar f32 binary ALU with a CONST operand: load const to an f-reg first.
@@ -599,6 +777,10 @@ isel_matcher = PatternMatcher([
    lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
   (UPat(Ops.MUL, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
    lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.FDIV, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FDIV_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.FDIV, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FDIV_S, src=(_f32_const_to_freg(c), v)) if x.dtype is dtypes.float32 else None),
   # Scalar f32 ALU needed by reductions and small matmul kernels.
   (UPat(Ops.ADD, name="x"), lambda x:
    x.ins(RVVOps.FADD_S) if x.dtype is dtypes.float32 else None),
@@ -621,10 +803,14 @@ isel_matcher = PatternMatcher([
    lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
   (UPat(Ops.MUL, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
    lambda c, v, x: x.ins(RVVOps.FMUL_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.FDIV, src=(UPat.var("v"), UPat.cvar("c", dtypes.float32)), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FDIV_S, src=(v, _f32_const_to_freg(c))) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.FDIV, src=(UPat.cvar("c", dtypes.float32), UPat.var("v")), name="x"),
+   lambda c, v, x: x.ins(RVVOps.FDIV_S, src=(_f32_const_to_freg(c), v)) if x.dtype is dtypes.float32 else None),
   # max via WHERE(CMPLT(a,b), b, a) -> fmax.s ; min via WHERE(CMPLT(a,b), a, b) -> fmin.s
   (UPat(Ops.WHERE, src=(UPat(Ops.CMPLT, src=(UPat.var("a"), UPat.var("b"))), UPat.var("c"), UPat.var("d")), name="x"),
-   lambda a,b,c,d,x: (x.ins(RVVOps.FMAX_S, src=(a, b)) if (c is b and d is a) else
-                      (x.ins(RVVOps.FMIN_S, src=(a, b)) if (c is a and d is b) else None))
+   lambda a,b,c,d,x: (x.ins(RVVOps.FMAX_S, src=(_as_f32_reg(a), _as_f32_reg(b))) if (c is b and d is a) else
+                      (x.ins(RVVOps.FMIN_S, src=(_as_f32_reg(a), _as_f32_reg(b))) if (c is a and d is b) else None))
                      if x.dtype is dtypes.float32 else None),
   # vec(N) fmax/fmin: vfmax.vv / vfmin.vv (same pattern but on vector dtypes)
   (UPat(Ops.WHERE, src=(UPat(Ops.CMPLT, src=(UPat.var("a"), UPat.var("b"))), UPat.var("c"), UPat.var("d")), name="x"),
@@ -635,6 +821,38 @@ isel_matcher = PatternMatcher([
   (UPat(Ops.SQRT, name="x"), lambda x:
    x.ins(RVVOps.FSQRT_S) if x.dtype is dtypes.float32 else
    (x.ins(RVVOps.VFSQRT_V) if x.dtype.count > 1 and x.dtype.scalar() is dtypes.float32 else None)),
+  (UPat(Ops.CAST, src=(UPat(dtype=dtypes.bool),), name="x"), lambda x:
+   x.ins(RVVOps.ADDI, src=(x.src[0], imm(dtypes.int32, 0))) if x.dtype in dtypes.ints and x.dtype.count == 1 else None),
+  (UPat(Ops.CAST, src=(UPat(dtype=dtypes.bool),), name="x"), lambda x:
+   x.ins(RVVOps.FCVT_S_W, src=(x.src[0],)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.ints),), name="x"), lambda a,x:
+   x.ins(RVVOps.ADDI, src=(a, imm(dtypes.int32, 0))) if x.dtype in dtypes.ints and x.dtype.count == 1 and a.dtype.itemsize == x.dtype.itemsize else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", (dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16)),), name="x"), lambda a,x:
+   x.ins(RVVOps.ADDI, src=(a, imm(dtypes.int32, 0))) if x.dtype in (dtypes.int32, dtypes.uint32) else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.uint32),), name="x"), lambda a,x:
+   _zext_u32_to_u64(a) if x.dtype is dtypes.uint64 else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.uint64),), name="x"), lambda a,x:
+   x.ins(RVVOps.ADDI, src=(a, imm(dtypes.int32, 0))) if x.dtype in (dtypes.int32, dtypes.uint32) else None),
+  # 32-bit signed/unsigned int -> 64-bit. On RV64, int32 is held sign-extended in the register and uint32
+  # is forced zero-extended via _zext_u32_to_u64 elsewhere; copy via ADDI 0 / ADDIW 0 preserves semantics.
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.int32),), name="x"), lambda a,x:
+   x.ins(RVVOps.ADDI, src=(a, imm(dtypes.int32, 0))) if x.dtype in (dtypes.int64, dtypes.uint64) else None),
+  # f32 <-> int64 / uint64 casts via FCVT.L.S / FCVT.LU.S / FCVT.S.L / FCVT.S.LU.
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.float32),), name="x"), lambda a,x:
+   x.ins(RVVOps.FCVT_L_S, src=(a,)) if x.dtype is dtypes.int64 else
+   (x.ins(RVVOps.FCVT_LU_S, src=(a,)) if x.dtype is dtypes.uint64 else None)),
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.int64),), name="x"), lambda a,x:
+   x.ins(RVVOps.FCVT_S_L, src=(a,)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", dtypes.uint64),), name="x"), lambda a,x:
+   x.ins(RVVOps.FCVT_S_LU, src=(a,)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.CAST, src=(UPat.var("a", (dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16)),), name="x"), lambda a,x:
+   x.ins(RVVOps.FCVT_S_W, src=(a,)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.BITCAST, src=(UPat.var("a", dtypes.uint32),), name="x"), lambda a,x:
+   x.ins(RVVOps.FMV_W_X, src=(a,)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.BITCAST, src=(UPat.var("a", dtypes.int32),), name="x"), lambda a,x:
+   x.ins(RVVOps.FMV_W_X, src=(a,)) if x.dtype is dtypes.float32 else None),
+  (UPat(Ops.BITCAST, src=(UPat.var("a", dtypes.float32),), name="x"), lambda a,x:
+   x.ins(RVVOps.FMV_X_W, src=(a,)) if x.dtype in (dtypes.int32, dtypes.uint32) else None),
   (UPat(Ops.CAST, name="x"), lambda x:
    x.ins(RVVOps.FCVT_W_S) if x.dtype is dtypes.int32 and x.src[0].dtype is dtypes.float32 else
    (x.ins(RVVOps.FCVT_S_W) if x.dtype is dtypes.float32 and x.src[0].dtype is dtypes.int32 else
@@ -772,6 +990,13 @@ encodings = {
   RVVOps.ADD:  lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x0, _idx(x), 0x33),
   RVVOps.SUB:  lambda x: enc_R(0x20, _r(x,1), _r(x,0), 0x0, _idx(x), 0x33),
   RVVOps.MUL:  lambda x: enc_R(0x01, _r(x,1), _r(x,0), 0x0, _idx(x), 0x33),
+  # RV64M divide / remainder (funct7=0x01, opcode=0x33; signed vs unsigned on funct3 bit0).
+  RVVOps.DIV:  lambda x: enc_R(0x01, _r(x,1), _r(x,0), 0x4, _idx(x), 0x33),
+  RVVOps.DIVU: lambda x: enc_R(0x01, _r(x,1), _r(x,0), 0x5, _idx(x), 0x33),
+  RVVOps.REM:  lambda x: enc_R(0x01, _r(x,1), _r(x,0), 0x6, _idx(x), 0x33),
+  RVVOps.REMU: lambda x: enc_R(0x01, _r(x,1), _r(x,0), 0x7, _idx(x), 0x33),
+  RVVOps.SLT:  lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x2, _idx(x), 0x33),
+  RVVOps.SLTU: lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x3, _idx(x), 0x33),
   RVVOps.AND:  lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x7, _idx(x), 0x33),
   RVVOps.OR:   lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x6, _idx(x), 0x33),
   RVVOps.XOR:  lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x4, _idx(x), 0x33),
@@ -816,12 +1041,20 @@ encodings = {
   # scalar float (F): src=(rs1, rs2). funct3 in {7=DYN rounding, 0=fmin, 1=fmax}
   RVVOps.FMIN_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x0, _idx(x), 0x53),
   RVVOps.FMAX_S: lambda x: enc_R(0x14, _r(x,1), _r(x,0), 0x1, _idx(x), 0x53),
+  RVVOps.FEQ_S:  lambda x: enc_R(0x50, _r(x,1), _r(x,0), 0x2, _idx(x), 0x53),
+  RVVOps.FLT_S:  lambda x: enc_R(0x50, _r(x,1), _r(x,0), 0x1, _idx(x), 0x53),
   # scalar f32 casts (rs2 field selects the variant). FCVT.W.S funct7=0x60 rs2=0. FCVT.S.W funct7=0x68 rs2=0.
   # FCVT.W.S uses funct3=1 (RTZ) to truncate toward zero, matching tinygrad/Python/C/NumPy f32->i32 semantics
   # (DYN reads fcsr.frm which defaults to RNE on this hardware — would round 1.5→2 instead of 1.5→1).
   # FCVT.S.W uses funct3=7 (DYN) since i32->f32 is exact for values fitting in the mantissa (no rounding needed).
   RVVOps.FCVT_W_S: lambda x: enc_R(0x60, 0, _r(x,0), 0x1, _idx(x), 0x53),
   RVVOps.FCVT_S_W: lambda x: enc_R(0x68, 0, _r(x,0), 0x7, _idx(x), 0x53),
+  # RV64 64-bit f32 <-> int64 casts. rs2=2 selects .L (signed64), rs2=3 selects .LU (unsigned64).
+  # f32->int RTZ (funct3=1) to match Python/C trunc-toward-zero; int->f32 DYN (funct3=7), exact within mantissa range.
+  RVVOps.FCVT_L_S:  lambda x: enc_R(0x60, 2, _r(x,0), 0x1, _idx(x), 0x53),
+  RVVOps.FCVT_LU_S: lambda x: enc_R(0x60, 3, _r(x,0), 0x1, _idx(x), 0x53),
+  RVVOps.FCVT_S_L:  lambda x: enc_R(0x68, 2, _r(x,0), 0x7, _idx(x), 0x53),
+  RVVOps.FCVT_S_LU: lambda x: enc_R(0x68, 3, _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FADD_S: lambda x: enc_R(0x00, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FSUB_S: lambda x: enc_R(0x04, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
   RVVOps.FMUL_S: lambda x: enc_R(0x08, _r(x,1), _r(x,0), 0x7, _idx(x), 0x53),
