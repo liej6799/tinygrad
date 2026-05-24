@@ -353,6 +353,10 @@ pre_isel_matcher = PatternMatcher([
   (UPat(Ops.NOOP, src=(UPat(Ops.NOOP),), name="x"), lambda x: x.replace(src=x.src[0].src)),
   # NEG -> SUB(0, x). Lets re-vectorization and the SUB(const,vec)->vfrsub.vf isel handle it.
   (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.const_like(0),) + x.src)),
+  # Scalarize GEP<short-vec LOAD, lane> into a scalar LOAD at the same base+lane offset, so kernels
+  # that load a small row vec then immediately extract lanes (e.g. matmul a-row * b-col after upcast)
+  # don't need to keep the whole vec register live just to FLW one lane at a time.
+  (UPat(Ops.GEP, name="x"), lambda x: _scalarize_gep_load(x)),
   # Reduction: detect ADD-tree over all lanes of one vector -> vfredusum chain.
   # Must come before STACK re-vectorize so scalar ADDs get folded before any STACK rewrite.
   (UPat(Ops.ADD, name="x"), lambda x: _detect_reduction(x)),
@@ -451,7 +455,7 @@ def _scalarize_gep_load(x:UOp) -> UOp|None:
   Tinygrad uses this in small matmul kernels: load a short row vector, then GEP
   individual lanes for scalar FMUL/FADD. Raw GEP is not an ISA op, so remove it
   before linear regalloc."""
-  if x.op is not Ops.GEP or len(x.arg) != 1 or x.src[0].op is not Ops.LOAD or not (1 < x.src[0].dtype.count <= 2): return None
+  if x.op is not Ops.GEP or len(x.arg) != 1 or x.src[0].op is not Ops.LOAD or not (1 < x.src[0].dtype.count <= 4): return None
   lane = x.arg[0]
   addr = x.src[0].src[0]
   if addr.op is Ops.CAST and isinstance(addr.dtype, PtrDType) and isinstance(addr.src[0].dtype, PtrDType): addr = addr.src[0]
@@ -461,18 +465,33 @@ def _scalarize_gep_load(x:UOp) -> UOp|None:
   return addr.index(UOp.const(dtypes.int, lane)).load(dtype=x.dtype)
 
 def _resolve_addr(a:UOp) -> UOp:
-  """Given the `addr` src of a LOAD/STORE — possibly wrapped in NOOP(ptr, elem_idx) — return a UOp
-  whose register holds the actual byte address. If elem_idx is literal 0, returns ptr unchanged.
-  Otherwise emits SLLI (idx * sizeof(elem)) + ADD (ptr + offset).  For f32 we scale by 2 bits.
-  Assumes the LOAD/STORE is for f32 (sizeof=4 -> shift left by 2)."""
-  if a.op is not Ops.NOOP or len(a.src) < 2: return a
-  ptr, idx = a.src[0], a.src[1]
-  # detect literal-zero offset: ADDI rd, zero, 0
+  """Given the `addr` src of a vec LOAD/STORE — wrapped in NOOP(ptr, elem_idx) or bare INDEX(ptr, idx)
+  — return a UOp whose register holds the actual byte address.
+    - PtrDType ptr (e.g. PARAM<float.ptr(N)>): idx is an element index, scale by 4 (vec f32/i32 elem).
+    - raw uint64 ptr (e.g. the stack pointer from spill/fill of vec values): idx is already a byte
+      offset, no scaling.
+  Returns ptr unchanged when idx is literal 0."""
+  if a.op is Ops.NOOP and len(a.src) >= 2:
+    ptr, idx = a.src[0], a.src[1]
+  elif a.op is Ops.INDEX and len(a.src) == 2:
+    ptr, idx = a.src
+  else:
+    return a
+  # detect literal-zero offset: bare CONST 0, or already-lowered ADDI rd, zero, 0
+  if idx.op is Ops.CONST and idx.arg == 0: return ptr
   if (idx.op is Ops.INS and idx.arg is RVVOps.ADDI and len(idx.src) == 2
       and idx.src[1].op is Ops.CONST and idx.src[1].arg == 0): return ptr
-  # scale idx by sizeof(f32) = 4 via SLLI by 2
-  scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, 2).rtag()), RVVOps.SLLI)
-  return UOp(Ops.INS, dtypes.uint64, (ptr, scaled), RVVOps.ADD)
+  if isinstance(ptr.dtype, PtrDType):
+    # element index: scale by 4 (vec f32/i32 element size) via SLLI by 2
+    scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, 2).rtag()), RVVOps.SLLI)
+    return UOp(Ops.INS, dtypes.uint64, (ptr, scaled), RVVOps.ADD)
+  # raw byte offset (e.g. sp-relative): build ptr + (idx as register). For const idx, materialize via
+  # ADDI<zero, imm> first, then ADD<ptr, that>. Mirroring the SLLI+ADD structure of the PtrDType case
+  # keeps the INS chain in the form alloc_vregs already handles correctly.
+  if idx.op is Ops.CONST:
+    idx_reg = UOp(Ops.INS, dtypes.uint64, (def_reg(dtypes.uint64, ZERO), UOp.const(dtypes.int32, idx.arg).rtag()), RVVOps.ADDI)
+    return UOp(Ops.INS, dtypes.uint64, (ptr, idx_reg), RVVOps.ADD)
+  return UOp(Ops.INS, dtypes.uint64, (ptr, idx), RVVOps.ADD)
 
 def _scalar_mem_addr(base:UOp, idx:UOp, itemsize:int=4) -> tuple[UOp, UOp]:
   """Return (base_reg, imm_off) for a scalar memory op. For typed pointer bases (PtrDType), idx is an
@@ -951,20 +970,33 @@ class RVVRenderer(ISARenderer):
         if vl_count > 2047: raise NotImplementedError(f"RVV: prelude vl > 2047 (got {vl_count}); needs LUI+ADDI")
         binary.extend(enc_I(vl_count, 0, 0, 5, 0x13))                            # addi t0, zero, vl_count
         binary.extend(enc_vsetvli(rd=0, rs1=5, vtypei=vtype(SEW32, LMUL_1)))     # vsetvli zero, t0, e32, m1, ta, ma
+    # Bcc has only a 13-bit signed immediate (±4096). For longer reaches we expand at fixup time into
+    # an inverted-condition skip + JAL trampoline (Bcc{inv} skip; JAL target; skip:) — JAL has 21-bit
+    # reach. We reserve 8 bytes per Bcc up-front so the JAL trampoline has room without shifting any
+    # subsequent labels.
     for u in uops:
       if u.op is not Ops.INS: continue
       if u.arg is RVVOps.LABEL: targets[u.tag] = len(binary); continue
       if u.arg not in encodings: raise RuntimeError(f"RVV: no encoding for {u.arg}")
-      if u.arg in (RVVOps.BEQ, RVVOps.BNE, RVVOps.BLT, RVVOps.BGE, RVVOps.BLTU, RVVOps.BGEU, RVVOps.JAL): branches.append((len(binary), u))
-      binary.extend(encodings[u.arg](u))
+      if u.arg in (RVVOps.BEQ, RVVOps.BNE, RVVOps.BLT, RVVOps.BGE, RVVOps.BLTU, RVVOps.BGEU):
+        branches.append((len(binary), u))
+        binary.extend(b"\x00" * 8)  # reserve Bcc + JAL
+      elif u.arg is RVVOps.JAL:
+        branches.append((len(binary), u))
+        binary.extend(encodings[u.arg](u))
+      else:
+        binary.extend(encodings[u.arg](u))
     # fix up branch/jal offsets
     for off, u in branches:
       tgt = targets[u.tag]
-      delta = tgt - off
-      if u.arg is RVVOps.JAL: binary[off:off+4] = enc_J(delta, 0 if isinstance(u.tag, str) else _idx(u), 0x6F)
+      if u.arg is RVVOps.JAL:
+        delta = tgt - off
+        binary[off:off+4] = enc_J(delta, 0 if isinstance(u.tag, str) else _idx(u), 0x6F)
       else:
-        funct3 = {RVVOps.BEQ:0,RVVOps.BNE:1,RVVOps.BLT:4,RVVOps.BGE:5,RVVOps.BLTU:6,RVVOps.BGEU:7}[u.arg]
-        binary[off:off+4] = enc_B(delta, _r(u,1), _r(u,0), funct3, 0x63)
+        # Bcc{inv} +8 ; JAL tgt ; (fallthrough is the not-taken path of the original Bcc)
+        inv_funct3 = {RVVOps.BEQ:1, RVVOps.BNE:0, RVVOps.BLT:5, RVVOps.BGE:4, RVVOps.BLTU:7, RVVOps.BGEU:6}[u.arg]
+        binary[off:off+4] = enc_B(8, _r(u,1), _r(u,0), inv_funct3, 0x63)
+        binary[off+4:off+8] = enc_J(tgt - (off + 4), 0, 0x6F)
     return binary.hex()
 
   def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16, dtypes.float16)}
