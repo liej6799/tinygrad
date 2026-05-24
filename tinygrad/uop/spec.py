@@ -73,9 +73,9 @@ spec_shared = PatternMatcher([
   # PARAM (that's really a DEFINE_GLOBAL)
   (UPat(Ops.PARAM, name="x"), lambda x: isinstance(x.dtype, (PtrDType, ImageDType)) and x.dtype.addrspace == AddrSpace.GLOBAL),
 
-  # GROUP of stores (or groups, or NOOPs)
+  # GROUP of stores (or groups, or pseudo dependency wrappers)
   # TODO: remove UNROLL here, it's for SPEC=2
-  (UPat(Ops.GROUP, dtypes.void, src=UPat((Ops.GROUP, Ops.STORE, Ops.NOOP, Ops.UNROLL, Ops.INS))), lambda: True),
+  (UPat(Ops.GROUP, dtypes.void, src=UPat((Ops.GROUP, Ops.STORE, Ops.NOOP, Ops.UNROLL, Ops.INS, Ops.AFTER))), lambda: True),
 
   # TOOD: these should be buffer with different addrspace
   (UPat(Ops.DEFINE_LOCAL, name="x"), lambda x: isinstance(x.dtype, PtrDType) and x.dtype.addrspace == AddrSpace.LOCAL),
