@@ -24,6 +24,7 @@ DPU_BYPASS_CFG = 0x53
 DPU_EW_BYPASS_CFG = 0x383
 CORE_RESERVED_ZERO_ADDR = 0x3030
 DPU_RESERVED_ZERO_ADDR = 0x40c4
+ROCKCHIP_MULTICORE_MIN = 32768
 
 def _rk_env(name:str, default:int) -> int:
   try: return int(os.getenv(name, str(default)))
@@ -719,6 +720,25 @@ class RockchipProgram:
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
 
+  # Multicore (3-core) elementwise split.
+  # Safe ops: pure binary pointwise where output[i] = f(lhs[i], rhs[i]).
+  MULTICORE_OPS = (Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.CMPLT, Ops.CMPEQ)
+
+  def _multicore_chunks(self, size:int) -> list[tuple[int,int]] | None:
+    # split `size` fp16 elements into 3 chunks, each a multiple of 8 (one DPU atom = 8 fp16).
+    # Empirical: 3-task fanout overhead beats single-core only above ~32K fp16
+    # elements on this NPU. Below that, multicore loses to a single tile.
+    if size < ROCKCHIP_MULTICORE_MIN: return None
+    atoms = size // 8
+    if size % 8 != 0 or atoms < 3: return None
+    base = atoms // 3
+    extra = atoms - base * 3  # 0, 1, or 2 leftover atoms
+    counts = [base + (1 if i < extra else 0) for i in range(3)]
+    starts, cur = [], 0
+    for c in counts:
+      starts.append(cur); cur += c * 8
+    return list(zip(starts, [c * 8 for c in counts]))
+
   def submit(self, uop):
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
     if uop not in (Ops.FDIV, Ops.WMMA):
@@ -728,49 +748,117 @@ class RockchipProgram:
     self.q.append(0x00810000000d0008 if uop is Ops.WMMA else 0x0081000000180008)
     tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
     assert len(self.q) <= self.cmd_buf_size
+
+    chunks = None
+    if uop in self.MULTICORE_OPS and self.ew_meta is not None and getattr(self, "input_buf", None) is not None:
+      chunks = self._multicore_chunks(self.ew_meta[1])
+
+    if chunks is None:
+      regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * self.cmd_buf_size)).contents
+      for i in range(len(self.q)):
+        regcmd[i] = self.q[i]
+
+      tasks[0].flags  = 0
+      tasks[0].op_idx = 4
+      tasks[0].enable_mask = 0x18
+      tasks[0].int_mask = 0x300
+      tasks[0].int_clear = 0x1ffff
+      tasks[0].int_status = 0
+      tasks[0].regcfg_amount = len(self.q)
+      tasks[0].regcfg_offset = 0
+      tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
+
+      # TODO: update parameter name as driver updated
+      submit_res = rk.struct_rknpu_submit(
+              flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+              timeout=6000,
+              task_start=0,
+              task_number=1,
+              task_counter=0,
+              priority=0,
+              task_obj_addr=self.task_buf.meta.obj_addr,   # Placeholder, would be actual address in real code
+              regcfg_obj_addr=0,
+              task_base_addr=0,
+              user_data=0,
+              core_mask=1,
+              fence_fd=-1,
+              subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+                  rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+                  rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+                  rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
+              )
+      )
+      if uop is Ops.WMMA and DEBUG >= 7:
+        os.system("cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_emit ")
+        os.system("cd ~/npu/ops_reg/ && python dump.py 3 > /tmp/tinygrad_input")
+        os.system("cd ~/npu/ops_reg/ && python dump.py 4 > /tmp/tinygrad_weight")
+      res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
+      # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
+      if DEBUG >= 7: print(res)
+      if uop is Ops.WMMA and DEBUG >= 7:
+        os.system("cd ~/npu/ops_reg/ && python dump.py 5 > /tmp/tinygrad_output")
+      return
+
+    # 3-core split path: patch width + DMA addresses per chunk, lay regcmds side-by-side.
+    REG_WIDTH_DPU = rk.REG_DPU_DATA_CUBE_WIDTH
+    REG_WIDTH_RDMA = rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH
+    REG_OUTPUT = rk.REG_DPU_DST_BASE_ADDR
+    REG_INPUT = rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR
+    REG_WEIGHT = rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR
+    base_in, base_w, base_out = self.input_buf.meta.dma_addr, self.weight_buf.meta.dma_addr, self.output_buf.meta.dma_addr
+    qlen = len(self.q)
+    cmd_stride_words = max(32, (qlen + 7) & ~7)  # at least 32 uint64 per task, 8-uint64 aligned
+    assert cmd_stride_words * 3 <= self.cmd_buf_size, f"cmd_buf too small for 3 chunks of {qlen}"
     regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * self.cmd_buf_size)).contents
-    for i in range(len(self.q)):
-      regcmd[i] = self.q[i]
+    for i,(elem_start, elem_count) in enumerate(chunks):
+      width_m1 = elem_count // 8 - 1
+      byte_off = elem_start * 2
+      base = cmd_stride_words * i
+      for j,cmd in enumerate(self.q):
+        reg = cmd & 0xffff
+        bank = cmd >> 48
+        if reg == REG_WIDTH_DPU or reg == REG_WIDTH_RDMA:
+          cmd = (bank << 48) | ((width_m1 & 0xffffffff) << 16) | reg
+        elif reg == REG_OUTPUT:
+          cmd = (bank << 48) | (((base_out + byte_off) & 0xffffffff) << 16) | reg
+        elif reg == REG_INPUT:
+          cmd = (bank << 48) | (((base_in + byte_off) & 0xffffffff) << 16) | reg
+        elif reg == REG_WEIGHT:
+          cmd = (bank << 48) | (((base_w + byte_off) & 0xffffffff) << 16) | reg
+        regcmd[base + j] = cmd
 
-    tasks[0].flags  = 0
-    tasks[0].op_idx = 4
-    tasks[0].enable_mask = 0x18
-    tasks[0].int_mask = 0x300
-    tasks[0].int_clear = 0x1ffff
-    tasks[0].int_status = 0
-    tasks[0].regcfg_amount = len(self.q)
-    tasks[0].regcfg_offset = 0
-    tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
+      tasks[i].flags = 0
+      tasks[i].op_idx = 4
+      tasks[i].enable_mask = 0x18
+      tasks[i].int_mask = 0x300
+      tasks[i].int_clear = 0x1ffff
+      tasks[i].int_status = 0
+      tasks[i].regcfg_amount = qlen
+      tasks[i].regcfg_offset = 0
+      tasks[i].regcmd_addr = self.cmd_buf.meta.dma_addr + cmd_stride_words * 8 * i
 
-    # TODO: update parameter name as driver updated
     submit_res = rk.struct_rknpu_submit(
-            flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
-            timeout=6000,
-            task_start=0,
-            task_number=1,
-            task_counter=0,
-            priority=0,
-            task_obj_addr=self.task_buf.meta.obj_addr,   # Placeholder, would be actual address in real code
-            regcfg_obj_addr=0,
-            task_base_addr=0,
-            user_data=0,
-            core_mask=1,
-            fence_fd=-1,
-            subcore_task=(rk.struct_rknpu_subcore_task * 5)(
-                rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
-                rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
-                rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
-            )
+        flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+        timeout=6000,
+        task_start=0,
+        task_number=3,
+        task_counter=0,
+        priority=0,
+        task_obj_addr=self.task_buf.meta.obj_addr,
+        regcfg_obj_addr=0,
+        task_base_addr=0,
+        user_data=0,
+        core_mask=0x7,
+        fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+            rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
+            rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
+            rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+            rk.struct_rknpu_subcore_task(task_start=1, task_number=1),
+            rk.struct_rknpu_subcore_task(task_start=2, task_number=1),
+        ),
     )
-    if uop is Ops.WMMA and DEBUG >= 7:
-      os.system("cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_emit ")
-      os.system("cd ~/npu/ops_reg/ && python dump.py 3 > /tmp/tinygrad_input")
-      os.system("cd ~/npu/ops_reg/ && python dump.py 4 > /tmp/tinygrad_weight")
-    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
-    # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
-    if DEBUG >= 7: print(res)
-    if uop is Ops.WMMA and DEBUG >= 7:
-      os.system("cd ~/npu/ops_reg/ && python dump.py 5 > /tmp/tinygrad_output")
+    rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
 
   def submit_conv(self):
     tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
@@ -906,11 +994,16 @@ class RockchipProgram:
           else:
             values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
         elif uop is Ops.LOAD:
+          # ops_rockchip's INDEX produces (m, o, g) triples (gate is set last in INDEX),
+          # but ops_python.load() expects (m, x) pairs. Encode the gate by setting the
+          # offset to None when False — _load returns 0.0 for None, matching gate semantics.
+          masked_index = [(m, o if g else None) for (m, o, g) in src_values[0]]
+          load_srcs = [masked_index] + list(src_values[1:])
           if dtype.count > 1:
-            values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
-                               for i in range(len(src_values))], j, dtype.scalar()) for j in range(dtype.count)]
+            values[i] = [load([load_srcs[k][j] if k != 0 and src_dtypes[k].count > 1 else load_srcs[k] \
+                               for k in range(len(load_srcs))], j, dtype.scalar()) for j in range(dtype.count)]
           else:
-            values[i] = load(src_values, 0, dtype)
+            values[i] = load(load_srcs, 0, dtype)
         elif uop is Ops.GEP: values[i] = src_values[0][get_single_element(arg)]
         elif uop is Ops.WMMA and False:
           first_src_dtype = self.uops[srcs[0]][1]
@@ -1095,7 +1188,6 @@ class RockchipProgram:
           else:
             allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR)
             if allow_fallback:
-              print('ALLOWED FALLBACK TO CPU', uop, dtype)
               values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
             else:
               print('<!> EXIT OPERATION NOT SUPPORTED', uop, dtype, src_values)
