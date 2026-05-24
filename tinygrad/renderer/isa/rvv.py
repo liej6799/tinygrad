@@ -475,10 +475,13 @@ def _resolve_addr(a:UOp) -> UOp:
   return UOp(Ops.INS, dtypes.uint64, (ptr, scaled), RVVOps.ADD)
 
 def _scalar_mem_addr(base:UOp, idx:UOp, itemsize:int=4) -> tuple[UOp, UOp]:
-  """Return (base_reg, imm_off) for a scalar memory op. Static indices use the imm field
-  (with byte scaling); dynamic element indices are converted to byte addresses with SLLI+ADD."""
-  shift_amt = {1:0, 2:1, 4:2, 8:3}[itemsize]
-  if idx.op is Ops.CONST: return base, UOp.const(dtypes.int32, idx.arg * itemsize).rtag()
+  """Return (base_reg, imm_off) for a scalar memory op. For typed pointer bases (PtrDType), idx is an
+  element index and we scale by itemsize to get a byte offset. For raw uint64 bases (e.g. the stack
+  pointer in spill/fill paths), idx is ALREADY a byte offset (regalloc allocates in bytes), so no
+  scaling — otherwise spill slots would be at off*8 instead of off and clobber the surrounding frame."""
+  effective_itemsize = itemsize if isinstance(base.dtype, PtrDType) else 1
+  shift_amt = {1:0, 2:1, 4:2, 8:3}[effective_itemsize]
+  if idx.op is Ops.CONST: return base, UOp.const(dtypes.int32, idx.arg * effective_itemsize).rtag()
   if shift_amt == 0:
     return UOp(Ops.INS, dtypes.uint64, (base, idx), RVVOps.ADD), UOp.const(dtypes.int32, 0).rtag()
   scaled = UOp(Ops.INS, dtypes.uint64, (idx, UOp.const(dtypes.int32, shift_amt).rtag()), RVVOps.SLLI)
