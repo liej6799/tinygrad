@@ -6,7 +6,7 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
-  if k.ren.device == "ROCKCHIP" and os.getenv("ROCKCHIP_FUSED_MATMUL", "1") != "0":
+  if k.ren.target.device == "ROCKCHIP" and os.getenv("ROCKCHIP_FUSED_MATMUL", "1") != "0":
     matched, reason = k._match_rockchip_gemm()
     if matched: return k
     # Keep tensor-core lowering available as the deterministic fallback path.
