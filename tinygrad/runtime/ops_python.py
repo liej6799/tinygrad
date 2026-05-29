@@ -25,6 +25,83 @@ def _store(m, i, v, dtype: DType):
   if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
   m[i] = to_storage_scalar(v, dtype)
 
+def _uops_to_onnx(name:str, uops:list[tuple[Ops, DType, list[int], Any]], path:str):
+  import onnx
+  from onnx import TensorProto, helper
+  onnx_dtypes = {dtypes.float16: TensorProto.FLOAT16, dtypes.float32: TensorProto.FLOAT, dtypes.float64: TensorProto.DOUBLE,
+                 dtypes.int8: TensorProto.INT8, dtypes.int16: TensorProto.INT16, dtypes.int32: TensorProto.INT32, dtypes.int64: TensorProto.INT64,
+                 dtypes.uint8: TensorProto.UINT8, dtypes.uint16: TensorProto.UINT16, dtypes.uint32: TensorProto.UINT32,
+                 dtypes.uint64: TensorProto.UINT64, dtypes.bool: TensorProto.BOOL}
+  onnx_ops = {Ops.ADD: "Add", Ops.SUB: "Sub", Ops.MUL: "Mul", Ops.FDIV: "Div", Ops.MAX: "Max", Ops.CMPLT: "Less", Ops.CMPEQ: "Equal"}
+  def param_name(i:int):
+    dtype, arg = uops[i][1], uops[i][3]
+    assert isinstance(dtype, PtrDType) and dtype.size != -1
+    return f"data{arg}_{dtype.size}"
+  def value_info(i:int, name:str):
+    dtype = uops[i][1]
+    assert isinstance(dtype, PtrDType) and dtype.size != -1
+    return helper.make_tensor_value_info(name, onnx_dtypes[dtype.base.scalar()], [dtype.size])
+  def matmul_value_info(i:int, name:str, shape:list[int]):
+    dtype = uops[i][1]
+    assert isinstance(dtype, PtrDType)
+    return helper.make_tensor_value_info(name, onnx_dtypes[dtype.base.scalar()], shape)
+  dims = [int(x) for x in name[2:].split("_")] if name.startswith("r_") else []
+  params = [i for i,(op,_,_,_) in enumerate(uops) if op is Ops.PARAM]
+  if len(dims) == 3 and len(params) == 3:
+    m,n,k = dims
+    out, a, b = params
+    nodes, initializers, elems = [], [], []
+    idxs = set()
+    def idx(name:str, x:int):
+      if name not in idxs:
+        initializers.append(helper.make_tensor(name, TensorProto.INT64, [1], [x]))
+        idxs.add(name)
+      return name
+    for y in range(m):
+      for x in range(n):
+        acc = None
+        for z in range(k):
+          ar, av, br, bv, mul = f"a_r{y}_{x}_{z}", f"a_{y}_{x}_{z}", f"b_r{y}_{x}_{z}", f"b_{y}_{x}_{z}", f"mul_{y}_{x}_{z}"
+          nodes += [helper.make_node("Gather", [param_name(a), idx(f"ai_{y}_{z}", y)], [ar], name=f"gather_a_row_{y}_{z}", axis=0),
+                    helper.make_node("Gather", [ar, idx(f"ak_{y}_{z}", z)], [av], name=f"gather_a_{y}_{z}", axis=1),
+                    helper.make_node("Gather", [param_name(b), idx(f"bi_{z}_{x}", z)], [br], name=f"gather_b_row_{z}_{x}", axis=0),
+                    helper.make_node("Gather", [br, idx(f"bj_{z}_{x}", x)], [bv], name=f"gather_b_{z}_{x}", axis=1),
+                    helper.make_node("Mul", [av, bv], [mul], name=mul)]
+          if acc is None: acc = mul
+          else:
+            nodes.append(helper.make_node("Add", [acc, mul], [f"add_{y}_{x}_{z}"], name=f"add_{y}_{x}_{z}"))
+            acc = f"add_{y}_{x}_{z}"
+        elems.append(acc)
+    initializers.append(helper.make_tensor("out_shape", TensorProto.INT64, [2], [m, n]))
+    nodes += [helper.make_node("Concat", elems, ["flat_out"], name="concat_out", axis=0),
+              helper.make_node("Reshape", ["flat_out", "out_shape"], [param_name(out)], name="reshape_out")]
+    graph = helper.make_graph(nodes, name, [matmul_value_info(a, param_name(a), [m, k]), matmul_value_info(b, param_name(b), [k, n])],
+                              [matmul_value_info(out, param_name(out), [m, n])], initializers)
+    model = helper.make_model(graph, producer_name="tinygrad-uop-export", opset_imports=[helper.make_operatorsetid("", 13)])
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    return
+  param_stores = {uops[srcs[0]][2][0] for op,_,srcs,_ in uops if op is Ops.STORE and uops[srcs[0]][0] is Ops.INDEX}
+  values, indexes, nodes, initializers, outputs = {}, {}, [], [], []
+  inputs = [value_info(i, param_name(i)) for i,(op,_,_,_) in enumerate(uops) if op is Ops.PARAM and i not in param_stores]
+  for i,(op,dtype,srcs,arg) in enumerate(uops):
+    if op is Ops.INDEX: indexes[i] = srcs[0]
+    elif op is Ops.LOAD: values[i] = param_name(indexes[srcs[0]])
+    elif op is Ops.CONST and dtype.scalar() in onnx_dtypes:
+      values[i] = f"uop{i}"
+      initializers.append(helper.make_tensor(values[i], onnx_dtypes[dtype.scalar()], [], [arg]))
+    elif op in onnx_ops:
+      values[i] = f"uop{i}"
+      nodes.append(helper.make_node(onnx_ops[op], [values[x] for x in srcs], [values[i]], name=f"uop{i}_{onnx_ops[op].lower()}"))
+    elif op is Ops.STORE:
+      out = param_name(indexes[srcs[0]])
+      nodes.append(helper.make_node("Identity", [values[srcs[1]]], [out], name=f"uop{i}_store"))
+      outputs.append(value_info(indexes[srcs[0]], out))
+  model = helper.make_model(helper.make_graph(nodes, name, inputs, outputs, initializers),
+                            producer_name="tinygrad-uop-export", opset_imports=[helper.make_operatorsetid("", 13)])
+  onnx.checker.check_model(model)
+  onnx.save(model, path)
+
 # here are the models for the WMMA instruction on the different hardware
 def generic_wmma_helper(inp, warp_size, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_elem, b_elem, c_map):
   for cc, tinp, num in zip(("A", "B", "C"), inp, (NUM_A, NUM_B, NUM_C)):
@@ -41,8 +118,11 @@ def generic_wmma_helper(inp, warp_size, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_
 
 class PythonProgram:
   def __init__(self, name:str, lib:bytes, **kwargs):
+    self.name = name
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    print(self.uops)
+    if uops_onnx := getenv("UOPS_ONNX", ""): _uops_to_onnx(self.name, self.uops, uops_onnx)
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)

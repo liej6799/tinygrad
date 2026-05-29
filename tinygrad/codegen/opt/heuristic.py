@@ -6,14 +6,6 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
-  if k.ren.target.device == "ROCKCHIP" and os.getenv("ROCKCHIP_FUSED_MATMUL", "1") != "0":
-    matched, reason = k._match_rockchip_gemm()
-    if matched: return k
-    # Keep tensor-core lowering available as the deterministic fallback path.
-    # The Rockchip runtime can still choose fused execution by kernel name.
-    if os.getenv("ROCKCHIP_FUSED_MATMUL_ONLY", "0") != "0" and reason is not None:
-      raise KernelOptError(f"FUSED_MATMUL_FALLBACK:{reason}")
-
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
   Tensor cores are optimized instructions that matrix multiply-accumulate across a wave of threads: D(M, N) = A(M, K) * B(K, N) + C(M, N).

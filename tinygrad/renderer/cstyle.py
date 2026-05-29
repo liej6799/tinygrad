@@ -44,7 +44,7 @@ base_rewrite = PatternMatcher([
   # default const render
   (UPat(Ops.CONST, name="x"), lambda ctx,x: str(x.arg)),
   # new load/store
-  (UPat.var("buf").index(UPat.var('idx')), lambda ctx,buf,idx: f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
+  (UPat.var("buf").index(UPat.var('idx')), lambda ctx,buf,idx: f"({ctx[buf]}/*IDX*/+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
   (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"(*{ctx[bidx]})"),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate"))), lambda ctx,bidx,var,gate: f"({ctx[gate]}?*{ctx[bidx]}:{ctx[var]})"),
   (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var")), allow_any_len=True), lambda ctx,bidx,var: f"*{ctx[bidx]} = {ctx[var]};"),
@@ -123,7 +123,7 @@ class CStyleLanguage(Renderer):
     Ops.EXP2: lambda x,dtype: f"exp2({x})", Ops.LOG2: lambda x,dtype: f"log2({x})", Ops.SIN: lambda x,dtype: f"sin({x})",
     Ops.TRUNC: lambda x,dtype: f"trunc({x})",
     Ops.AND: lambda a,b,dtype: f"({a}&{b})", Ops.XOR: lambda a,b,dtype: f"({a}^{b})", Ops.OR: lambda a,b,dtype: f"({a}|{b})",
-    Ops.ADD: lambda a,b,dtype: f"({a}+{b})", Ops.SUB: lambda a,b,dtype: f"({a}-{b})", Ops.MUL: lambda a,b,dtype: f"({a}*{b})",
+    Ops.ADD: lambda a,b,dtype: f"(/*ADD*/{a}+{b})", Ops.SUB: lambda a,b,dtype: f"({a}-{b})", Ops.MUL: lambda a,b,dtype: f"(/*MUL*/{a}*{b})",
     Ops.CMOD: lambda a,b,dtype: f"({a}%{b})", Ops.CDIV: lambda a,b,dtype: f"({a}/{b})", Ops.CMPNE: lambda a,b,dtype: f"({a}!={b})",
     Ops.SHR: lambda a,b,dtype: f"({a}>>{b})", Ops.SHL: lambda a,b,dtype: f"({a}<<{b})", Ops.CMPLT: lambda a,b,dtype: f"({a}<{b})",
     Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})", Ops.CMPEQ: lambda a,b,dtype: f"({a}=={b})"}
@@ -230,7 +230,14 @@ class ClangRenderer(CStyleLanguage):
   code_for_op = {**({k:v for k,v in CStyleLanguage.code_for_op.items() if k not in [Ops.EXP2, Ops.SIN, Ops.LOG2, Ops.TRUNC, Ops.RECIPROCAL]}),
                  Ops.SQRT: lambda x,dtype: f"__builtin_sqrt({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})",
                  Ops.TRUNC: lambda x,dtype: f"__builtin_trunc({x})" if dtype == dtypes.float64 else f"__builtin_truncf({x})",
-                 Ops.FDIV: lambda a,b,dtype: f"({a}/{b})"}
+                 # arithmetic ADD/SUB/MUL/DIV go through per-type C functions (declared in _render_defines) instead of inlined operators
+                 Ops.ADD:  lambda a,b,dtype: f"add({a}, {b})",
+                 Ops.SUB:  lambda a,b,dtype: f"sub({a}, {b})",
+                 Ops.MUL:  lambda a,b,dtype: f"mul({a}, {b})",
+                 Ops.CDIV: lambda a,b,dtype: f"div({a}, {b})",
+                 Ops.FDIV: lambda a,b,dtype: f"div({a}, {b})",
+                 # listing MULACC here makes the late-rewrite fuse a*b+c into a single ternary call (decompositions.py:500)
+                 Ops.MULACC: lambda a,b,c,dtype: f"mulacc({a}, {b}, {c})"}
 
   # LLVM legalizes double => half/bf16 cast on systems that don't support it natively (like x86 cpus without AVX512-FP16) into a compiler-rt libcall.
   # there is also no native bfl16 <-> fp16 conversion on those CPUs
@@ -249,6 +256,30 @@ class ClangRenderer(CStyleLanguage):
 
   def _render_defines(self, uops) -> list[str]:
     prefix = [self.render_vector_prefix(dt) for dt in uops_to_dtypes(uops) if dt.count > 1]
+    # ADD/SUB/MUL/DIV helpers: per-type real C functions dispatched by a _Generic macro, so Ops.{ADD,SUB,MUL,CDIV,FDIV} emit add/sub/mul/div(a,b).
+    prefix += [
+      "static inline int    add_i(int    a, int    b) { return a + b; }",
+      "static inline float  add_f(float  a, float  b) { return a + b; }",
+      "static inline double add_d(double a, double b) { return a + b; }",
+      "#define add(a, b) _Generic((a), int: add_i, float: add_f, double: add_d, default: add_i)((a), (b))",
+      "static inline int    sub_i(int    a, int    b) { return a - b; }",
+      "static inline float  sub_f(float  a, float  b) { return a - b; }",
+      "static inline double sub_d(double a, double b) { return a - b; }",
+      "#define sub(a, b) _Generic((a), int: sub_i, float: sub_f, double: sub_d, default: sub_i)((a), (b))",
+      "static inline int    mul_i(int    a, int    b) { return a * b; }",
+      "static inline float  mul_f(float  a, float  b) { return a * b; }",
+      "static inline double mul_d(double a, double b) { return a * b; }",
+      "#define mul(a, b) _Generic((a), int: mul_i, float: mul_f, double: mul_d, default: mul_i)((a), (b))",
+      "static inline int    div_i(int    a, int    b) { return a / b; }",
+      "static inline float  div_f(float  a, float  b) { return a / b; }",
+      "static inline double div_d(double a, double b) { return a / b; }",
+      "#define div(a, b) _Generic((a), int: div_i, float: div_f, double: div_d, default: div_i)((a), (b))",
+      # MULACC: fused multiply-add (a*b+c) as a single ternary call instead of nested add(mul(...), ...)
+      "static inline int    mulacc_i(int    a, int    b, int    c) { return a * b + c; }",
+      "static inline float  mulacc_f(float  a, float  b, float  c) { return a * b + c; }",
+      "static inline double mulacc_d(double a, double b, double c) { return a * b + c; }",
+      "#define mulacc(a, b, c) _Generic((a), int: mulacc_i, float: mulacc_f, double: mulacc_d, default: mulacc_i)((a), (b), (c))",
+    ]
     # https://github.com/corsix/amx
     for name, (N, M, _), dtype_in, _, _, _, _, _ in wmma_args(uops):
       prefix += [

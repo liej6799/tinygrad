@@ -34,8 +34,9 @@ class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     prg = pickle.loads(lib)
     self.ew_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "elementwise" else None
+    self.addchain_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "addchain" else None
     self.conv_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "conv1x1" and not name.startswith("rkmm_v1_") else None
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None or self.conv_meta is not None else prg
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if (self.ew_meta or self.addchain_meta or self.conv_meta) is not None else prg
     self.device = dev
     self.q = []
     self.hardware_ops = {Ops.WMMA:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
@@ -300,6 +301,94 @@ class RockchipProgram:
       ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
+
+  def _run_addchain(self, size:int, out_slot:int, input_slots:list[int], bufs:tuple[Any, ...]) -> None:
+    # Chained elementwise add: out = in[0] + in[1] + ... + in[K-1], computed as N=K-1 ADD ops.
+    # Instead of one ioctl submit per add (the generic interpreter path), pack all N ops as N
+    # tasks into a SINGLE DRM_IOCTL_RKNPU_SUBMIT (task_number=N), the way the RKNN runtime does.
+    # Intermediates stay resident on-device (task k's dst feeds task k+1's feature), so there is
+    # exactly one host->device upload of the inputs and one device->host readback of the result.
+    K = len(input_slots)
+    N = K - 1
+    nbytes = size * 2
+    self.task_buf = self.device._gpu_alloc(max(1024, 64 * N), rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+    self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
+    in_bufs = [self.device._gpu_alloc(nbytes, 0, name=f"input{i}") for i in range(K)]
+    out_bufs = [self.device._gpu_alloc(nbytes, 0, name=f"out{i}") for i in range(N)]
+    try:
+      for i, slot in enumerate(input_slots):
+        src = memoryview(bufs[slot])[:nbytes]
+        ctypes.memmove(in_bufs[i].va_addr, mv_address(src), nbytes)
+        self.device._gpu_sync(in_bufs[i], rk.RKNPU_MEM_SYNC_TO_DEVICE)
+
+      tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
+      regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * self.cmd_buf_size)).contents
+      acc = in_bufs[0]
+      cmd_stride = None
+      for k in range(N):
+        feat, ew, dst = acc, in_bufs[k + 1], out_bufs[k]
+        self.q, self.lut_enable = [], False
+        self.boilerplate(op=Ops.ADD, size=size, arg=None)
+        # Tasks run back-to-back on one core with no reset_npu() between them, so unlike the
+        # single-op path each task must fully specify the BS/BN sub-block state rather than relying
+        # on post-reset defaults. NOTE: this is necessary but not yet sufficient -- the task is not
+        # fully self-contained, so the chain still hangs the NPU; see _addchain_meta for status.
+        self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+          self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+          self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+          self.reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+          self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+          self.reg(dst.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+        self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+          self.reg(feat.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
+                    rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+        self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+          self.reg(ew.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
+                    rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+        # per-task trailer: RDMA feature-mode cfg + PC_OPERATION_ENABLE trigger (mirrors submit())
+        self.q.append(0x2001000178495044)
+        self.q.append(0x0081000000180008)
+        qlen = len(self.q)
+        if cmd_stride is None: cmd_stride = max(32, (qlen + 7) & ~7)
+        assert cmd_stride * N <= self.cmd_buf_size, f"cmd_buf too small for {N} chained adds"
+        for j in range(qlen): regcmd[cmd_stride * k + j] = self.q[j]
+        tasks[k].flags = 0
+        tasks[k].op_idx = 4
+        tasks[k].enable_mask = 0x18
+        tasks[k].int_mask = 0x300
+        tasks[k].int_clear = 0x1ffff
+        tasks[k].int_status = 0
+        tasks[k].regcfg_amount = qlen
+        tasks[k].regcfg_offset = 0
+        tasks[k].regcmd_addr = self.cmd_buf.meta.dma_addr + cmd_stride * 8 * k
+        acc = dst
+
+      # all N tasks run sequentially on core 0 (the chain is data-dependent, so it can't be split
+      # across cores like the multicore elementwise path)
+      submit_res = rk.struct_rknpu_submit(
+        flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+        timeout=6000, task_start=0, task_number=N, task_counter=0, priority=0,
+        task_obj_addr=self.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
+        user_data=0, core_mask=1, fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+          rk.struct_rknpu_subcore_task(task_start=0, task_number=N),
+          rk.struct_rknpu_subcore_task(task_start=N, task_number=0),
+          rk.struct_rknpu_subcore_task(task_start=N, task_number=0),
+        ),
+      )
+      self.device.submit_job(submit_res)
+      self.device._gpu_sync(out_bufs[-1], rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:nbytes]), out_bufs[-1].va_addr, nbytes)
+    finally:
+      self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, *in_bufs, *out_bufs])
 
   def _run_conv1x1(self, out_slot:int, in_slot:int, weight_slot:int, in_channels:int, out_channels:int, spatial:int, bufs:tuple[Any, ...]) -> None:
     if in_channels == 1:
@@ -792,7 +881,7 @@ class RockchipProgram:
         os.system("cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_emit ")
         os.system("cd ~/npu/ops_reg/ && python dump.py 3 > /tmp/tinygrad_input")
         os.system("cd ~/npu/ops_reg/ && python dump.py 4 > /tmp/tinygrad_weight")
-      res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
+      res = self.device.submit_job(submit_res)
       # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
       if DEBUG >= 7: print(res)
       if uop is Ops.WMMA and DEBUG >= 7:
@@ -858,7 +947,7 @@ class RockchipProgram:
             rk.struct_rknpu_subcore_task(task_start=2, task_number=1),
         ),
     )
-    rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
+    self.device.submit_job(submit_res)
 
   def submit_conv(self):
     tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
@@ -895,7 +984,7 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
-    rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
+    self.device.submit_job(submit_res)
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
@@ -903,6 +992,10 @@ class RockchipProgram:
     if self.ew_meta is not None:
       op, size, out_slot, lhs_slot, rhs_slot = self.ew_meta
       self._run_elementwise(op, size, out_slot, lhs_slot, rhs_slot, bufs)
+      return time.perf_counter() - st
+    if self.addchain_meta is not None:
+      size, out_slot, input_slots = self.addchain_meta
+      self._run_addchain(size, out_slot, list(input_slots), bufs)
       return time.perf_counter() - st
     if self.fused_matmul_meta is not None:
       try:
@@ -1298,6 +1391,79 @@ class RockchipRenderer(Renderer):
         if lhs[2] is not None and lhs[2] != (j,): return None
     return (flat_op, size, 0, 1, 2) if flat_op is not None else None
 
+  def _addchain_meta(self, uops:list[UOp]):
+    # Match a left-deep chain of >=2 elementwise half ADDs into a single output:
+    #   out[i] = (((in0[i] + in1[i]) + in2[i]) + ...)
+    # Handles both the scalar form and the vectorized form, where the stored value is a STACK of
+    # V structurally-identical ADD chains over GEP components of vec loads (tinygrad's per-thread
+    # emulation layout; the hardware op is still plain elementwise). The single-ADD case is left to
+    # _elementwise_meta. Returns (size, out_slot, [input_slots]) for the batched-submit runtime.
+    #
+    # STATUS: WIP, default OFF. Detection + buffer/task/submit layout are correct and the chain
+    # collapses N adds into one DRM_IOCTL_RKNPU_SUBMIT (task_number=N), matching the RKNN runtime.
+    # The blocker is that a single chained task is not yet fully self-contained: the single-op path
+    # relies on reset_npu() clearing all DPU registers to defaults before each submit, but chained
+    # tasks share one core with no reset between them, so each task must explicitly re-specify the
+    # full DPU register set (RKNN emits ~69 regs/task vs tinygrad's ~12). Until that register set is
+    # reconstructed, enabling this hangs the NPU. Enable with ROCKCHIP_FUSE_ADDCHAIN=1 to develop.
+    if os.getenv("ROCKCHIP_FUSE_ADDCHAIN", "0") == "0": return None
+    params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
+    if len(params) < 4 or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
+    size = params[0][1].dtype.size
+    if any(u.dtype.size != size for _,u in params): return None
+    slot_of = {p[0]:slot for slot,p in enumerate(params)}  # uop index -> buffer slot
+
+    def leaf(u:UOp, want_comp):
+      # peel GEP(comp)? -> LOAD -> CAST? -> INDEX(param, idx); returns (slot, idx_uop) or None
+      comp = None
+      if u.op is Ops.GEP:
+        if len(u.arg) != 1: return None
+        comp, u = u.arg[0], u.src[0]
+      if u.op is not Ops.LOAD: return None
+      idx = u.src[0]
+      if idx.op is Ops.CAST: idx = idx.src[0]
+      if idx.op is not Ops.INDEX: return None
+      if want_comp is not None and comp != want_comp: return None
+      return (slot_of.get(uops.index(idx.src[0])), idx.src[1])
+
+    def chain(node:UOp, comp):
+      # walk left-deep ADD tree; return (input_slots, common_idx) or None
+      inputs:list = []
+      idx_ref = None
+      while node.op is Ops.ADD and node.dtype.scalar() is dtypes.half and len(node.src) == 2:
+        info = leaf(node.src[1], comp)
+        if info is None: return None
+        inputs.append(info[0])
+        if idx_ref is None: idx_ref = info[1]
+        elif info[1] is not idx_ref: return None
+        node = node.src[0]
+      info = leaf(node, comp)
+      if info is None: return None
+      inputs.append(info[0])
+      if idx_ref is None: idx_ref = info[1]
+      elif info[1] is not idx_ref: return None
+      inputs.reverse()
+      return inputs, idx_ref
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if len(stores) != 1: return None
+    dst = stores[0].src[0]
+    if dst.op is Ops.CAST: dst = dst.src[0]
+    if dst.op is not Ops.INDEX or uops.index(dst.src[0]) != params[0][0]: return None
+    val = stores[0].src[1]
+
+    if val.op is Ops.STACK:
+      results = [chain(c, j) for j,c in enumerate(val.src)]
+      if any(r is None for r in results): return None
+      inputs = results[0][0]
+      if any(r[0] != inputs for r in results): return None  # all components must use the same inputs
+    else:
+      r = chain(val, None)
+      if r is None: return None
+      inputs = r[0]
+    if len(inputs) < 3 or any(s is None or s == 0 for s in inputs): return None
+    return (size, 0, inputs)
+
   def _conv1x1_meta(self, uops:list[UOp]):
     if os.getenv("ROCKCHIP_NATIVE_CONV", "1") == "0": return None
     params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
@@ -1316,6 +1482,7 @@ class RockchipRenderer(Renderer):
 
   def render(self, uops:list[UOp]) -> str:
     if (ew_meta:=self._elementwise_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("elementwise", *ew_meta))).decode()
+    if (addchain_meta:=self._addchain_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("addchain", *addchain_meta))).decode()
     if (conv_meta:=self._conv1x1_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("conv1x1", *conv_meta))).decode()
     # the value of SPECIAL comes from local/global_size, not form its source
     uop_to_idx = {u:i for i,u in enumerate(uops)}
@@ -1350,7 +1517,13 @@ class RockchipAllocator(Allocator['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
+    self.submit_count = 0
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
+  def submit_job(self, submit_res):
+    # central RKNPU_SUBMIT ioctl; counts calls and reports the running total (and task_number) under DEBUG>=6
+    self.submit_count += 1
+    if DEBUG >= 6: print(f"RKNPU_SUBMIT #{self.submit_count} (task_number={submit_res.task_number} core_mask={submit_res.core_mask:#x})")
+    return rk.DRM_IOCTL_RKNPU_SUBMIT(self.fd_ctl, __payload=submit_res)
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
     result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
