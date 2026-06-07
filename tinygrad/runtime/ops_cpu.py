@@ -9,7 +9,32 @@ from tinygrad.renderer.llvmir import CPULLVMRenderer
 from tinygrad.renderer.nir import LVPRenderer
 from tinygrad.renderer.isa.x86 import X86Renderer
 from tinygrad.runtime.support.elf import jit_loader
-from tinygrad.uop.ops import sint
+from tinygrad.uop.ops import sint, Ops, UOp
+from tinygrad.dtype import dtypes
+import itertools
+
+def _fully_unroll(uops:list[UOp]) -> list[UOp]:
+  # expand every constant-bound RANGE: substitute the loop var with each concrete value and replicate the body
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if not ranges: return uops
+  for r in ranges:
+    assert r.src[0].op is Ops.CONST, f"cannot unroll non-constant range bound {r.src[0]}"
+  sink = next(u for u in uops if u.op is Ops.SINK)
+  stores = [u for u in uops if u.op is Ops.STORE]
+  # cartesian product over all ranges -> one (range->const) substitution map per iteration
+  per_range = [[(r, UOp.const(dtypes.int, i)) for i in range(int(r.src[0].arg))] for r in ranges]
+  new_stores = [st.substitute(dict(combo)).simplify() for combo in itertools.product(*per_range) for st in stores]
+  return list(UOp.sink(*new_stores, arg=sink.arg).toposort())
+
+class ClangUnrollRenderer(ClangJITRenderer):
+  def render(self, uops:list[UOp]) -> str:
+    # debug only: print the fully-unrolled uops, but render the original (unmodified) uops
+    # NOTE: the unrolled-uop dump is commented out -- for large N (e.g. N=64) it is huge
+    # and printing thousands of lines (plus the O(n^2) unrolled.index lookup) is very slow.
+    # unrolled = _fully_unroll(uops)
+    # for i, u in enumerate(unrolled):
+    #   print(f"{i:3d}: {u.op.name:8s} dtype={u.dtype} src={[unrolled.index(s) for s in u.src]} arg={u.arg}")
+    return super().render(uops)
 
 class CPUSignal(HCQSignal):
   def _sleep(self, time_spent_since_last_sleep_ms:int):
@@ -138,5 +163,5 @@ class CPUDevice(HCQCompiled):
   def __init__(self, device:str=""):
     self.tasks:queue.Queue = queue.Queue()
     CPUWorker(self, self.tasks, thread_id=0).start()
-    super().__init__(device, CPUAllocator(self), [ClangJITRenderer, CPULLVMRenderer, LVPRenderer, X86Renderer], functools.partial(CPUProgram, self),
+    super().__init__(device, CPUAllocator(self), [ClangUnrollRenderer, CPULLVMRenderer, LVPRenderer, X86Renderer], functools.partial(CPUProgram, self),
                      CPUSignal, CPUComputeQueue, arch={'amd64':'x86_64', 'aarch64':'arm64'}.get(m:=platform.machine().lower(), m)+",native")

@@ -40,9 +40,10 @@ def _float_type(size:int, n_elems:int, name:str) -> int:
   raise AssertionError(f"{name} wants float16/float32 buffer for {n_elems} elems, got {size} bytes")
 
 class RKNNBlob(bytes):
-  def __new__(cls, data:bytes, path:str):
+  def __new__(cls, data:bytes, path:str, meta:dict|None=None):
     ret = bytes.__new__(cls, data)
     ret.path = path
+    ret.meta = meta            # e.g. {"kind":"matmul","M":..,"K":..,"N":..} for the MULACC decomposition
     return ret
   def __repr__(self): return f"<RKNN model {len(self)} bytes from {self.path}>"
   __str__ = __repr__
@@ -60,51 +61,110 @@ def _load_rknn():
   return lib
 
 class RKCompiler(Compiler):
-  def compile(self, src:bytes) -> bytes: return bytes(src)
+  # keep the RKNNBlob subclass (don't downcast to plain bytes) so .meta survives to RKProgram
+  def compile(self, src:bytes) -> bytes: return src if isinstance(src, RKNNBlob) else bytes(src)
 
 class RKRenderer(Renderer):
   compiler = RKCompiler()
   has_local = False
+  device = "RK"
   def render(self, uops:list[UOp]) -> bytes:
-    print([(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops])
+    # Synthesize a .rknn straight from the UOps (toolkit-free), then RKProgram loads it
+    # into the official rknn runtime. This is the rknn-decode uops->.rknn path vendored
+    # under runtime/support/rknn. RKNN_STATIC=1 (or a synth failure with RKNN_MODEL set)
+    # falls back to a prebuilt static model for debugging.
+    from tinygrad.runtime.support.rknn import synth
+    if not int(os.getenv("RKNN_STATIC", "0")):
+      try: return RKNNBlob(synth.uops_to_rknn(uops), "<synth>")
+      except Exception: pass
+      try:
+        # matmul reduction: emit one MULACC step model + carry (M,K,N); RKProgram runs the
+        # K-step element-wise decomposition `acc = A[:,k]*B[k,:] + acc` on the rknn runtime.
+        M, K, N = synth.analyze_matmul(uops)
+        return RKNNBlob(synth.matmul_step_rknn(M*N), "<synth:matmul>", {"kind":"matmul", "M":M, "K":K, "N":N})
+      except Exception as e:
+        if not RKNN_MODEL or not pathlib.Path(RKNN_MODEL).exists(): raise
+        if int(os.getenv("DEBUG", "0")): print(f"RKRenderer: synth failed ({e}); using {RKNN_MODEL}")
     path = pathlib.Path(RKNN_MODEL)
     return RKNNBlob(path.read_bytes(), str(path))
+def _rknn_init(lib, model_bytes:bytes):
+  ctx = ctypes.c_uint64(0)
+  model = ctypes.create_string_buffer(model_bytes)
+  _check(lib.rknn_init(ctypes.byref(ctx), ctypes.cast(model, ctypes.c_void_p), len(model_bytes), 0, None), "rknn_init")
+  _check(lib.rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2), "rknn_set_core_mask")
+  return ctx
+
+def _rknn_infer(lib, ctx, in_addrs_sizes, out_buf):
+  """Run one inference: in_addrs_sizes is [(addr,size,fmt,type), ...]; result -> out_buf bytes."""
+  io = RKNNInputOutputNum()
+  _check(lib.rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, ctypes.byref(io), ctypes.sizeof(io)), "RKNN_QUERY_IN_OUT_NUM")
+  assert io.n_output == 1, "RKNN model expects one output"
+  assert io.n_input == len(in_addrs_sizes), f"model expects {io.n_input} inputs, got {len(in_addrs_sizes)}"
+  in_attrs = (RKNNTensorAttr * io.n_input)()
+  for i in range(io.n_input):
+    in_attrs[i].index = i
+    _check(lib.rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, ctypes.byref(in_attrs[i]), ctypes.sizeof(RKNNTensorAttr)), "RKNN_QUERY_INPUT_ATTR")
+  inputs = (RKNNInput * io.n_input)()
+  for i, (addr, size) in enumerate(in_addrs_sizes):
+    input_type = _float_type(size, in_attrs[i].n_elems, f"RKNN input {i}")
+    inputs[i] = RKNNInput(i, addr, size, 0, input_type, in_attrs[i].fmt)
+  _check(lib.rknn_inputs_set(ctx, io.n_input, inputs), "rknn_inputs_set")
+  _check(lib.rknn_run(ctx, None), "rknn_run")
+  out_attr = RKNNTensorAttr(); out_attr.index = 0
+  _check(lib.rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, ctypes.byref(out_attr), ctypes.sizeof(RKNNTensorAttr)), "RKNN_QUERY_OUTPUT_ATTR")
+  output_type = _float_type(len(out_buf), out_attr.n_elems, "RKNN output")
+  output = RKNNOutput(output_type == RKNN_TENSOR_FLOAT32, 0, 0, None, 0)
+  _check(lib.rknn_outputs_get(ctx, 1, ctypes.byref(output), None), "rknn_outputs_get")
+  try: ctypes.memmove(_addr(out_buf), output.buf, len(out_buf))
+  finally: _check(lib.rknn_outputs_release(ctx, 1, ctypes.byref(output)), "rknn_outputs_release")
 
 class RKProgram:
-  def __init__(self, device:str, name:str, lib:bytes, *args, **kwargs): self.device, self.name, self.lib = device, name, lib
+  def __init__(self, device:str, name:str, lib:bytes, *args, **kwargs):
+    self.device, self.name, self.lib = device, name, lib
+    self.meta = getattr(lib, "meta", None)
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(),
                wait=False, **kw):
     with cpu_profile(self.name, self.device):
-      ctx, lib = ctypes.c_uint64(0), _load_rknn()
-      model = ctypes.create_string_buffer(self.lib)
-      _check(lib.rknn_init(ctypes.byref(ctx), ctypes.cast(model, ctypes.c_void_p), len(self.lib), 0, None), "rknn_init")
-      try:
-        _check(lib.rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2), "rknn_set_core_mask")
-        io = RKNNInputOutputNum()
-        _check(lib.rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, ctypes.byref(io), ctypes.sizeof(io)), "RKNN_QUERY_IN_OUT_NUM")
-        assert io.n_output == 1, "static RKNN model expects one output"
-        assert len(bufs) == io.n_input + 1, f"static RKNN model expects output plus {io.n_input} inputs"
-        in_attrs = (RKNNTensorAttr * io.n_input)()
-        for i in range(io.n_input):
-          in_attrs[i].index = i
-          _check(lib.rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, ctypes.byref(in_attrs[i]), ctypes.sizeof(RKNNTensorAttr)), "RKNN_QUERY_INPUT_ATTR")
-        inputs = (RKNNInput * io.n_input)()
-        for i in range(io.n_input):
-          input_type = _float_type(len(bufs[i+1]), in_attrs[i].n_elems, f"RKNN input {i}")
-          inputs[i] = RKNNInput(i, _addr(bufs[i+1]), len(bufs[i+1]), 0, input_type, in_attrs[i].fmt)
-        _check(lib.rknn_inputs_set(ctx, io.n_input, inputs), "rknn_inputs_set")
-        _check(lib.rknn_run(ctx, None), "rknn_run")
-        out_attr = RKNNTensorAttr()
-        out_attr.index = 0
-        _check(lib.rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, ctypes.byref(out_attr), ctypes.sizeof(RKNNTensorAttr)), "RKNN_QUERY_OUTPUT_ATTR")
-        output_type = _float_type(len(bufs[0]), out_attr.n_elems, "RKNN output")
-        assert output_type == out_attr.type or output_type == RKNN_TENSOR_FLOAT32, f"RKNN output wants {out_attr.size} bytes"
-        output = RKNNOutput(output_type == RKNN_TENSOR_FLOAT32, 0, 0, None, 0)
-        _check(lib.rknn_outputs_get(ctx, 1, ctypes.byref(output), None), "rknn_outputs_get")
-        try: ctypes.memmove(_addr(bufs[0]), output.buf, len(bufs[0]))
-        finally: _check(lib.rknn_outputs_release(ctx, 1, ctypes.byref(output)), "rknn_outputs_release")
-      finally: _check(lib.rknn_destroy(ctx), "rknn_destroy")
+      lib = _load_rknn()
+      if self.meta is not None and self.meta.get("kind") == "matmul":
+        self._run_matmul(lib, bufs)
+      else:
+        ctx = _rknn_init(lib, self.lib)
+        try: _rknn_infer(lib, ctx, [(_addr(b), len(b)) for b in bufs[1:]], bufs[0])
+        finally: _check(lib.rknn_destroy(ctx), "rknn_destroy")
     return 1e-3 if wait else None
+
+  def _run_matmul(self, lib, bufs):
+    # out[M,N] = a[M,K] @ b[K,N], run as K MULACC steps acc = A[:,k]*B[k,:] + acc on the
+    # official rknn runtime -- the rknn-decode matmul decomposition. The K steps reuse one
+    # loaded model (a single load_rknn + init_runtime). The multi-input chain model is fed
+    # via the toolkit inference() entry of the official runtime (it normalizes the 3 inputs);
+    # the single-op element-wise path uses the faster raw librknnrt C API.
+    import numpy as np, os, tempfile, shutil
+    from rknn.api import RKNN
+    M, K, N = self.meta["M"], self.meta["K"], self.meta["N"]
+    out_buf, a_buf, b_buf = bufs[0], bufs[1], bufs[2]
+    out_fp32 = len(out_buf) == M*N*4
+    A = np.frombuffer(bytes(a_buf), dtype=(np.float32 if len(a_buf)==M*K*4 else np.float16)).astype(np.float16).reshape(M, K)
+    B = np.frombuffer(bytes(b_buf), dtype=(np.float32 if len(b_buf)==K*N*4 else np.float16)).astype(np.float16).reshape(K, N)
+    acc = np.zeros(M*N, dtype=np.float16)
+    work = tempfile.mkdtemp(prefix="rk_mm_", dir=("/dev/shm" if os.path.isdir("/dev/shm") else None))
+    path = os.path.join(work, "step.rknn")
+    with open(path, "wb") as f: f.write(bytes(self.lib))
+    rk = RKNN(verbose=False)
+    try:
+      _check(rk.load_rknn(path), "load_rknn")
+      # single core (mask 0): the chained multi-tile MULACC model is data-dependent across
+      # tiles and is corrupted by the 3-core split, so don't use RKNN_NPU_CORE_0_1_2 here.
+      _check(rk.init_runtime(target=os.getenv("RKNN_TARGET", "rk3588"), core_mask=0), "init_runtime")
+      for k in range(K):
+        col = np.repeat(A[:, k], N).astype(np.float16)   # A[:,k] broadcast over N cols
+        row = np.tile(B[k], M).astype(np.float16)         # B[k,:] tiled over M rows
+        acc = np.asarray(rk.inference(inputs=[col, row, acc])[0]).reshape(-1)[:M*N].astype(np.float16)
+    finally:
+      rk.release(); shutil.rmtree(work, ignore_errors=True)
+    res = np.ascontiguousarray(acc.astype(np.float32) if out_fp32 else acc)
+    ctypes.memmove(_addr(out_buf), _addr(res), len(out_buf))
 
 class RKAllocator(Allocator['RKDevice']):
   def _alloc(self, size, options): return bytearray(size)
