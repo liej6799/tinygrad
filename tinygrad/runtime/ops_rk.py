@@ -18,6 +18,7 @@ RKNPU_MEM_KERNEL_MAPPING = 8
 RKNPU_MEM_NON_CACHEABLE = 0
 RKNPU_ACT_RESET = 1
 RKNPU_JOB_PC = 1
+RKNPU_JOB_BLOCK = 2
 RKNPU_JOB_PINGPONG = 4
 
 class rknpu_mem_create(ctypes.Structure):
@@ -351,7 +352,35 @@ CPU_KERNELS = {
     "Concat":     lambda i, a={}: np.concatenate(i, axis=a.get("axis", 0)),
     "Identity":   lambda i, a={}: i[0],
     "Reshape":    lambda i, a={}: i[0].reshape(i[1].astype(np.int64)),
+    # general per-element scalar-graph ops (threefry rand, in-place counter, ...)
+    "Where":      lambda i, a={}: np.where(i[0], i[1], i[2]),
+    "BitCast":    lambda i, a={}: i[0].view(np.dtype(a["dtype"])),
+    "Shl":        lambda i, a={}: i[0] << i[1],
+    "Shr":        lambda i, a={}: i[0] >> i[1],
+    "Max":        lambda i, a={}: np.maximum(i[0], i[1]),
+    "Recip":      lambda i, a={}: (np.ones_like(i[0]) / i[0]),
+    "NotEqual":   lambda i, a={}: i[0] != i[1],
+    "CDiv":       lambda i, a={}: _cdiv_kernel(i[0], i[1]),
+    "CMod":       lambda i, a={}: _cmod_kernel(i[0], i[1]),
 }
+
+def _cdiv_kernel(x, y):
+    # C-style division (truncate toward zero); unsigned // is already truncating.
+    if x.dtype.kind == "u": return x // y
+    if x.dtype.kind == "i":
+        q = np.abs(x.astype(np.int64)) // np.abs(y.astype(np.int64))
+        return np.where((x < 0) ^ (y < 0), -q, q).astype(x.dtype)
+    return x / y
+
+def _cmod_kernel(x, y):
+    # C-style remainder (matches truncating CDiv: r = x - y*trunc(x/y)); unsigned % already matches.
+    if x.dtype.kind == "u": return x % y
+    if x.dtype.kind == "i": return (x - y * _cdiv_kernel(x, y)).astype(x.dtype)
+    return np.fmod(x, y)
+
+# numpy scalar dtype name -> ONNX TensorProto type enum (reverse of _ONNX_CAST), for Cast nodes
+_NP_TO_ONNX = {"float32": 1, "uint8": 2, "int8": 3, "uint16": 4, "int16": 5, "int32": 6,
+               "int64": 7, "bool": 9, "float16": 10, "uint32": 12, "uint64": 13}
 
 # RKNN graph scheduling treats these as structural (NPU COPY / IO), never as
 # CPU compute ops, even though CPU_KERNELS has a Reshape kernel for uop graphs.
@@ -1831,6 +1860,165 @@ def _canon(op=EW_OP_ADD):
     (0x2001, 0x5068, 0x01010101, False),
     (0x2001, 0x506c, 0x00000000, True),
 ]
+
+# ── Native NPU GEMM register commands (matmul on the CNA/CORE MAC engine) ─────
+# Co-located with the EW regcmd templates above so all NPU register-command generation
+# lives in one place and shares the single standardized command-word encoder `_w`
+# (target<<48 | value<<16 | reg). A matmul C[m,n] = A[m,k] @ B[k,n] runs as a
+# fully-connected / 1x1-conv on the NPU MAC array, programmed with decoded register
+# writes and submitted directly -- no FlatBuffer container, no rc-template machinery.
+# The DPU post-processing stages (BS/BN/EW) are bypassed; only CNA (feature/weight DMA)
+# + CORE (MAC) compute. The `_GemmNPU` runtime runner (buffers/submit) stays below.
+_GEMM_FP16, _GEMM_FP32 = 2, 4
+_GEMM_CBUF_BANK_SIZE = 256 * 128
+_GEMM_CBUF_BANKS = 12
+_GEMM_MIN_CH = 32
+_GEMM_LINE_STRIDE_CAP = 13
+_GEMM_MIN_WIDE_GRAINS = 80
+_GEMM_INPUT_BANKS = _GEMM_CBUF_BANKS - 2
+_GEMM_MAX_ALIGN_IN = _GEMM_CBUF_BANKS * _GEMM_MIN_CH
+# stream/target ids and register addresses (subset used by GEMM)
+_G_CNA, _G_CORE, _G_DPU, _G_PC, _G_PCREG, _G_VER = 0x0201, 0x0801, 0x1001, 0x0081, 0x0101, 0x0041
+_G_RDMA = 0x2001
+
+def _g_ceil(x, y): return (x + y - 1) // y
+def _g_align(x, a): return _g_ceil(x, a) * a
+
+def _gemm_layout(m, n, k):
+  aligned_k = max(_GEMM_MIN_CH, _g_align(k, _GEMM_MIN_CH))
+  align_out = max(_GEMM_MIN_CH, _g_align(n, _GEMM_MIN_CH))
+  align_in = max(aligned_k, align_out)
+  return align_in, align_out
+
+def _make_gemm_regs(m, n, k, in_dma, wt_dma, out_dma, out_fp16):
+  align_in, align_out = _gemm_layout(m, n, k)
+  input_row_bytes = align_in * _GEMM_FP16
+  out_precision = 2 if out_fp16 else 5
+  size_e = 1 if out_fp16 else 3
+  even_rows_per_two_banks = (_g_ceil(2 * _GEMM_CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
+  feature_grains = max(_GEMM_MIN_WIDE_GRAINS, even_rows_per_two_banks)
+  import numpy as _np
+  data_banks = int(_np.clip(_g_ceil(m * input_row_bytes, _GEMM_CBUF_BANK_SIZE), 1, _GEMM_CBUF_BANKS - 1))
+  line_stride = 4 * min(_g_ceil(align_in, _GEMM_MIN_CH), _GEMM_LINE_STRIDE_CAP)
+  notch_val = 8 * min(align_out // _GEMM_MIN_CH, _GEMM_LINE_STRIDE_CAP) - 1
+  return [
+    _w(_G_DPU,  0x4004, (1 << 3) | (1 << 2) | (1 << 1)),                 # DPU S_POINTER pp/exec
+    _w(_G_CNA,  0x100c, (2 << 4) | (2 << 7) | (1 << 29)),                # CONV_CON1 in/proc fp16
+    _w(_G_CNA,  0x1010, feature_grains << 4),                            # CONV_CON2 feature grains
+    _w(_G_CNA,  0x1014, (1 << 3) | 1),                                   # CONV_CON3 op_en | weight_reuse
+    _w(_G_CNA,  0x1020, (1 << 16) | m),                                  # DATA_SIZE0 width=1 height=m
+    _w(_G_CNA,  0x1024, ((align_in - 1) << 16) | align_in),              # DATA_SIZE1 channel/atomics
+    _w(_G_CNA,  0x1028, 1),
+    _w(_G_CNA,  0x102c, m),
+    _w(_G_CNA,  0x1030, input_row_bytes * align_out),                    # WEIGHT_SIZE0 total
+    _w(_G_CNA,  0x1034, input_row_bytes),                                # WEIGHT_SIZE1 per-kernel
+    _w(_G_CNA,  0x1038, (1 << 24) | (1 << 16) | align_out),              # WEIGHT_SIZE2 kw/kh/kernels
+    _w(_G_CNA,  0x1040, ((_GEMM_CBUF_BANKS - data_banks) << 4) | data_banks),  # CBUF_CON0 banks
+    _w(_G_CNA,  0x1044, _g_ceil(align_in, _GEMM_MIN_CH)),                # CBUF_CON1 entries
+    _w(_G_CNA,  0x104c, (1 << 3) | (1 << 1) | 1),                        # CVT_CON0 truncate/scale/enable
+    _w(_G_CNA,  0x1050, 1 << 16), _w(_G_CNA, 0x1054, 1 << 16),
+    _w(_G_CNA,  0x1058, 1 << 16), _w(_G_CNA, 0x105c, 1 << 16),          # CVT scales
+    _w(_G_CNA,  0x1070, in_dma),                                         # FEATURE_DATA_ADDR
+    _w(_G_CNA,  0x1078, (15 << 16) | 15),                                # DMA_CON0 burst
+    _w(_G_CNA,  0x107c, line_stride),                                    # DMA_CON1 line stride
+    _w(_G_CNA,  0x1080, 0),                                              # DMA_CON2 surf stride
+    _w(_G_CNA,  0x1084, (1 << 16) | m),                                  # FC_DATA_SIZE0
+    _w(_G_CNA,  0x1088, align_in),                                       # FC_DATA_SIZE1
+    _w(_G_CNA,  0x1110, wt_dma),                                         # DCOMP_ADDR0 (weight)
+    _w(_G_CORE, 0x3010, (2 << 8) | 1),                                   # CORE_MISC proc fp16 | op_en
+    _w(_G_CORE, 0x3014, (m - 1) << 16),                                  # DATAOUT_SIZE_0 height
+    _w(_G_CORE, 0x3018, align_out - 1),                                  # DATAOUT_SIZE_1 channel
+    _w(_G_CORE, 0x3030, 0),
+    _w(_G_DPU,  0x400c, (15 << 5) | (2 << 1)),                           # FEATURE_MODE bypass/mode
+    _w(_G_DPU,  0x4010, (out_precision << 29) | (2 << 26) | 2),          # DATA_FORMAT out/proc/in
+    _w(_G_DPU,  0x4020, out_dma),                                        # DST_BASE_ADDR
+    _w(_G_DPU,  0x4024, 1 << 4),                                         # DST_SURF_STRIDE
+    _w(_G_DPU,  0x4030, 0),
+    _w(_G_DPU,  0x4034, m - 1),
+    _w(_G_DPU,  0x4038, (notch_val << 16) | notch_val),                  # DATA_CUBE_NOTCH
+    _w(_G_DPU,  0x403c, ((align_out - 1) << 16) | (align_out - 1)),      # DATA_CUBE_CHANNEL
+    _w(_G_DPU,  0x4040, (1 << 6) | (1 << 4) | (1 << 1) | 1),             # BS_CFG bypass
+    _w(_G_DPU,  0x4050, (size_e << 8) | (size_e << 5) | (size_e << 2) | (1 << 1)),  # BS_OW_CFG
+    _w(_G_DPU,  0x4058, align_out - 1),                                  # WDMA_SIZE_0
+    _w(_G_DPU,  0x405c, (m - 1) << 16),                                  # WDMA_SIZE_1 height
+    _w(_G_DPU,  0x4060, (1 << 6) | (1 << 4) | (1 << 1) | 1),             # BN_CFG bypass
+    _w(_G_DPU,  0x4070, (1 << 9) | (1 << 8) | (1 << 7) | (1 << 1) | 1),  # EW_CFG bypass
+    _w(_G_DPU,  0x4084, ((1 << 16) | 1) if out_fp16 else 0),             # OUT_CVT_SCALE fp32->fp16
+    _w(_G_DPU,  0x40c0, (1 * 4) << 4),                                   # SURFACE_ADD
+  ]
+
+
+# ── Native NPU element-wise register block (DPU EW ALU + RDMA, flying mode) ──
+# The element-wise counterpart of _make_gemm_regs (ported from the rk3588 reference EW path):
+# a binary fp16 op reads operand A from RDMA_SRC and operand B from RDMA_EW, runs the DPU EW
+# ALU, and writes DST_BASE. Because both this and the GEMM block are plain `_w` word lists, a
+# matmul block and an EW block compose into one fused submit through `_chain_blocks` — the EW
+# block's RDMA_SRC simply points at the matmul block's DST surface.
+_EW_CFG_BY_NAME = {"Add": 0x108202c0, "Sub": 0x108402c0, "Mul": 0x108003c4}
+
+def _make_ew_regs(n, ew_cfg, src_dma, ew_dma, dst_dma, out_fp16=True):
+  dataout_width = (n + 7) // 8 - 1
+  out_prec = 2 if out_fp16 else 5
+  return [
+    _w(_G_DPU,  0x4004, 0x0000000E),                                  # S_POINTER
+    _w(_G_DPU,  0x400c, (15 << 5) | (2 << 1) | 1),                    # FEATURE_MODE_CFG (flying: main data from RDMA)
+    _w(_G_DPU,  0x4010, (out_prec << 29) | (2 << 26) | 2),            # DATA_FORMAT out/in/proc precision
+    _w(_G_DPU,  0x4030, dataout_width),                               # DATA_CUBE_WIDTH = ceil(n/8)-1
+    _w(_G_DPU,  0x4034, 0),                                           # DATA_CUBE_HEIGHT
+    _w(_G_DPU,  0x4038, 0),                                           # DATA_CUBE_NOTCH (must be 0 or it corrupts the next run)
+    _w(_G_DPU,  0x403c, (7 << 16) | 7),                               # DATA_CUBE_CHANNEL cube/atomics
+    _w(_G_DPU,  0x4070, ew_cfg),                                      # EW_CFG (op select)
+    _w(_G_DPU,  0x4084, (1 << 16) | 1),                              # OUT_CVT_SCALE
+    _w(_G_RDMA, 0x5004, 0x0000000E),                                 # RDMA_S_POINTER
+    _w(_G_RDMA, 0x500c, dataout_width),                             # RDMA_DATA_CUBE_WIDTH
+    _w(_G_RDMA, 0x5010, 0),                                          # RDMA_DATA_CUBE_HEIGHT
+    _w(_G_RDMA, 0x5014, 7),                                          # RDMA_DATA_CUBE_CHANNEL
+    _w(_G_RDMA, 0x5034, (1 << 30) | (2 << 2)),                       # RDMA_ERDMA_CFG
+    _w(_G_DPU,  0x4020, dst_dma),                                    # DST_BASE_ADDR (output)
+    _w(_G_RDMA, 0x5018, src_dma),                                   # RDMA_SRC_BASE_ADDR (operand A)
+    _w(_G_RDMA, 0x5038, ew_dma),                                    # RDMA_EW_BASE_ADDR (operand B)
+    _w(_G_RDMA, 0x5044, (2 << 15) | (15 << 11) | (2 << 5) | (1 << 3) | 1),  # RDMA_FEATURE_MODE_CFG flying
+  ]
+
+
+# ── Single place that frames NPU register blocks into one PC-chained submit ──
+# An ordered list of register-command blocks (each a list of `_w(...)` u64 words for one op:
+# a GEMM tile, an element-wise op, a copy, ...) is turned into the regcmd word stream + the
+# rknpu_task descriptors a single DRM submit expects. Both the native matmul path and the
+# fused matmul->element-wise path build their submit through here, so all NPU command framing
+# (PC-chain tail, per-op enable_mask/op_idx, regcmd offsets) lives in one place.
+_PC_TAIL = 4   # PC chain-tail qwords appended after each block body
+def _npu_block(regs, op_idx, enable_mask, pc_enable, int_mask=(1 << 8) | (1 << 9)):
+  """One NPU op for _chain_blocks: register words + its task/PC-enable descriptor."""
+  return {"regs": regs, "op_idx": op_idx, "enable_mask": enable_mask, "pc_enable": pc_enable, "int_mask": int_mask}
+
+def _chain_blocks(blocks, rc_dma):
+  """Frame `blocks` (list from _npu_block) into (regcmd_words, task_fields) for one submit.
+
+  Each block becomes a regcmd segment (body + 4-qword PC tail) at a 2-aligned offset; the tail
+  of block i points PC to block i+1's segment, and the last block closes the chain. The task's
+  PC OPERATION_ENABLE (pc_enable) and enable_mask arm the engines that op needs (matmul: CNA|CORE,
+  element-wise: DPU|RDMA), which is exactly how a matmul op and an EW op coexist in one chain."""
+  offsets, off = [], 0
+  for blk in blocks:
+    offsets.append(off); off += _g_align(len(blk["regs"]) + _PC_TAIL, 2)
+  regcmd = [0] * off
+  tasks = []
+  for idx, blk in enumerate(blocks):
+    regs, base = blk["regs"], offsets[idx]
+    for i, q in enumerate(regs): regcmd[base + i] = q
+    enable = _w(_G_PC, 0x0008, blk["pc_enable"])
+    if idx + 1 < len(blocks):
+      nxt = rc_dma + offsets[idx + 1] * 8
+      tail = [_w(_G_PCREG, 0x0010, nxt & 0xFFFFFFF0),
+              _w(_G_PCREG, 0x0014, _g_ceil(len(blocks[idx + 1]["regs"]), 2) + 1), _w(_G_VER, 0, 0), enable]
+    else:
+      tail = [_w(0x0001, 0, 0), _w(_G_PCREG, 0x0014, 0), _w(_G_VER, 0, 0), enable]
+    for i, q in enumerate(tail): regcmd[base + len(regs) + i] = q
+    tasks.append({"regcmd_addr": rc_dma + base * 8, "regcfg_amount": len(regs), "op_idx": blk["op_idx"],
+                  "enable_mask": blk["enable_mask"], "int_mask": blk["int_mask"], "int_clear": 0x1ffff})
+  return regcmd, tasks
+
 
 def reshape_copy_canon_words():
     """The 69-word NPU reshape/copy canon (CPU-op block) for the [1,4] bool shape.
@@ -4944,7 +5132,7 @@ def build_graph_rknn(tensor_names, tensor_shapes, node_specs, inputs, outputs, o
   consts:       {tensor_id(str): {"dtype": np-dtype-str, "data": [...]}}
   node_attrs:   {node_index(str): {attr: val}}
   """
-  b = flatbuffers.Builder(1 << 20)
+  b = flatbuffers.Builder(max(1 << 20, (len(tensor_names) + len(node_specs)) * 512))
   toffs = [_tensor(b, nm, tensor_shapes[nm]) for nm in tensor_names]
   noffs = [_node(b, *spec) for spec in node_specs]
   tvec, nvec = _ovec(b, toffs), _ovec(b, noffs)
@@ -5066,7 +5254,9 @@ def _resolve_op(alu:UOp):
 
 
 def _np_dtype_name(dt) -> str:
-  return str(_to_np_dtype(dt.scalar()).__name__)
+  # np.dtype(...).name gives the canonical spelling ('uint64', not 'ulonglong') so the
+  # _NP_TO_ONNX table and np.dtype(name) round-trips agree across all paths.
+  return np.dtype(_to_np_dtype(dt.scalar())).name
 
 
 def _flatten_ew(alu:UOp, op_name:str):
@@ -5397,26 +5587,27 @@ def _extract_range_groups(uops):
   return dict(groups), params
 
 
-def uops_to_reduce_rknn(uops:list[UOp]) -> bytes:
-  # range-based loop nests (matmul / conv with a reduction accumulator) are read directly off
-  # the original graph; fully-unrolled add-tree reduces are read off the unrolled graph.
+def _reduce_groups_and_params(uops):
+  """Recover the multiply-accumulate gather groups + param sizes for a reduce/matmul/conv.
+
+  Single entry used by both the CPU reduce path and matmul detection so they always agree:
+  range-based loop nests (large matmul / conv accumulator) are read off the original graph;
+  fully-unrolled add-tree reduces are read off the unrolled graph. Returns (groups, params)
+  with `groups` a plain dict {out_index: [(a_param,a_idx,b_param,b_idx), ...]} or None."""
   rg = _extract_range_groups(uops)
-  if rg is not None:
-    groups, params = rg
-    return _reduce_graph_rknn(groups, 0, params, dtype_tag=_dtype_tag(uops))
+  if rg is not None: return dict(rg[0]), rg[1]
   unrolled = _unroll_uops(uops)
-  groups = _extract_reduce_groups(unrolled)
-  if groups is None:
-    groups = _extract_unrolled_matmul(unrolled)
-  if groups is None:
-    groups = _symbolic_reduce_groups(unrolled)
-  if groups is None:
-    raise ValueError("unrolled uops are not a pure reduce(mul(a,b)) pattern")
-  params = {}
-  for u in unrolled:
-    if u.op is Ops.PARAM:
-      params[u.arg] = u.dtype.size
-  return _reduce_graph_rknn(groups, 0, params, dtype_tag=_dtype_tag(unrolled))
+  groups = _extract_reduce_groups(unrolled) or _extract_unrolled_matmul(unrolled) or _symbolic_reduce_groups(unrolled)
+  if groups is None: return None
+  return dict(groups), {u.arg: u.dtype.size for u in unrolled if u.op is Ops.PARAM}
+
+
+def uops_to_reduce_rknn(uops:list[UOp]) -> bytes:
+  res = _reduce_groups_and_params(uops)
+  if res is None:
+    raise ValueError("uops are not a pure reduce(mul(a,b)) pattern")
+  groups, params = res
+  return _reduce_graph_rknn(groups, 0, params, dtype_tag=_dtype_tag(uops))
 
 
 def uops_to_linear_rknn(uops:list[UOp]) -> bytes:
@@ -5534,6 +5725,349 @@ def uops_to_scalar_rknn(uops:list[UOp]) -> bytes:
                           ["out"], {"out": [N]}, consts=consts, dtype_tag=_dtype_tag(uops))
 
 
+# ── General per-element scalar graph (threefry rand, in-place counter, any kernel) ──
+# The catch-all CPU path: fully evaluate each output element's expression tree (unrolling
+# RANGE loops and resolving per-lane INDEX offsets) into a uop_graph of 1-element nodes --
+# Gather(input, [offset]) for indexed loads, const tensors for CONSTs, one CPU-op node per
+# ALU/WHERE/CAST/BITCAST, and a final Concat assembling the N elements. The runtime's
+# uop_graph executor runs it on the CPU (consts + node attrs). Handles ops the EW/reduce/
+# scalar paths can't: SHL/SHR/XOR/OR/AND/CDIV/WHERE/CMPLT/CAST/BITCAST + in-place RMW.
+_GEN_BIN = {"ADD": "Add", "SUB": "Sub", "MUL": "Mul", "FDIV": "Div", "XOR": "Xor", "OR": "Or",
+            "AND": "And", "MAX": "Max", "MOD": "Mod", "CMPLT": "Less", "CMPNE": "NotEqual",
+            "SHL": "Shl", "SHR": "Shr", "CDIV": "CDiv", "IDIV": "CDiv", "CMOD": "CMod"}
+
+def _gen_load_ref(u:UOp, ev_idx, env):
+  """A value-leaf LOAD/GEP -> (param_arg, flat_offset). Peels CAST/GEP, evaluates the index."""
+  u = _peel_cast(u)
+  lane = 0
+  if u.op is Ops.GEP:
+    lane = int(u.arg[0]); u = _peel_cast(u.src[0])
+  if u.op is not Ops.LOAD: raise ValueError(f"not a load leaf: {u.op}")
+  idx = _peel_cast(u.src[0])
+  if idx.op is not Ops.INDEX or idx.src[0].op is not Ops.PARAM: raise ValueError("load not from INDEX(PARAM)")
+  return idx.src[0].arg, ev_idx(idx.src[1], env) + lane
+
+
+def uops_to_general_rknn(uops:list[UOp]):
+  """Translate an arbitrary (unrollable, per-element) kernel into a CPU uop_graph .rknn.
+
+  Returns (blob, in_args, in_dtypes, out_np, N): the bytes plus the param args bound as
+  graph inputs (in order), their numpy dtype names, the output numpy dtype, and N elements.
+  """
+  params = {u.arg: u for u in uops if u.op is Ops.PARAM}
+  if 0 not in params: raise ValueError("no output PARAM 0")
+  out_param = params[0]
+  N = out_param.dtype.size
+  if not isinstance(N, int) or N < 1: raise ValueError(f"bad output size {N}")
+  out_np = _np_dtype_name(out_param.dtype)
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if not stores: raise ValueError("no STORE")
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+
+  names, shapes, node_specs, consts, attrs = [], {}, [], {}, {}
+  tid = [0]
+  def add_tensor(nm, shape):
+    names.append(nm); shapes[nm] = shape; i = tid[0]; tid[0] += 1; return i
+  # input params = every PARAM that is LOADed (incl. PARAM 0 itself when read in-place)
+  in_args = sorted({_gen_load_ref(u, lambda x, e: 0, {})[0] for u in uops if u.op is Ops.LOAD}
+                   | {_operand_param(u).arg for u in uops if u.op is Ops.GEP})
+  input_ids = {}
+  for a in in_args:
+    input_ids[a] = add_tensor(f"in{a}", [params[a].dtype.size])
+    node_specs.append(("InputOperator", f"InputOperator:in{a}", [], [input_ids[a]]))
+
+  def const_tensor(v, npname):
+    cid = add_tensor(f"k{tid[0]}", [1]); dt = np.dtype(npname)
+    if dt.kind == "u" and isinstance(v, int) and v < 0: v = v % (1 << (dt.itemsize * 8))
+    consts[str(cid)] = {"dtype": npname, "data": [float(v) if dt.kind == "f" else int(v)]}
+    return cid
+  def op_node(op, ins, attr=None):
+    oid = add_tensor(f"t{tid[0]}", [1]); ni = len(node_specs)
+    node_specs.append((op, f"{op}:{oid}", list(ins), [oid]))
+    if attr is not None: attrs[str(ni)] = attr
+    return oid
+
+  def ev_idx(u, env):
+    u = _peel_cast(u)
+    if u.op is Ops.CONST: return int(u.arg)
+    if u.op in (Ops.RANGE, Ops.SPECIAL): return int(env[u])
+    if u.op is Ops.ADD: return ev_idx(u.src[0], env) + ev_idx(u.src[1], env)
+    if u.op is Ops.MUL: return ev_idx(u.src[0], env) * ev_idx(u.src[1], env)
+    if u.op.name == "IDIV": return ev_idx(u.src[0], env) // ev_idx(u.src[1], env)
+    if u.op.name == "MOD": return ev_idx(u.src[0], env) % ev_idx(u.src[1], env)
+    raise ValueError(f"non-constant index op {u.op}")
+
+  memo = {}
+  def ev_val(u, env):
+    key = (u, tuple(sorted(env.items(), key=lambda kv: id(kv[0]))))
+    if key in memo: return memo[key]
+    res = _ev_val(u, env); memo[key] = res; return res
+  def _ev_val(u, env):
+    op = u.op
+    if op is Ops.CONST: return const_tensor(u.arg, _np_dtype_name(u.dtype))
+    if op in (Ops.RANGE, Ops.SPECIAL): return const_tensor(int(env[u]), _np_dtype_name(u.dtype))  # loop index used as data
+    if op in (Ops.LOAD, Ops.GEP):
+      pid, off = _gen_load_ref(u, ev_idx, env)
+      return op_node("Gather", (input_ids[pid], const_tensor(off, "int64")), attr={"axis": 0})
+    if op is Ops.CAST: return op_node("Cast", (ev_val(u.src[0], env),), attr={"to": _NP_TO_ONNX[_np_dtype_name(u.dtype)]})
+    if op is Ops.BITCAST: return op_node("BitCast", (ev_val(u.src[0], env),), attr={"dtype": _np_dtype_name(u.dtype)})
+    if op is Ops.WHERE: return op_node("Where", tuple(ev_val(s, env) for s in u.src))
+    if op is Ops.NEG: return op_node("Neg", (ev_val(u.src[0], env),))
+    if op is Ops.RECIPROCAL: return op_node("Recip", (ev_val(u.src[0], env),))
+    if op.name in _GEN_BIN: return op_node(_GEN_BIN[op.name], (ev_val(u.src[0], env), ev_val(u.src[1], env)))
+    raise ValueError(f"unsupported value op {op.name}")
+
+  out_map = {}
+  extents = [(r, int(r.src[0].arg)) for r in ranges]
+  for combo in (itertools.product(*[range(e) for _, e in extents]) if extents else [()]):
+    env = {r: v for (r, _), v in zip(extents, combo)}
+    for st in stores:
+      tgt = _peel_cast(st.src[0])
+      if tgt.op is not Ops.INDEX or tgt.src[0].op is not Ops.PARAM or tgt.src[0].arg != 0: continue
+      base = ev_idx(tgt.src[1], env)
+      val = st.src[1]
+      if val.op is Ops.STACK:
+        for lane, sub in enumerate(val.src): out_map[base + lane] = ev_val(sub, env)
+      else:
+        out_map[base] = ev_val(val, env)
+
+  if sorted(out_map) != list(range(N)):
+    raise ValueError(f"output offsets not contiguous 0..{N-1}: {sorted(out_map)[:8]}")
+  order = [out_map[o] for o in range(N)]
+  if len(order) == 1:
+    out_id = add_tensor("out", [N]); node_specs.append(("Identity", "Identity:out", [order[0]], [out_id]))
+  else:
+    out_id = add_tensor("out", [N]); ni = len(node_specs)
+    node_specs.append(("Concat", "Concat:out", order, [out_id])); attrs[str(ni)] = {"axis": 0}
+  node_specs.append(("OutputOperator", "OutputOperator:out", [out_id], []))
+  blob = build_graph_rknn(names, shapes, node_specs, [f"in{a}" for a in in_args],
+                          ["out"], {"out": [N]}, consts=consts, node_attrs=attrs, dtype_tag=_dtype_tag(uops))
+  in_dtypes = [_np_dtype_name(params[a].dtype) for a in in_args]
+  return blob, in_args, in_dtypes, out_np, N
+
+
+class _GemmNPU:
+  """Persistent device + buffers for native NPU matmul, mirroring the reference runner."""
+  def __init__(self):
+    self.dev = NPUDevice()
+    self.task_buf, self.task_mc = self.dev.mem_alloc(64 * 1024, RKNPU_MEM_KERNEL_MAPPING | RKNPU_MEM_NON_CACHEABLE)
+    self.rc_buf, self.rc_mc = self.dev.mem_alloc(512 * 1024, RKNPU_MEM_NON_CACHEABLE)
+    self.in_buf, self.in_mc = self.dev.mem_alloc(4 << 20, RKNPU_MEM_NON_CACHEABLE)
+    self.wt_buf, self.wt_mc = self.dev.mem_alloc(4 << 20, RKNPU_MEM_NON_CACHEABLE)
+    self.out_buf, self.out_mc = self.dev.mem_alloc(4 << 20, RKNPU_MEM_NON_CACHEABLE)
+    # extra operand + final-output surfaces for the fused matmul->element-wise chain
+    self.ew_buf, self.ew_mc = self.dev.mem_alloc(4 << 20, RKNPU_MEM_NON_CACHEABLE)
+    self.fout_buf, self.fout_mc = self.dev.mem_alloc(4 << 20, RKNPU_MEM_NON_CACHEABLE)
+
+  def _submit(self, task_count, flags=None):
+    if flags is None: flags = RKNPU_JOB_PC | RKNPU_JOB_PINGPONG
+    self.dev.reset()
+    s = rknpu_submit(flags=flags, timeout=6000, task_start=0,
+                     task_number=task_count, task_counter=0, priority=0,
+                     task_obj_addr=self.task_mc.obj_addr, core_mask=1, fence_fd=-1)
+    s.subcore_task[0] = rknpu_subcore_task(task_start=0, task_number=task_count)
+    s.subcore_task[1] = rknpu_subcore_task(task_start=task_count, task_number=0)
+    s.subcore_task[2] = rknpu_subcore_task(task_start=task_count, task_number=0)
+    if ioctl(self.dev.fd, IOCTL_SUBMIT, s) < 0: raise RuntimeError("gemm npu_submit failed")
+
+  def run(self, a, b, out_fp16):
+    m, k = a.shape
+    k2, n = b.shape
+    assert k == k2
+    align_in, align_out = _gemm_layout(m, n, k)
+    input_row_bytes = align_in * _GEMM_FP16
+    out_bytes = _GEMM_FP16 if out_fp16 else _GEMM_FP32
+    out_dtype = np.float16 if out_fp16 else np.float32
+    row_stride_bytes = align_out * 4
+    row_stride_elems = align_out * 2 if out_fp16 else align_out
+
+    inp = np.zeros(align_in * m, dtype=np.float16)
+    inp.reshape(m, align_in)[:, :k] = a[:, :k].astype(np.float16)
+    wt = np.zeros((align_out, align_in), dtype=np.float16)
+    wt[:n, :k] = b.T[:n, :k].astype(np.float16)
+    wt = wt.reshape(align_out // 16, 16, align_in // 32, 32).transpose(0, 2, 1, 3).ravel()
+    (ctypes.c_uint16 * (align_in * m)).from_buffer(self.in_buf)[:] = inp.view(np.uint16).tolist()
+    (ctypes.c_uint16 * wt.size).from_buffer(self.wt_buf)[:] = wt.view(np.uint16).tolist()
+
+    # split rows (M) across tasks to fit the input CBUF bank budget
+    m_tile = _GEMM_INPUT_BANKS * _GEMM_CBUF_BANK_SIZE // input_row_bytes if align_in <= _GEMM_MAX_ALIGN_IN else 1
+    task_regs = []
+    for start in range(0, m, m_tile):
+      tile_m = min(m_tile, m - start)
+      task_regs.append(_make_gemm_regs(tile_m, n, k, self.in_mc.dma_addr + start * input_row_bytes,
+                                        self.wt_mc.dma_addr, self.out_mc.dma_addr + start * row_stride_bytes, out_fp16))
+    self._write_tasks(task_regs)
+    out_nbytes = max(256, m * row_stride_bytes)
+    output = np.frombuffer(self.out_buf, dtype=out_dtype, count=out_nbytes // out_bytes)
+    if out_fp16: output[:] = np.nan
+    self._submit(len(task_regs))
+    if out_fp16:
+      col = (np.arange(n) // 16) * 32 + (np.arange(n) % 16)
+      idx = (np.arange(m) * row_stride_elems)[:, None] + col[None, :]
+      return output[idx].copy().reshape(m, n)
+    out = output.copy()
+    return out[(np.arange(m) * row_stride_elems)[:, None] + np.arange(n)]
+
+  def run_ew(self, a, b, op="Add"):
+    """Standalone NPU element-wise binary op (one DPU|RDMA block) — isolates _make_ew_regs."""
+    a = np.asarray(a, dtype=np.float16).ravel(); b = np.asarray(b, dtype=np.float16).ravel()
+    n = a.size
+    (ctypes.c_uint16 * n).from_buffer(self.in_buf)[:] = a.view(np.uint16).tolist()
+    (ctypes.c_uint16 * n).from_buffer(self.ew_buf)[:] = b.view(np.uint16).tolist()
+    out = np.frombuffer(self.fout_buf, dtype=np.float16, count=max(8, n)); out[:] = np.nan
+    regs = _make_ew_regs(n, _EW_CFG_BY_NAME[op], self.in_mc.dma_addr, self.ew_mc.dma_addr, self.fout_mc.dma_addr, out_fp16=True)
+    self._submit_blocks([_npu_block(regs, op_idx=4, enable_mask=0x18, pc_enable=0x18, int_mask=0x300)])
+    self._submit(1)
+    return out[:n].copy()
+
+  _FUSED_MAX_ROWS = 4   # 2*m=8 blocks per submit is reliable; >=10-block chains poison NPU state (see below)
+
+  def run_fused(self, a, b, c, op="Add"):
+    """Fused matmul(a,b) then element-wise `op` with c, in ONE PC-chained NPU submit.
+
+    Each output row is a matmul block (CNA|CORE) that writes its result to a per-row intermediate
+    surface, immediately followed by an element-wise block (DPU|RDMA flying) that reads that surface
+    via RDMA_SRC and c via RDMA_EW and writes the final row. All 2*m blocks are PC-chained through
+    the single _chain_blocks builder, so the matmul and element-wise commands run in one submit.
+
+    Two frontiers limit this to small fused ops today:
+    - n<=16: only there is the m==1 matmul output contiguous in its first n elements. n>16 needs the
+      DPU/RDMA surface-notch (regs 0x504c/0x5048/0x5010) reverse-engineered against a reference capture.
+    - m<=4 (8 blocks): verified reliable across repeated submits; >=10-block chains intermittently
+      leave rows unwritten because the per-submit action-reset does not fully clear PC/DPU pingpong
+      state between long chains (same limit documented for chained DPU ops in /data/rkt). Lifting it
+      needs an inter-chain DPU-state cleanup (a cleanup_dpu_state-style block), not just dev.reset()."""
+    a = np.asarray(a, dtype=np.float16); b = np.asarray(b, dtype=np.float16); c = np.asarray(c, dtype=np.float16).reshape(-1)
+    m, k = a.shape; k2, n = b.shape
+    assert k == k2
+    if n > 16:
+      raise NotImplementedError(f"fused matmul+EW supports n<=16 (got n={n}); n>16 needs the column "
+                                "surface-notch (regs 0x504c/0x5048/0x5010) reverse-engineered vs a capture")
+    if m > self._FUSED_MAX_ROWS:
+      raise NotImplementedError(f"fused matmul+EW row-chain capped at {self._FUSED_MAX_ROWS} rows (got m={m})")
+    c = c.reshape(m, n)
+    align_in, align_out = _gemm_layout(1, n, k)             # per-row matmul layout (align is independent of m)
+    input_row_bytes = align_in * _GEMM_FP16
+    tmp_stride_bytes = max(256, align_out * 4)              # per-row intermediate matmul-output slot
+    row_elems = max(8, n)                                  # per-row contiguous EW operand/output slot (fp16 elems)
+    # weights (B) are shared by every row: pack once into the NPU's 16x32 kernel atom layout
+    wt = np.zeros((align_out, align_in), dtype=np.float16); wt[:n, :k] = b.T[:n, :k]
+    wt = wt.reshape(align_out // 16, 16, align_in // 32, 32).transpose(0, 2, 1, 3).ravel()
+    (ctypes.c_uint16 * wt.size).from_buffer(self.wt_buf)[:] = wt.view(np.uint16).tolist()
+    in_ct = (ctypes.c_uint16 * (align_in * m)).from_buffer(self.in_buf)
+    ew_ct = (ctypes.c_uint16 * (row_elems * m)).from_buffer(self.ew_buf)
+    blocks = []
+    for i in range(m):
+      inp = np.zeros(align_in, dtype=np.float16); inp[:k] = a[i, :k]
+      in_ct[i * align_in:(i + 1) * align_in] = inp.view(np.uint16).tolist()
+      ew_ct[i * row_elems:i * row_elems + n] = c[i, :n].view(np.uint16).tolist()
+      tmp_dma = self.out_mc.dma_addr + i * tmp_stride_bytes
+      gemm = _make_gemm_regs(1, n, k, self.in_mc.dma_addr + i * input_row_bytes, self.wt_mc.dma_addr, tmp_dma, out_fp16=True)
+      ew = _make_ew_regs(n, _EW_CFG_BY_NAME[op], tmp_dma, self.ew_mc.dma_addr + i * row_elems * _GEMM_FP16,
+                         self.fout_mc.dma_addr + i * row_elems * _GEMM_FP16, out_fp16=True)
+      blocks.append(_npu_block(gemm, op_idx=0, enable_mask=0xd, pc_enable=(6 << 1) | 1))
+      blocks.append(_npu_block(ew, op_idx=4, enable_mask=0x18, pc_enable=0x18, int_mask=0x300))
+    out = np.frombuffer(self.fout_buf, dtype=np.float16, count=row_elems * m); out[:] = np.nan
+    self._submit_blocks(blocks)
+    self._submit(len(blocks), flags=RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG)
+    return out.reshape(m, row_elems)[:, :n].copy()
+
+  def _write_tasks(self, task_regs):
+    # each GEMM tile is a CNA|CORE op (enable_mask 0xd, op_idx 0, PC enable (6<<1)|1); frame them
+    # through the single _chain_blocks builder shared with the fused matmul->element-wise path.
+    blocks = [_npu_block(regs, op_idx=0, enable_mask=0xd, pc_enable=(6 << 1) | 1) for regs in task_regs]
+    self._submit_blocks(blocks)
+
+  def _submit_blocks(self, blocks):
+    """Write a chained NPU submit (regcmd + task array) from _chain_blocks output."""
+    regcmd = ctypes.cast(ctypes.addressof(ctypes.c_char.from_buffer(self.rc_buf)), ctypes.POINTER(ctypes.c_uint64))
+    tasks = ctypes.cast(ctypes.addressof(ctypes.c_char.from_buffer(self.task_buf)), ctypes.POINTER(rknpu_task))
+    regcmd_words, task_fields = _chain_blocks(blocks, self.rc_mc.dma_addr)
+    for i, q in enumerate(regcmd_words): regcmd[i] = q
+    for idx, tf in enumerate(task_fields):
+      tasks[idx].regcmd_addr = tf["regcmd_addr"]
+      tasks[idx].regcfg_amount = tf["regcfg_amount"]
+      tasks[idx].op_idx = tf["op_idx"]
+      tasks[idx].enable_mask = tf["enable_mask"]
+      tasks[idx].int_mask = tf["int_mask"]
+      tasks[idx].int_clear = tf["int_clear"]
+
+  def close(self): self.dev.close()
+
+
+_GEMM_NPU = None
+def _gemm_npu():
+  global _GEMM_NPU
+  if _GEMM_NPU is None: _GEMM_NPU = _GemmNPU()
+  return _GEMM_NPU
+
+
+def _detect_matmul(uops):
+  """Recognize a standard row-major matmul C[m,n]=A[m,k]@B[k,n] in the uop graph.
+
+  Returns {m,n,k,a_param,b_param} if the reduction is exactly a row-major matmul over
+  two distinct input params, else None. Built on the same range/group extraction used
+  by the CPU reduce path, then verified against the matmul access pattern."""
+  res = _reduce_groups_and_params(uops)
+  if res is None: return None
+  groups, params = res
+  n_out = len(groups)
+  if sorted(groups) != list(range(n_out)): return None
+  K = len(next(iter(groups.values())))
+  if K < 1: return None
+  a_param, b_param = groups[0][0][0], groups[0][0][2]
+  if a_param == b_param or a_param not in params or b_param not in params: return None
+  a_size, b_size = params[a_param], params[b_param]
+  if K == 0 or a_size % K or b_size % K: return None
+  m, n = a_size // K, b_size // K
+  if m * n != n_out: return None
+  # verify each output is exactly the matmul term set; order-independent since vectorization
+  # (UPCAST) scrambles the reduction order (k may appear as 4,0,5,1,... rather than 0..K-1).
+  for o in range(n_out):
+    i, j = divmod(o, n)
+    if set(groups[o]) != {(a_param, i * K + kk, b_param, kk * n + j) for kk in range(K)}: return None
+  return {"m": m, "n": n, "k": K, "a_param": a_param, "b_param": b_param}
+
+
+def _peel_param_load(u):
+  """If u is (CAST/GEP/BITCAST)* of a plain LOAD(INDEX(PARAM p, ...)), return p, else None.
+
+  Used to spot a matmul's additive/multiplicative bias operand: a direct load of a third
+  param, as opposed to the reduction sub-tree (which is an ADD of products)."""
+  while u.op in (Ops.CAST, Ops.GEP, Ops.BITCAST): u = u.src[0]
+  if u.op is not Ops.LOAD: return None
+  idx = u.src[0]
+  if idx.op is Ops.CAST: idx = idx.src[0]
+  if idx.op is not Ops.INDEX: return None
+  base = idx.src[0]
+  return base.arg if base.op is Ops.PARAM else None
+
+
+def _detect_matmul_ew(uops):
+  """Recognize a fused matmul-plus-bias  C[m,n] = (A@B) op D[m,n]  with op in {Add, Mul}.
+
+  Returns {m,n,k,a_param,b_param,c_param,op} or None. The matmul is recognized by _detect_matmul;
+  the bias is the single STORE value's other operand -- a plain load of a third param of size m*n,
+  combined at the top with the reduction. _detect_matmul's reduction extraction silently ignores
+  that bias, so detecting it here both enables NPU fusion and stops the pure-GEMM path from
+  dropping the +c (verified: (a@b)+c otherwise computes a@b)."""
+  mm = _detect_matmul(uops)
+  if mm is None: return None
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1: return None
+  val = stores[0].src[1]
+  op = {Ops.ADD: "Add", Ops.MUL: "Mul"}.get(val.op)
+  if op is None: return None
+  res = _reduce_groups_and_params(uops)
+  params = res[1] if res else {}
+  known = {0, mm["a_param"], mm["b_param"]}
+  for operand in val.src:
+    p = _peel_param_load(operand)
+    if p is not None and p not in known and params.get(p) == mm["m"] * mm["n"]:
+      return {**mm, "c_param": p, "op": op}
+  return None
+
+
 class RKRenderer(Renderer):
     compiler = _Compiler()
     has_local = False
@@ -5545,6 +6079,29 @@ class RKRenderer(Renderer):
         in_dtypes = [_np_dtype_name(p.dtype) for p in sorted((u for u in uops if u.op is Ops.PARAM and u.arg != 0), key=lambda u:u.arg)]
         meta = {"kind":"rknn", "in_dtypes":in_dtypes}
         if out_params: meta["dtype"] = _np_dtype_name(out_params[0].dtype)
+        # fp16 matmul runs natively on the NPU MAC engine; float32 stays on the exact CPU path.
+        if meta.get("dtype") == "float16":
+            mm_ew = None
+            try: mm_ew = _detect_matmul_ew(uops)
+            except Exception: mm_ew = None
+            if mm_ew is not None:
+                # fused (a@b) op c: a small fp16 bias-matmul runs as one PC-chained matmul+EW NPU submit.
+                if mm_ew["m"] <= _GemmNPU._FUSED_MAX_ROWS and mm_ew["n"] <= 16 and mm_ew["op"] in ("Add", "Mul"):
+                    tag = (f"FUSEDGEMM:{mm_ew['m']}x{mm_ew['n']}x{mm_ew['k']}:{mm_ew['a_param']},"
+                           f"{mm_ew['b_param']},{mm_ew['c_param']}:{mm_ew['op']}:{in_dtypes}").encode()
+                    return _Blob(tag, {"kind":"fused_gemm_ew", **mm_ew, "dtype":"float16", "in_dtypes":in_dtypes})
+                # bias present but not fusable: the pure-GEMM and reduce paths both drop the bias, so
+                # compute the full (a@b) op c on the correct per-element general path.
+                blob, in_args, gin_dtypes, out_np, N = uops_to_general_rknn(uops)
+                return _Blob(blob, {"kind":"general", "in_params":in_args, "in_dtypes":gin_dtypes, "dtype":out_np, "N":N})
+            else:
+                mm = None
+                try: mm = _detect_matmul(uops)
+                except Exception: mm = None
+                if mm is not None:
+                    # encode the shape/params into the bytes so distinct matmuls don't collide in the compile cache
+                    tag = f"GEMM:{mm['m']}x{mm['n']}x{mm['k']}:{mm['a_param']},{mm['b_param']}:{in_dtypes}".encode()
+                    return _Blob(tag, {"kind":"gemm", **mm, "dtype":"float16", "in_dtypes":in_dtypes})
         try:
             N, op_name, dtype, _ = analyze_elementwise(uops)
             return _Blob(uops_to_rknn(uops), {"kind":"rknn", "N":N, "op":op_name, "dtype":dtype, "in_dtypes":in_dtypes})
@@ -5558,8 +6115,13 @@ class RKRenderer(Renderer):
         try:
             return _Blob(uops_to_scalar_rknn(uops), meta)
         except Exception: pass
-        raise RuntimeError(f"RKRenderer: cannot render {len(uops)}-uop kernel "
-                           f"(ops: {sorted(set(u.op.name for u in uops))})")
+        # general catch-all: per-element scalar uop_graph (in-place counter, threefry rand, bitops, ...)
+        try:
+            blob, in_args, gin_dtypes, out_np, N = uops_to_general_rknn(uops)
+            return _Blob(blob, {"kind":"general", "in_params":in_args, "in_dtypes":gin_dtypes, "dtype":out_np, "N":N})
+        except Exception as e:
+            raise RuntimeError(f"RKRenderer: cannot render {len(uops)}-uop kernel "
+                               f"(ops: {sorted(set(u.op.name for u in uops))}): {e}") from e
 
 _WORKDIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
@@ -5586,9 +6148,26 @@ class RKProgram:
             self._run_rknn(bufs)
         return 1e-3 if wait else None
 
+    def _run_general(self, bufs):
+        # bufs[i] is the buffer for PARAM arg i. The graph's inputs are the param args in
+        # meta["in_params"] (may include PARAM 0 for in-place RMW); output is written to bufs[0].
+        in_params = self.meta["in_params"]
+        in_dtypes = self.meta["in_dtypes"]
+        out_dt = np.dtype(self.meta["dtype"])
+        ins = [np.frombuffer(bytes(bufs[a]), dtype=np.dtype(dt)).copy() for a, dt in zip(in_params, in_dtypes)]
+        got = _run_once(self.lib, ins, self.meta["N"]).astype(out_dt)
+        res = np.ascontiguousarray(got)
+        ctypes.memmove(_addr(bufs[0]), _addr(res), min(len(bufs[0]), res.nbytes))
+
     def _run_rknn(self, bufs):
+        if self.meta.get("kind") == "general":
+            return self._run_general(bufs)
         dtype = np.dtype(self.meta.get("dtype", "float16"))
         in_dtypes = self.meta.get("in_dtypes") or []
+        if self.meta.get("kind") == "gemm":
+            return self._run_gemm(bufs, dtype, in_dtypes)
+        if self.meta.get("kind") == "fused_gemm_ew":
+            return self._run_fused_gemm(bufs, dtype, in_dtypes)
         out_buf, in_bufs = bufs[0], bufs[1:]
         ins = [np.frombuffer(bytes(b), dtype=np.dtype(in_dtypes[i]) if i < len(in_dtypes) else dtype).copy()
                for i, b in enumerate(in_bufs)]
@@ -5596,6 +6175,27 @@ class RKProgram:
         got = _run_once(self.lib, ins, n_out).astype(dtype)
         res = np.ascontiguousarray(got)
         ctypes.memmove(_addr(out_buf), _addr(res), min(len(out_buf), res.nbytes))
+
+    def _run_gemm(self, bufs, dtype, in_dtypes):
+        m, n, k = self.meta["m"], self.meta["n"], self.meta["k"]
+        ap, bp = self.meta["a_param"], self.meta["b_param"]
+        a_dt, b_dt = np.dtype(in_dtypes[ap - 1]), np.dtype(in_dtypes[bp - 1])
+        A = np.frombuffer(bytes(bufs[ap]), dtype=a_dt).reshape(m, k)
+        B = np.frombuffer(bytes(bufs[bp]), dtype=b_dt).reshape(k, n)
+        C = _gemm_npu().run(A.astype(np.float16), B.astype(np.float16), out_fp16=(dtype == np.float16))
+        res = np.ascontiguousarray(C.astype(dtype))
+        ctypes.memmove(_addr(bufs[0]), _addr(res), min(len(bufs[0]), res.nbytes))
+
+    def _run_fused_gemm(self, bufs, dtype, in_dtypes):
+        # fused (a@b) op c in one PC-chained matmul+element-wise NPU submit (see _GemmNPU.run_fused)
+        m, n, k = self.meta["m"], self.meta["n"], self.meta["k"]
+        ap, bp, cp, op = self.meta["a_param"], self.meta["b_param"], self.meta["c_param"], self.meta["op"]
+        A = np.frombuffer(bytes(bufs[ap]), dtype=np.dtype(in_dtypes[ap - 1])).reshape(m, k)
+        B = np.frombuffer(bytes(bufs[bp]), dtype=np.dtype(in_dtypes[bp - 1])).reshape(k, n)
+        C = np.frombuffer(bytes(bufs[cp]), dtype=np.dtype(in_dtypes[cp - 1])).reshape(m, n)
+        out = _gemm_npu().run_fused(A.astype(np.float16), B.astype(np.float16), C.astype(np.float16), op=op)
+        res = np.ascontiguousarray(out.astype(dtype))
+        ctypes.memmove(_addr(bufs[0]), _addr(res), min(len(bufs[0]), res.nbytes))
 
 class RKAllocator(Allocator['RKDevice']):
     def _alloc(self, size, options): return bytearray(size)

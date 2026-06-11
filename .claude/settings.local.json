@@ -1,7 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls -la /data/test/)"
+      "Bash(ls -la /data/test/)",
+      "Read(//dev/dri/**)",
+      "Read(//dev/**)",
+      "Bash(cat)",
+      "Bash(DEV=RK DEBUG=2 python3 /tmp/rk_add_probe.py)",
+      "Bash(PYTHONPATH=/data/tinygrad DEV=RK DEBUG=2 python3 *)",
+      "Bash(PYTHONPATH=/data/tinygrad DEV=RK python3 /tmp/rk_add_probe32.py)",
+      "Bash(git -C /data/tinygrad status --short)",
+      "Bash(git -C /data/tinygrad branch --show-current)",
+      "Read(//data/rk3588/**)",
+      "Read(//data/rk3588/rknn-creation/**)",
+      "Bash(awk -F: '$1 > 1875')",
+      "Bash(git -C /data/tinygrad show HEAD:tinygrad/runtime/support/rknn/__init__.py)",
+      "Bash(git -C /data/tinygrad log --oneline -25)",
+      "Bash(git -C /data/tinygrad diff --stat 3588-new...rk-asm)"
     ]
   }
 }
