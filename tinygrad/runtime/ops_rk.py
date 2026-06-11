@@ -401,7 +401,6 @@ class RKNNRuntime:
         self._alu_result = None
         self._uop = None
         self._npu_ew = None
-        self._npu_ew_cache = {}
         self._init()
 
     def _init(self):
@@ -1350,48 +1349,25 @@ class RKNNRuntime:
             self.dev.mem_sync(mc.handle, mc.size)
         self.dev.mem_sync(self._model_mc.handle, self._model_mc.size)
 
-    def _npu_ew_exec(self, op_name, a, b):
-        """Run one fp16 two-input element-wise op on the NPU, building (and caching) the
-        baked register-command EW model for this (size, op) on demand. This is where the
-        runtime turns an op-graph node into actual NPU commands; raises on any failure so
-        the caller can fall back to a CPU kernel."""
-        N = int(a.size)
-        key = (N, op_name)
-        rt = self._npu_ew_cache.get(key)
-        if rt is None:
-            raw = bytes(assemble_rknn(build_body(N, 2, ops=[op_name], dtype="float16"), 1, N, 2))
-            fd, path = tempfile.mkstemp(suffix=".rknn", dir=_WORKDIR)
-            with os.fdopen(fd, "wb") as f: f.write(raw)
-            try: rt = RKNNRuntime(path)
-            finally: os.unlink(path)
-            self._npu_ew_cache[key] = rt
-        rt.inputs_set([np.asarray(a, dtype=np.float16), np.asarray(b, dtype=np.float16)])
-        rt.run()
-        return np.asarray(rt.outputs_get()[0]).ravel()[:N].astype(np.float16)
-
     def run(self):
         """Execute the model: NPU submit or CPU fallback."""
         if self._uop is not None:
-            # uop graph: per-node dispatch. fp16 EW-supported ops go to the NPU via
-            # register-command models the runtime builds on demand; the rest run on CPU.
+            # uop graph: per-node dispatch. fp16 EW-supported ops go to the NPU
+            # via the companion EW model's baked register blocks; the rest run
+            # on CPU kernels.
             attrs_map = self._uop.get("node_attrs", {})
             self._uop_exec_log = []
             for ni, n in enumerate(self.model["nodes"]):
                 if n.op in ("InputOperator", "OutputOperator"):
                     continue
                 ins = [self._uop_values[ti] for ti in n.inputs]
-                # Per-node dispatch: try the NPU for ops/dtypes it supports (fp16 2-input
-                # element-wise), otherwise — or if the NPU attempt fails — fall back to a CPU kernel.
-                out = None
-                if (n.op in UOP_NPU_SUPPORTED and len(ins) == 2
-                        and all(getattr(a, 'dtype', None) == np.float16 for a in ins)
-                        and ins[0].size == ins[1].size):
-                    try:
-                        out = self._npu_ew_exec(n.op, ins[0], ins[1])
-                        self._uop_exec_log.append((n.op, "NPU"))
-                    except Exception:
-                        out = None
-                if out is None:
+                if (self._npu_ew is not None and n.op in UOP_NPU_SUPPORTED
+                        and len(ins) == 2 and all(getattr(a, 'dtype', None) == np.float16 for a in ins)):
+                    self._npu_ew.inputs_set([ins[0], ins[1]])
+                    self._npu_ew.run()
+                    out = self._npu_ew.outputs_get()[0][:ins[0].size]
+                    self._uop_exec_log.append((n.op, "NPU"))
+                else:
                     kernel = CPU_KERNELS.get(n.op)
                     if kernel is None:
                         raise NotImplementedError(f"uop graph op {n.op} (node {ni}) has no CPU kernel")
@@ -1613,10 +1589,6 @@ class RKNNRuntime:
         return result.reshape(shape) if shape else result
 
     def destroy(self):
-        for rt in getattr(self, "_npu_ew_cache", {}).values():
-            try: rt.destroy()
-            except Exception: pass
-        self._npu_ew_cache = {}
         self.dev.close()
 
     def __enter__(self): return self
@@ -5008,12 +4980,11 @@ def build_graph_rknn(tensor_names, tensor_shapes, node_specs, inputs, outputs, o
   return bytes(hdr) + body + struct.pack("<Q", len(tj)) + tj
 
 
-def elementwise_graph_rknn(op_name: str, N: int, n_inputs: int = 2, dtype_tag: str | None = None) -> bytes:
-  """A single element-wise op over N elements, n_inputs operands, as an RKNN op-graph.
+def elementwise_graph_rknn(op_name: str, N: int, n_inputs: int = 2) -> bytes:
+  """A single element-wise op over N elements, n_inputs operands, run on the CPU.
 
   Graph: InputOperator x n_inputs -> <op chain> -> OutputOperator. For >2 inputs the op
   is applied left-associatively (in0 OP in1 OP in2 ...), matching the EW chain semantics.
-  The runtime decides per node whether each op runs on the NPU or a CPU kernel.
   """
   shape = [1, N]
   names = [f"in{i}" for i in range(n_inputs)]
@@ -5032,7 +5003,7 @@ def elementwise_graph_rknn(op_name: str, N: int, n_inputs: int = 2, dtype_tag: s
   out_name = names[-1]
   specs.append(("OutputOperator", f"OutputOperator:{out_name}", [acc], []))   # bind the graph output
   return build_graph_rknn(names, shapes, specs, [f"in{i}" for i in range(n_inputs)],
-                          [out_name], {out_name: shape}, dtype_tag=dtype_tag)
+                          [out_name], {out_name: shape})
 
 # ── UOp Synthesizer ─────────────────────────────────────────────────────
 """Synthesize a runnable .rknn from tinygrad UOps (toolkit-free).
@@ -5137,10 +5108,11 @@ def analyze_elementwise(uops:list[UOp]):
 
 
 def uops_to_rknn(uops:list[UOp]) -> bytes:
-  # The renderer only converts the uops to an RKNN op-graph; the runtime decides per node
-  # whether to run on the NPU (e.g. fp16 element-wise) or fall back to a CPU kernel.
   N, op_name, dtype, n_inputs = analyze_elementwise(uops)
-  return elementwise_graph_rknn(op_name, N, n_inputs, dtype_tag=_dtype_tag(uops))
+  if n_inputs == 2 and dtype in _NPU_EW_FB_DTYPE:
+    body = build_body(N, 2, ops=[op_name], dtype=_NPU_EW_FB_DTYPE[dtype])
+    return bytes(assemble_rknn(body, 1, N, 2))
+  return elementwise_graph_rknn(op_name, N, n_inputs)
 
 
 def _unroll_uops(uops:list[UOp]) -> list[UOp]:
