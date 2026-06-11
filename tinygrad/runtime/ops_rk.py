@@ -1,11 +1,11 @@
-import ctypes, functools, json, os, tempfile
+import ctypes, functools, itertools, json, os, tempfile
 import numpy as np
 
 from tinygrad.device import Allocator, Compiled, Compiler
 from tinygrad.helpers import cpu_profile, mv_address
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.dtype import _to_np_dtype
+from tinygrad.dtype import _to_np_dtype, dtypes
 
 def _addr(buf) -> int: return mv_address(memoryview(buf).cast("B"))
 
@@ -4933,7 +4933,7 @@ def _node(b, op, name, ins, outs):
 
 
 def build_graph_rknn(tensor_names, tensor_shapes, node_specs, inputs, outputs, output_shapes,
-                     consts=None, node_attrs=None, npu_ew_model=None) -> bytes:
+                     consts=None, node_attrs=None, npu_ew_model=None, dtype_tag=None) -> bytes:
   """Assemble a uop_graph .rknn.
 
   tensor_names: ordered list of value names (index == tensor id used by node_specs)
@@ -4967,6 +4967,10 @@ def build_graph_rknn(tensor_names, tensor_shapes, node_specs, inputs, outputs, o
     "inputs": list(inputs),
     "outputs": list(outputs),
     "output_shapes": output_shapes,
+    # I/O dtype signature: keeps otherwise-identical graphs that differ only in dtype
+    # (e.g. float32 vs fp16 matmul of the same shape) byte-distinct, so the compile cache
+    # does not return the wrong-dtype program for them.
+    "dtype_tag": dtype_tag,
   }
   tj = json.dumps(trailer).encode()
   hdr = bytearray(HEADER_SIZE)
@@ -5039,10 +5043,12 @@ def _is_neg(u:UOp):
 
 
 def _operand_param(u:UOp):
-  if u.op is Ops.GEP: u = u.src[0]
-  if u.op is not Ops.LOAD:
-    raise ValueError("operand must be LOAD(INDEX(PARAM)) (scalar) or GEP(LOAD(...)) (vectorized)")
-  return _index_param(u.src[0])
+  # peel dtype CASTs at every level: a leaf can be (CAST*)(GEP of)?(LOAD of)?(CAST*) INDEX(PARAM),
+  # e.g. CAST(GEP(LOAD(CAST(INDEX)))) when float32 operands are cast to fp16 inside a vectorized store.
+  u = _peel_cast(u)
+  if u.op is Ops.GEP: u = _peel_cast(u.src[0])
+  if u.op is Ops.LOAD: u = u.src[0]
+  return _index_param(u)
 
 
 def _resolve_op(alu:UOp):
@@ -5085,7 +5091,8 @@ def analyze_elementwise(uops:list[UOp]):
     out = _index_param(st.src[0])
     out_params.add(out.arg)
     val = st.src[1]
-    alu = val.src[0] if val.op is Ops.STACK else val
+    # peel an output-dtype CAST (e.g. float32 operands -> fp16 store) and the STACK of vectorized lanes
+    alu = _peel_cast(val.src[0] if val.op is Ops.STACK else val)
     op_name, _ = _resolve_op(alu)
     ops.add(op_name)
     for operand in _flatten_ew(alu, op_name):
@@ -5108,17 +5115,385 @@ def uops_to_rknn(uops:list[UOp]) -> bytes:
   return elementwise_graph_rknn(op_name, N, n_inputs)
 
 
+def _unroll_uops(uops:list[UOp]) -> list[UOp]:
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if not ranges: return uops
+  for r in ranges:
+    if r.src[0].op is not Ops.CONST: raise ValueError(f"cannot unroll non-constant range bound {r.src[0]}")
+  sink = next(u for u in uops if u.op is Ops.SINK)
+  stores = [u for u in uops if u.op is Ops.STORE]
+  per_range = [[(r, UOp.const(dtypes.int, i)) for i in range(int(r.src[0].arg))] for r in ranges]
+  new_stores = [st.substitute(dict(combo)).simplify() for combo in itertools.product(*per_range) for st in stores]
+  return list(UOp.sink(*new_stores, arg=sink.arg).toposort())
+
+
+def _extract_reduce_groups(unrolled):
+  from collections import defaultdict
+  groups = defaultdict(list)
+  for u in unrolled:
+    if u.op is not Ops.STORE: continue
+    idx_node = u.src[0]
+    red_node = u.src[1]
+    if red_node.op is not Ops.REDUCE: return None
+    mul_node = red_node.src[0]
+    if mul_node.op is not Ops.MUL: return None
+    try:
+      out_pos = idx_node.src[1].arg
+      a_idx_node = mul_node.src[0]
+      b_idx_node = mul_node.src[1]
+      if a_idx_node.op is not Ops.INDEX or b_idx_node.op is not Ops.INDEX: return None
+      a_pos = a_idx_node.src[1].arg
+      b_pos = b_idx_node.src[1].arg
+      a_param_id = a_idx_node.src[0].arg
+      b_param_id = b_idx_node.src[0].arg
+      groups[out_pos].append((a_param_id, a_pos, b_param_id, b_pos))
+    except (AttributeError, IndexError):
+      return None
+  return groups
+
+
+def _peel_cast(u:UOp):
+  while u.op is Ops.CAST: u = u.src[0]
+  return u
+
+
+def _peel_end(u:UOp):
+  # an AFTER's ordering dep may be the producing STORE directly or wrapped in loop-END markers.
+  while u.op is Ops.END: u = u.src[0]
+  return u
+
+
+def _dtype_tag(uops) -> str:
+  """I/O dtype signature (param dtypes ordered by arg) used to keep dtype-distinct graphs byte-distinct."""
+  return ",".join(_np_dtype_name(u.dtype) for u in sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg))
+
+
+def _unrolled_leaf_ref(u:UOp):
+  """Resolve a value-tree leaf in a fully-unrolled graph to (param_id, flat_index).
+
+  Leaves are (CAST*)(GEP of)? (LOAD of)? (CAST*) INDEX(PARAM, CONST); the constant
+  index is the flat element offset, the GEP lane (if any) adds to it (vectorized load).
+  """
+  u = _peel_cast(u)
+  off = 0
+  if u.op is Ops.GEP:
+    if len(u.arg) != 1: raise ValueError("multi-element GEP leaf")
+    off = int(u.arg[0]); u = _peel_cast(u.src[0])
+  if u.op is Ops.LOAD: u = _peel_cast(u.src[0])
+  if u.op is not Ops.INDEX or u.src[0].op is not Ops.PARAM:
+    raise ValueError(f"leaf is not INDEX(PARAM), got {u.op.name}")
+  if u.src[1].op is not Ops.CONST: raise ValueError("non-constant index in unrolled leaf")
+  return u.src[0].arg, int(u.src[1].arg) + off
+
+
+def _unrolled_terms(u:UOp):
+  """Flatten a CAST/ADD-wrapped tree of MUL(a,b) products into (a_param,a_idx,b_param,b_idx)."""
+  u = _peel_cast(u)
+  if u.op is Ops.ADD: return _unrolled_terms(u.src[0]) + _unrolled_terms(u.src[1])
+  if u.op is Ops.MUL:
+    a, b = _unrolled_leaf_ref(u.src[0]), _unrolled_leaf_ref(u.src[1])
+    return [(a[0], a[1], b[0], b[1])]
+  raise ValueError(f"value node is not an add-of-mul reduce, got {u.op.name}")
+
+
+def _extract_unrolled_matmul(unrolled):
+  """Extract gather-reduce groups from an already-lowered matmul (REDUCE expanded to ADD/MUL)."""
+  from collections import defaultdict
+  groups = defaultdict(list)
+  for u in unrolled:
+    if u.op is not Ops.STORE: continue
+    idx_node = _peel_cast(u.src[0])
+    if idx_node.op is not Ops.INDEX or idx_node.src[1].op is not Ops.CONST: return None
+    try:
+      groups[int(idx_node.src[1].arg)] = _unrolled_terms(u.src[1])
+    except (ValueError, AttributeError, IndexError):
+      return None
+  ks = {len(v) for v in groups.values()}
+  return groups if (groups and len(ks) == 1) else None
+
+
+def _symbolic_reduce_groups(unrolled):
+  """Symbolically interpret a fully-unrolled multiply-accumulate program into gather groups.
+
+  Handles both the add-tree reduce (matmul, small conv) and the DEFINE_REG accumulator
+  loop (conv with many outputs): each value is interpreted as a sum-of-products list of
+  (a_param, a_idx, b_param, b_idx); accumulator registers hold partial sums and output
+  PARAM stores capture the final term list per output element. Returns groups or None.
+  """
+  groups = {}
+
+  def ev(node):
+    # interpret a value node as a sum-of-products term list, following the register
+    # dataflow: a LOAD of a register reads its producing STORE's value (linked via AFTER).
+    node = _peel_cast(node)
+    if node.op is Ops.CONST:
+      if node.arg != 0: raise ValueError("non-zero const in reduce value")
+      return []                                              # additive identity (acc init / uninit reg)
+    if node.op is Ops.ADD: return ev(node.src[0]) + ev(node.src[1])
+    if node.op is Ops.MUL:
+      a, b = _unrolled_leaf_ref(node.src[0]), _unrolled_leaf_ref(node.src[1])
+      return [(a[0], a[1], b[0], b[1])]
+    if node.op is Ops.LOAD:
+      idxn = _peel_cast(node.src[0])
+      if idxn.op is not Ops.INDEX: raise ValueError("bad load index")
+      base = idxn.src[0]
+      if base.op is Ops.AFTER:
+        producer = next((s for s in (_peel_end(d) for d in base.src[1:]) if s is not None and s.op is Ops.STORE), None)
+        if producer is None: raise ValueError("AFTER without producer store")
+        return ev(producer.src[1])                           # value written by the producing store
+      if base.op is Ops.DEFINE_REG: return []                # uninitialized register reads as 0
+      raise ValueError("param load in additive position")
+    raise ValueError(f"cannot interpret {node.op.name} in reduce value")
+
+  try:
+    for u in unrolled:
+      if u.op is not Ops.STORE: continue
+      tgt = _peel_cast(u.src[0])
+      if tgt.op is not Ops.INDEX or tgt.src[1].op is not Ops.CONST: continue
+      base = tgt.src[0]
+      while base.op is Ops.AFTER: base = base.src[0]
+      if base.op is Ops.PARAM and base.arg == 0:             # final output element store
+        if u.src[1].op is Ops.STACK: return None             # vectorized output unsupported here
+        groups[int(tgt.src[1].arg)] = ev(u.src[1])
+  except (ValueError, AttributeError, IndexError, RecursionError):
+    return None
+  ks = {len(v) for v in groups.values()}
+  return groups if (groups and len(ks) == 1 and 0 not in ks) else None
+
+
+def _reduce_graph_rknn(groups, out_param, params_info, dtype_tag=None):
+  n_out = len(groups)
+  sample = next(iter(groups.values()))
+  K = len(sample)
+  a_param_id = sample[0][0]
+  b_param_id = sample[0][2]
+  a_size = params_info[a_param_id]
+  b_size = params_info[b_param_id]
+  # reject patterns we can't express as a plain gather (e.g. masked/padded accesses with
+  # out-of-range indices, or inconsistent operand params) so render fails cleanly here.
+  for terms in groups.values():
+    for (ap, ai, bp, bi) in terms:
+      if ap != a_param_id or bp != b_param_id or not (0 <= ai < a_size and 0 <= bi < b_size):
+        raise ValueError("reduce pattern not expressible as a plain gather (masked/padded or mixed params)")
+
+  shape = [n_out]
+  tid = 0
+  tensor_names = []
+  tensor_shapes = {}
+  node_specs = []
+  consts = {}
+
+  def add_tensor(name, sh):
+    nonlocal tid
+    tensor_names.append(name)
+    tensor_shapes[name] = sh
+    cur = tid
+    tid += 1
+    return cur
+
+  a_id = add_tensor("A", [a_size])
+  b_id = add_tensor("B", [b_size])
+  out_id = add_tensor("out", shape)
+  node_specs += [("InputOperator", "InputOperator:A", [], [a_id]),
+                 ("InputOperator", "InputOperator:B", [], [b_id])]
+
+  prod_ids = []
+  for k in range(K):
+    a_indices = [groups[o][k][1] for o in range(n_out)]
+    b_indices = [groups[o][k][3] for o in range(n_out)]
+    a_idx_id = add_tensor(f"a_idx{k}", shape)
+    b_idx_id = add_tensor(f"b_idx{k}", shape)
+    ag_id = add_tensor(f"a_g{k}", shape)
+    bg_id = add_tensor(f"b_g{k}", shape)
+    consts[str(a_idx_id)] = {"dtype": "int64", "data": a_indices}
+    consts[str(b_idx_id)] = {"dtype": "int64", "data": b_indices}
+    node_specs.append(("Gather", f"a_gather_{k}", [a_id, a_idx_id], [ag_id]))
+    node_specs.append(("Gather", f"b_gather_{k}", [b_id, b_idx_id], [bg_id]))
+    p_id = add_tensor(f"p{k}", shape)
+    prod_ids.append(p_id)
+    node_specs.append(("Mul", f"mul_{k}", [ag_id, bg_id], [p_id]))
+
+  acc_id = prod_ids[0]
+  for k in range(1, K):
+    sum_id = add_tensor(f"s{k}", shape) if k < K - 1 else out_id
+    node_specs.append(("Add", f"add_{k}", [acc_id, prod_ids[k]], [sum_id]))
+    acc_id = sum_id
+  if K == 1:
+    node_specs.append(("Identity", "copy", [prod_ids[0]], [out_id]))
+  node_specs.append(("OutputOperator", "OutputOperator:out", [out_id], []))
+
+  return build_graph_rknn(tensor_names, tensor_shapes, node_specs, ["A", "B"],
+                          ["out"], {"out": shape}, consts=consts, dtype_tag=dtype_tag)
+
+
+def _eval_index(u, env):
+  """Evaluate an integer index expression over a range environment {range_uop: value}."""
+  if u.op is Ops.CONST: return int(u.arg)
+  if u.op is Ops.RANGE: return env[u]
+  if u.op is Ops.ADD: return _eval_index(u.src[0], env) + _eval_index(u.src[1], env)
+  if u.op is Ops.MUL: return _eval_index(u.src[0], env) * _eval_index(u.src[1], env)
+  if u.op is Ops.IDIV: return _eval_index(u.src[0], env) // _eval_index(u.src[1], env)
+  if u.op is Ops.MOD: return _eval_index(u.src[0], env) % _eval_index(u.src[1], env)
+  if u.op is Ops.CAST: return _eval_index(u.src[0], env)
+  raise ValueError(f"cannot evaluate index op {u.op.name}")
+
+
+def _operand_ref(u):
+  """Resolve a multiplicand to (param_id, index_expr_uop, lane_offset)."""
+  u = _peel_cast(u)
+  lane = 0
+  if u.op is Ops.GEP:
+    if len(u.arg) != 1: raise ValueError("multi-element GEP")
+    lane = int(u.arg[0]); u = _peel_cast(u.src[0])
+  if u.op is Ops.LOAD: u = _peel_cast(u.src[0])
+  if u.op is not Ops.INDEX or u.src[0].op is not Ops.PARAM: raise ValueError("operand not INDEX(PARAM)")
+  return u.src[0].arg, u.src[1], lane
+
+
+def _extract_range_groups(uops):
+  """Iterate the range-based loop nest, accumulating out[idx] += a[..]*b[..] into gather groups.
+
+  Works directly on the original (non-unrolled) graph, so it captures reduction loops
+  (matmul, conv with a DEFINE_REG accumulator) without collapsing the sum. Returns
+  (groups, params_info) or None.
+  """
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if not ranges: return None
+  # the reduction products: float MULs whose two operands both load from input PARAMs (arg != 0)
+  products = []
+  for u in uops:
+    if u.op is not Ops.MUL or u.dtype.count != 1 or u.dtype.scalar() not in (dtypes.float16, dtypes.float32): continue
+    try:
+      a, b = _operand_ref(u.src[0]), _operand_ref(u.src[1])
+    except ValueError:
+      continue
+    if a[0] != 0 and b[0] != 0: products.append((a, b))
+  out_stores = []
+  for u in uops:
+    if u.op is not Ops.STORE: continue
+    tgt = _peel_cast(u.src[0])
+    if tgt.op is not Ops.INDEX: continue
+    base = tgt.src[0]
+    while base.op is Ops.AFTER: base = base.src[0]
+    if base.op is Ops.PARAM and base.arg == 0: out_stores.append(tgt.src[1])
+  if not products or len(out_stores) != 1: return None
+  out_idx_expr = out_stores[0]
+  params = {u.arg: u.dtype.size for u in uops if u.op is Ops.PARAM}
+  from collections import defaultdict
+  groups = defaultdict(list)
+  try:
+    for vals in itertools.product(*[range(int(r.src[0].arg)) for r in ranges]):
+      env = dict(zip(ranges, vals))
+      out_pos = _eval_index(out_idx_expr, env)
+      for (ap, ax, al), (bp, bx, bl) in products:
+        ai, bi = _eval_index(ax, env) + al, _eval_index(bx, env) + bl
+        # masked (padded) accesses produce out-of-range indices we can't model as a plain gather
+        if not (0 <= out_pos < params[0] and 0 <= ai < params[ap] and 0 <= bi < params[bp]): return None
+        groups[out_pos].append((ap, ai, bp, bi))
+  except (ValueError, KeyError):
+    return None
+  ks = {len(v) for v in groups.values()}
+  if not groups or len(ks) != 1 or 0 in ks: return None
+  return dict(groups), params
+
+
+def uops_to_reduce_rknn(uops:list[UOp]) -> bytes:
+  # range-based loop nests (matmul / conv with a reduction accumulator) are read directly off
+  # the original graph; fully-unrolled add-tree reduces are read off the unrolled graph.
+  rg = _extract_range_groups(uops)
+  if rg is not None:
+    groups, params = rg
+    return _reduce_graph_rknn(groups, 0, params, dtype_tag=_dtype_tag(uops))
+  unrolled = _unroll_uops(uops)
+  groups = _extract_reduce_groups(unrolled)
+  if groups is None:
+    groups = _extract_unrolled_matmul(unrolled)
+  if groups is None:
+    groups = _symbolic_reduce_groups(unrolled)
+  if groups is None:
+    raise ValueError("unrolled uops are not a pure reduce(mul(a,b)) pattern")
+  params = {}
+  for u in unrolled:
+    if u.op is Ops.PARAM:
+      params[u.arg] = u.dtype.size
+  return _reduce_graph_rknn(groups, 0, params, dtype_tag=_dtype_tag(unrolled))
+
+
+def uops_to_linear_rknn(uops:list[UOp]) -> bytes:
+  """Handle already-linearized matmul uops: explicit MUL+ADD tree with RANGE/LOAD/GEP."""
+  params = {u.arg: u for u in uops if u.op is Ops.PARAM}
+  if len(params) != 3: raise ValueError(f"expected 3 params, got {len(params)}")
+  from collections import defaultdict
+  groups = defaultdict(list)
+
+  def eval_int(u, env):
+    if u.op is Ops.CONST: return int(u.arg)
+    if u.op is Ops.RANGE: return env[u]
+    if u.op is Ops.ADD: return eval_int(u.src[0], env) + eval_int(u.src[1], env)
+    if u.op is Ops.MUL: return eval_int(u.src[0], env) * eval_int(u.src[1], env)
+    raise ValueError(f"unsupported index op {u.op}")
+
+  def load_ref(u, env):
+    if u.op is Ops.GEP:
+      if len(u.arg) != 1 or u.src[0].op is not Ops.LOAD: raise ValueError("unsupported GEP")
+      idx = u.src[0].src[0]
+      if idx.op is Ops.CAST: idx = idx.src[0]
+      if idx.op is not Ops.INDEX: raise ValueError("GEP load is not from INDEX")
+      return idx.src[0].arg, eval_int(idx.src[1], env) + int(u.arg[0])
+    if u.op is Ops.LOAD:
+      idx = u.src[0]
+      if idx.op is Ops.CAST: idx = idx.src[0]
+      if idx.op is not Ops.INDEX: raise ValueError("LOAD is not from INDEX")
+      return idx.src[0].arg, eval_int(idx.src[1], env)
+    if u.op is Ops.INDEX:
+      return u.src[0].arg, eval_int(u.src[1], env)
+    raise ValueError(f"not a load/index ref: {u.op}")
+
+  def terms(u, env):
+    if u.op is Ops.ADD: return terms(u.src[0], env) + terms(u.src[1], env)
+    if u.op is Ops.MUL:
+      a, b = load_ref(u.src[0], env), load_ref(u.src[1], env)
+      return [(a[0], a[1], b[0], b[1])]
+    raise ValueError(f"unsupported value op {u.op}")
+
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1: raise ValueError(f"expected one STORE, got {len(stores)}")
+  store = stores[0]
+  extents = [int(r.src[0].arg) for r in ranges]
+  for vals in itertools.product(*[range(e) for e in extents]):
+    env = dict(zip(ranges, vals))
+    out_idx = load_ref(store.src[0], env)[1]
+    groups[out_idx] = terms(store.src[1], env)
+
+  if not groups: raise ValueError("could not extract gather pattern from linearized uops")
+  params_info = {arg: dt.dtype.size for arg, dt in params.items()}
+  return _reduce_graph_rknn(groups, 0, params_info, dtype_tag=_dtype_tag(uops))
+
+
 class RKRenderer(Renderer):
     compiler = _Compiler()
     has_local = False
     device = "RK"
     def render(self, uops:list[UOp]) -> bytes:
+        out_params = [u for u in uops if u.op is Ops.PARAM and u.arg == 0]
+        # per-input param dtypes (ordered by PARAM arg) so the runtime reads each input buffer
+        # at its own width; inputs may differ from the output dtype (e.g. float32 in, fp16 matmul out).
+        in_dtypes = [_np_dtype_name(p.dtype) for p in sorted((u for u in uops if u.op is Ops.PARAM and u.arg != 0), key=lambda u:u.arg)]
+        meta = {"kind":"rknn", "in_dtypes":in_dtypes}
+        if out_params: meta["dtype"] = _np_dtype_name(out_params[0].dtype)
         try:
             N, op_name, dtype, _ = analyze_elementwise(uops)
-        except Exception as e:
-            raise RuntimeError(f"RKRenderer: only element-wise kernels can be rendered to RKNN, "
-                               f"cannot render {len(uops)}-uop kernel: {e}") from e
-        return _Blob(uops_to_rknn(uops), {"kind":"rknn", "N":N, "op":op_name, "dtype":dtype})
+            return _Blob(uops_to_rknn(uops), {"kind":"rknn", "N":N, "op":op_name, "dtype":dtype, "in_dtypes":in_dtypes})
+        except Exception: pass
+        try:
+            return _Blob(uops_to_reduce_rknn(uops), meta)
+        except Exception: pass
+        try:
+            return _Blob(uops_to_linear_rknn(uops), meta)
+        except Exception: pass
+        raise RuntimeError(f"RKRenderer: cannot render {len(uops)}-uop kernel "
+                           f"(ops: {sorted(set(u.op.name for u in uops))})")
 
 _WORKDIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
@@ -5147,8 +5522,10 @@ class RKProgram:
 
     def _run_rknn(self, bufs):
         dtype = np.dtype(self.meta.get("dtype", "float16"))
+        in_dtypes = self.meta.get("in_dtypes") or []
         out_buf, in_bufs = bufs[0], bufs[1:]
-        ins = [np.frombuffer(bytes(b), dtype=dtype).copy() for b in in_bufs]
+        ins = [np.frombuffer(bytes(b), dtype=np.dtype(in_dtypes[i]) if i < len(in_dtypes) else dtype).copy()
+               for i, b in enumerate(in_bufs)]
         n_out = len(out_buf) // dtype.itemsize
         got = _run_once(self.lib, ins, n_out).astype(dtype)
         res = np.ascontiguousarray(got)
