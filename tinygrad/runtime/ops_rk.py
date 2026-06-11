@@ -1,11 +1,11 @@
 import ctypes, functools, json, os, tempfile
 import numpy as np
-from itertools import product as _iproduct
+
 from tinygrad.device import Allocator, Compiled, Compiler
 from tinygrad.helpers import cpu_profile, mv_address
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.dtype import _to_np_dtype, PtrDType
+from tinygrad.dtype import _to_np_dtype
 
 def _addr(buf) -> int: return mv_address(memoryview(buf).cast("B"))
 
@@ -400,7 +400,6 @@ class RKNNRuntime:
         self._alu_input_shapes = []
         self._alu_result = None
         self._uop = None
-        self._uop_vm = None
         self._npu_ew = None
         self._init()
 
@@ -440,14 +439,6 @@ class RKNNRuntime:
                       f"npu_ew={'yes' if self._npu_ew else 'no'}")
                 print(f"  NPU ops (fp16 EW): {npu_ok}")
                 print(f"  CPU ops: {cpu_only}")
-                return
-
-            # uop_program: serialized UOp list from tinygrad (general fallback for
-            # threefry rand, bit ops, etc). The UOpVM interprets the DAG in numpy.
-            if isinstance(trailer, dict) and trailer.get("uop_program"):
-                self._uop_vm = UOpVM(trailer)
-                print(f"UOpProgram executor: {len(trailer['nodes'])} uops, "
-                      f"{len(trailer['params'])} params")
                 return
 
         # Classify tensors
@@ -1261,9 +1252,6 @@ class RKNNRuntime:
 
     def inputs_set(self, input_arrays):
         """Write input data into the model (contiguous → NC1HWC2 + DMA patching)."""
-        if self._uop_vm is not None:
-            self._uop_vm.set_buffers(input_arrays)
-            return
         if self._uop is not None:
             for ti, arr in zip(self._uop_inputs, input_arrays):
                 self._uop_values[ti] = np.asarray(arr).ravel()
@@ -1363,9 +1351,6 @@ class RKNNRuntime:
 
     def run(self):
         """Execute the model: NPU submit or CPU fallback."""
-        if self._uop_vm is not None:
-            self._uop_vm.run()
-            return
         if self._uop is not None:
             # uop graph: per-node dispatch. fp16 EW-supported ops go to the NPU
             # via the companion EW model's baked register blocks; the rest run
@@ -1545,8 +1530,6 @@ class RKNNRuntime:
         return None, None, None
 
     def outputs_get(self):
-        if self._uop_vm is not None:
-            return [self._uop_vm.buffers[self._uop_vm.output_param]]
         if self._uop is not None:
             return [self._uop_values[ti] for ti in self._uop_outputs]
         if self._graph:
@@ -1611,144 +1594,6 @@ class RKNNRuntime:
     def __enter__(self): return self
     def __exit__(self, *a): self.destroy()
 
-
-# ── Test ─────────────────────────────────────────────────────────────────────
-
-# ── UOp Program Interpreter (CPU fallback for general kernels) ───────────────
-# Handles kernels the NPU/CPU-graph paths can't service: threefry rand, matmul
-# reductions, bitops, arbitrary UOp graphs. Buffers are numpy arrays keyed by
-# PARAM arg; PARAM 0 is the output. RANGE loops iterate over the cartesian product
-# of their extents; DEFINE_ACC/ASSIGN/REDUCE are rejected (must be pre-unrolled).
-
-class UOpVM:
-    _CMP = {"CMPLT": lambda a, b: a < b, "CMPNE": lambda a, b: a != b}
-
-    def __init__(self, program):
-        self.nodes = program["nodes"]
-        self.params = {p["arg"]: p for p in program["params"]}
-        self.output_param = program.get("output_param", 0)
-        self.buffers = {}
-
-    def set_buffers(self, arrays):
-        p0 = self.params.get(0)
-        if p0 and p0["np"]:
-            dt = np.dtype(p0["np"])
-            sz = p0.get("size") or 1
-            self.buffers[0] = np.zeros(sz, dtype=dt)
-        for i, arr in enumerate(arrays):
-            parg = i + 1
-            p = self.params.get(parg)
-            if p and p["np"]:
-                dt = np.dtype(p["np"])
-                self.buffers[parg] = np.asarray(arr).ravel().astype(dt)
-            else:
-                self.buffers[parg] = np.asarray(arr).ravel()
-
-    def _cast(self, x, d):
-        npn = d["np"]
-        if npn is None: return x
-        tgt = np.dtype(npn)
-        if isinstance(x, np.ndarray) and x.ndim > 0: return x.astype(tgt)
-        return tgt.type(x)
-
-    def _bitcast(self, x, d):
-        npn = d["np"]
-        if npn is None: return x
-        return np.asarray(x).view(np.dtype(npn)) if isinstance(x, np.ndarray) and x.ndim else np.array(x).view(np.dtype(npn)).reshape(())[()]
-
-    def _alu(self, op, a, b, d):
-        intt = d["np"] is not None and np.dtype(d["np"]).kind in "iu"
-        if op == "ADD": r = a + b
-        elif op == "SUB": r = a - b
-        elif op == "MUL": r = a * b
-        elif op == "MUL_": r = a * b
-        elif op in ("FDIV",): r = a / b
-        elif op in ("CDIV", "IDIV"):
-            if intt:
-                ia, ib = int(a), int(b)
-                q = 0 if ib == 0 else (abs(ia) // abs(ib)) * (1 if (ia < 0) == (ib < 0) else -1)
-                r = q
-            else: r = a / b
-        elif op in ("MOD",): r = (int(a) - int(b) * (int(a) // int(b) if b else 0)) if intt else np.fmod(a, b)
-        elif op == "SHL": r = int(a) << int(b)
-        elif op == "SHR": r = int(a) >> int(b)
-        elif op in ("AND", "BITWISEAND"): r = int(a) & int(b)
-        elif op in ("OR", "BITWISEOR"): r = int(a) | int(b)
-        elif op in ("XOR", "BITWISEXOR"): r = int(a) ^ int(b)
-        elif op == "MAX": r = np.maximum(a, b)
-        elif op in self._CMP: return self._CMP[op](a, b)
-        else: raise NotImplementedError(f"UOpVM ALU op {op}")
-        return self._cast(r, d)
-
-    def _eval(self, i, env, memo):
-        if i in memo: return memo[i]
-        n = self.nodes[i]; op = n["op"]; d = n["dtype"]; src = n["src"]
-        if op == "CONST":
-            v = n["arg"]
-            if d["np"]:
-                dt = np.dtype(d["np"])
-                if dt.kind == "u" and isinstance(v, int) and v < 0:
-                    v = v % (1 << (dt.itemsize * 8))
-                res = dt.type(v)
-            else:
-                res = v
-        elif op == "PARAM": res = self.buffers[n["arg"]]
-        elif op == "RANGE": res = env.get(i, 0)
-        elif op == "SPECIAL": res = env.get(i, 0)
-        elif op == "CAST":
-            res = self._eval(src[0], env, memo) if d["ptr"] else self._cast(self._eval(src[0], env, memo), d)
-        elif op == "BITCAST": res = self._bitcast(self._eval(src[0], env, memo), d)
-        elif op == "INDEX":
-            base = self._eval(src[0], env, memo)
-            off = int(self._eval(src[1], env, memo))
-            res = (base, off)
-        elif op == "LOAD":
-            base, off = self._eval(src[0], env, memo)
-            cnt = d["count"]
-            res = base[off] if cnt == 1 else np.asarray(base[off:off + cnt])
-        elif op == "GEP":
-            v = self._eval(src[0], env, memo); lanes = n["arg"]
-            res = v[lanes[0]] if len(lanes) == 1 else np.asarray([v[l] for l in lanes])
-        elif op in ("VECTORIZE", "STACK"):
-            res = np.asarray([self._eval(s, env, memo) for s in src], dtype=np.dtype(d["np"]) if d["np"] else None)
-        elif op == "MULACC":
-            a, b, c = (self._eval(s, env, memo) for s in src); res = self._cast(a * b + c, d)
-        elif op == "WHERE":
-            c, a, b = (self._eval(s, env, memo) for s in src); res = a if bool(c) else b
-        elif op == "NEG": res = self._cast(-self._eval(src[0], env, memo), d)
-        elif op in ("RECIP", "RECIPROCAL"): res = self._cast(1.0 / self._eval(src[0], env, memo), d)
-        elif op in ("SQRT",): res = self._cast(np.sqrt(self._eval(src[0], env, memo)), d)
-        elif op in ("EXP2",): res = self._cast(np.exp2(self._eval(src[0], env, memo)), d)
-        elif op in ("LOG2",): res = self._cast(np.log2(self._eval(src[0], env, memo)), d)
-        elif op in ("SIN",): res = self._cast(np.sin(self._eval(src[0], env, memo)), d)
-        elif len(src) == 2: res = self._alu(op, self._eval(src[0], env, memo), self._eval(src[1], env, memo), d)
-        else: raise NotImplementedError(f"UOpVM op {op} (src={len(src)})")
-        memo[i] = res
-        return res
-
-    def run(self):
-        for n in self.nodes:
-            if n["op"] in ("DEFINE_ACC", "ASSIGN", "REDUCE"):
-                raise NotImplementedError(f"UOpVM cannot run accumulating op {n['op']} (need pre-unrolled reduce)")
-        ranges = [i for i, n in enumerate(self.nodes) if n["op"] in ("RANGE", "SPECIAL")]
-        extents = []
-        for ri in ranges:
-            ext = int(self._eval(self.nodes[ri]["src"][0], {}, {})) if self.nodes[ri]["src"] else 1
-            extents.append((ri, ext))
-        stores = [i for i, n in enumerate(self.nodes) if n["op"] == "STORE"]
-        combos = list(_iproduct(*[range(e) for _, e in extents])) or [()]
-        for combo in combos:
-            env = {ri: v for (ri, _), v in zip(extents, combo)}
-            memo = {}
-            for si in stores:
-                n = self.nodes[si]
-                base, off = self._eval(n["src"][0], env, memo)
-                val = self._eval(n["src"][1], env, memo)
-                if isinstance(val, np.ndarray) and val.ndim > 0:
-                    base[off:off + len(val)] = val
-                else:
-                    base[off] = val
-        return self.buffers[self.output_param]
 
 # ── RK backend ───────────────────────────────────────────────────────────────
 
@@ -5131,40 +4976,6 @@ def build_graph_rknn(tensor_names, tensor_shapes, node_specs, inputs, outputs, o
   return bytes(hdr) + body + struct.pack("<Q", len(tj)) + tj
 
 
-def build_program_rknn(program: dict) -> bytes:
-  """Wrap a serialized UOp program (see synth.serialize_uops) in a minimal .rknn.
-
-  The FlatBuffer body is a single placeholder InputOperator/OutputOperator pair (the
-  runtime's container parser needs a well-formed graph); the real payload is the
-  `program` dict carried in the trailer JSON under `uop_program`. The runtime detects
-  that flag and runs its UOp interpreter instead of the node/EW executors."""
-  N = next((p["size"] for p in program["params"] if p["arg"] == program["output_param"]), 1) or 1
-  names = ["prog_in", "prog_out"]
-  shapes = {"prog_in": [1, N], "prog_out": [1, N]}
-  specs = [("InputOperator", "InputOperator:prog_in", [], [0]),
-           ("OutputOperator", "OutputOperator:prog_out", [0], [])]
-  b = flatbuffers.Builder(1 << 20)
-  toffs = [_tensor(b, nm, shapes[nm]) for nm in names]
-  noffs = [_node(b, *spec) for spec in specs]
-  tvec, nvec = _ovec(b, toffs), _ovec(b, noffs)
-  b.StartObject(16)
-  b.PrependUOffsetTRelativeSlot(1, nvec, 0)
-  b.PrependUOffsetTRelativeSlot(0, tvec, 0)
-  sg = b.EndObject()
-  sgs = _ovec(b, [sg])
-  b.StartObject(22)
-  b.PrependUOffsetTRelativeSlot(2, sgs, 0)
-  root = b.EndObject()
-  b.Finish(root)
-  body = bytes(b.Output())
-  tj = json.dumps(program).encode()
-  hdr = bytearray(HEADER_SIZE)
-  hdr[0:4] = b"RKNN"
-  struct.pack_into("<Q", hdr, 0x08, 6)
-  struct.pack_into("<Q", hdr, 0x10, len(body))
-  return bytes(hdr) + body + struct.pack("<Q", len(tj)) + tj
-
-
 def elementwise_graph_rknn(op_name: str, N: int, n_inputs: int = 2) -> bytes:
   """A single element-wise op over N elements, n_inputs operands, run on the CPU.
 
@@ -5199,9 +5010,10 @@ element count N and the op, and emits the .rknn (FlatBuffer body + NPU
 register-command stream + container) from scratch via the vendored builders
 (`_rknn_flatbuf` + `_rc_template_gen`, which depend only on `flatbuffers`).
 
-Scope: a single element-wise op `z = a OP b` (OP in Add/Sub/Mul/Div) over N elements,
-in either the scalar full-unroll form or tinygrad's vectorized UPCAST form.
-Non-EW kernels (matmul, rand, bitops) fall through to the UOpVM interpreter.
+Scope: an element-wise op `z = a OP b [OP c ...]` (OP in Add/Sub/Mul/Div) over N elements,
+in either the scalar full-unroll form or tinygrad's vectorized UPCAST form. Two-input fp16/
+int8 ops bake NPU register commands; everything else (more inputs, int32, ...) emits an
+rknn CPU-op graph. Non-element-wise kernels (matmul, rand, bitops) are rejected at render.
 """
 
 
@@ -5251,95 +5063,62 @@ def _np_dtype_name(dt) -> str:
   return str(_to_np_dtype(dt.scalar()).__name__)
 
 
+def _flatten_ew(alu:UOp, op_name:str):
+  # Flatten associative Add/Mul chains (a OP b OP c ...) into ordered leaf operands so the
+  # rknn graph path can carry >2 inputs. Sub/Div stay binary (left-associative).
+  raw = {"Add": Ops.ADD, "Mul": Ops.MUL}.get(op_name)
+  if raw is None: return list(_resolve_op(alu)[1])
+  leaves:list[UOp] = []
+  def walk(u:UOp):
+    if u.op is raw and len(u.src) == 2 and _is_neg(u) is None and not any(s.op is Ops.RECIPROCAL for s in u.src):
+      for s in u.src: walk(s)
+    else: leaves.append(u)
+  walk(alu)
+  return leaves
+
+
 def analyze_elementwise(uops:list[UOp]):
   stores = [u for u in uops if u.op is Ops.STORE]
   if not stores: raise ValueError("no STORE in uops")
-  out_params, in_params, ops = set(), set(), set()
+  out_params, in_params, ops = set(), [], set()
   for st in stores:
     out = _index_param(st.src[0])
     out_params.add(out.arg)
     val = st.src[1]
     alu = val.src[0] if val.op is Ops.STACK else val
-    op_name, operands = _resolve_op(alu)
+    op_name, _ = _resolve_op(alu)
     ops.add(op_name)
-    for operand in operands: in_params.add(_operand_param(operand).arg)
+    for operand in _flatten_ew(alu, op_name):
+      p = _operand_param(operand).arg
+      if p not in in_params: in_params.append(p)
   if len(ops) != 1: raise ValueError(f"all stores must use the same op, got {ops}")
   if len(out_params) != 1: raise ValueError(f"expected one output PARAM, got {out_params}")
-  if len(in_params) != 2: raise ValueError(f"expected two input PARAMs, got {in_params}")
+  if len(in_params) < 2: raise ValueError(f"expected at least two input PARAMs, got {in_params}")
   out_param = next(u for u in uops if u.op is Ops.PARAM and u.arg == next(iter(out_params)))
   N = out_param.dtype.size
   if not isinstance(N, int) or N < 1: raise ValueError(f"could not recover element count (ptr size={N})")
-  return N, next(iter(ops)), _np_dtype_name(out_param.dtype)
+  return N, next(iter(ops)), _np_dtype_name(out_param.dtype), len(in_params)
 
 
 def uops_to_rknn(uops:list[UOp]) -> bytes:
-  N, op_name, dtype = analyze_elementwise(uops)
-  if dtype in _NPU_EW_FB_DTYPE:
+  N, op_name, dtype, n_inputs = analyze_elementwise(uops)
+  if n_inputs == 2 and dtype in _NPU_EW_FB_DTYPE:
     body = build_body(N, 2, ops=[op_name], dtype=_NPU_EW_FB_DTYPE[dtype])
     return bytes(assemble_rknn(body, 1, N, 2))
-  return elementwise_graph_rknn(op_name, N, 2)
+  return elementwise_graph_rknn(op_name, N, n_inputs)
 
 
-# ── general fallback: serialize UOp program for the UOpVM interpreter ──────
-
-def _ser_dtype(d):
-  if d is None: return {"np": None, "count": 1, "ptr": False, "size": None}
-  if isinstance(d, PtrDType):
-    base = d.base
-    count = getattr(base, "count", 1)
-    scalar = base.scalar() if count > 1 else base
-    return {"np": str(_to_np_dtype(scalar).__name__), "count": count, "ptr": True, "size": d.size}
-  count = getattr(d, "count", 1)
-  try:
-    scalar = d.scalar() if count > 1 else d
-    npn = str(_to_np_dtype(scalar).__name__)
-  except Exception:
-    npn = None
-  return {"np": npn, "count": count, "ptr": False, "size": None}
-
-
-def _ser_arg(u:UOp):
-  if u.op is Ops.CONST: return u.arg
-  if u.op is Ops.PARAM: return int(u.arg)
-  if u.op is Ops.GEP: return list(u.arg)
-  if u.op is Ops.RANGE:
-    return int(u.arg[0]) if isinstance(u.arg, tuple) else None
-  return None
-
-
-def serialize_uops(uops:list[UOp]) -> dict:
-  idx = {u: i for i, u in enumerate(uops)}
-  nodes = []
-  for u in uops:
-    nodes.append({"op": u.op.name, "dtype": _ser_dtype(u.dtype), "arg": _ser_arg(u),
-                  "src": [idx[s] for s in u.src]})
-  written = set()
-  for u in uops:
-    if u.op is Ops.STORE:
-      tgt = u.src[0]
-      while tgt.op in (Ops.INDEX, Ops.CAST) and tgt.src: tgt = tgt.src[0]
-      if tgt.op is Ops.PARAM: written.add(int(tgt.arg))
-  params = []
-  for u in uops:
-    if u.op is Ops.PARAM:
-      dd = _ser_dtype(u.dtype)
-      params.append({"arg": int(u.arg), "np": dd["np"], "size": dd["size"], "written": int(u.arg) in written})
-  params.sort(key=lambda p: p["arg"])
-  return {"uop_program": 1, "nodes": nodes, "params": params, "output_param": 0}
 class RKRenderer(Renderer):
     compiler = _Compiler()
     has_local = False
     device = "RK"
     def render(self, uops:list[UOp]) -> bytes:
         try:
-            N, op_name, dtype = analyze_elementwise(uops)
-            return _Blob(uops_to_rknn(uops), {"kind":"rknn", "N":N, "op":op_name, "dtype":dtype})
-        except Exception: pass
-        try:
-            prog = serialize_uops(uops)
-            return _Blob(json.dumps(prog).encode(), {"kind":"program"})
+            N, op_name, dtype, _ = analyze_elementwise(uops)
         except Exception as e:
-            raise RuntimeError(f"RKRenderer: cannot render {len(uops)}-uop kernel: {e}") from e
+            raise RuntimeError(f"RKRenderer: only element-wise kernels can be rendered to RKNN, "
+                               f"cannot render {len(uops)}-uop kernel: {e}") from e
+        return _Blob(uops_to_rknn(uops), {"kind":"rknn", "N":N, "op":op_name, "dtype":dtype})
 
 _WORKDIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
@@ -5360,31 +5139,11 @@ class RKProgram:
     def __init__(self, device:str, name:str, lib:bytes, *args, **kwargs):
         self.device, self.name, self.lib = device, name, lib
         self.meta = getattr(lib, "meta", None) or {"kind":"rknn"}
-        self._prog = None
-        if self.meta.get("kind") == "program" and isinstance(lib, _Blob):
-            import warnings; warnings.filterwarnings("ignore", category=RuntimeWarning)
-            np.seterr(over="ignore", under="ignore")
-            self._prog = json.loads(lib)
     def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
                vals:tuple[int, ...]=(), wait=False, **kw):
         with cpu_profile(self.name, self.device):
-            if self._prog is not None: self._run_program(bufs)
-            else: self._run_rknn(bufs)
+            self._run_rknn(bufs)
         return 1e-3 if wait else None
-
-    def _run_program(self, bufs):
-        vm = UOpVM(self._prog)
-        out_buf = bufs[0]
-        in_bufs = bufs[1:]
-        np_inputs = []
-        for i, b in enumerate(in_bufs):
-            p = self._prog["params"][i + 1] if i + 1 < len(self._prog["params"]) else None
-            dt = np.dtype(p["np"]) if p and p.get("np") else np.uint8
-            np_inputs.append(np.frombuffer(bytes(b), dtype=dt).copy())
-        vm.set_buffers(np_inputs)
-        vm.run()
-        result = np.ascontiguousarray(vm.buffers[vm.output_param])
-        ctypes.memmove(_addr(out_buf), _addr(result), min(len(out_buf), result.nbytes))
 
     def _run_rknn(self, bufs):
         dtype = np.dtype(self.meta.get("dtype", "float16"))
