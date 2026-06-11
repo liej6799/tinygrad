@@ -5471,6 +5471,69 @@ def uops_to_linear_rknn(uops:list[UOp]) -> bytes:
   return _reduce_graph_rknn(groups, 0, params_info, dtype_tag=_dtype_tag(uops))
 
 
+def uops_to_scalar_rknn(uops:list[UOp]) -> bytes:
+  """Translate a per-element expression (inputs + constants, no reduction) into a CPU graph.
+
+  Handles scalar/unary ops the 2-input element-wise path can't: x*c, x+c, c-x, x/c, 1/x,
+  -x and arbitrary compositions. The per-lane value tree is mapped recursively to graph
+  nodes -- a param-load becomes an InputOperator, a CONST a const tensor, and
+  ADD/SUB/MUL/FDIV/RECIPROCAL/NEG the matching CPU op node -- so it generalizes to any
+  composition of these over one or more inputs.
+  """
+  out_stores = []
+  for u in uops:
+    if u.op is not Ops.STORE: continue
+    tgt = _peel_cast(u.src[0])
+    if tgt.op is not Ops.INDEX: continue
+    base = tgt.src[0]
+    while base.op is Ops.AFTER: base = base.src[0]
+    if base.op is Ops.PARAM and base.arg == 0: out_stores.append(u)
+  # the output may be written by several stores (vectorized body + scalar tail); they apply the
+  # same element-wise op over disjoint index ranges, so translating any one covers all N elements.
+  if not out_stores: raise ValueError("no output STORE found")
+  st = out_stores[0]
+  out_param = _index_param(st.src[0])
+  N = out_param.dtype.size
+  if not isinstance(N, int) or N < 1: raise ValueError(f"could not recover element count ({N})")
+  # only identity-indexed inputs map cleanly to an element-wise graph; a smaller (broadcast)
+  # input would need index-aware gathering, so reject it rather than silently mis-mapping.
+  if any(u.dtype.size != N for u in uops if u.op is Ops.PARAM):
+    raise ValueError("non-identity (broadcast) input shapes not supported by the scalar path")
+  out_dtype = _np_dtype_name(out_param.dtype)
+  lane = _peel_cast(st.src[1].src[0] if st.src[1].op is Ops.STACK else st.src[1])
+
+  names, shapes, node_specs, consts, tid = [], {}, [], {}, [0]
+  def add_tensor(name, shape):
+    names.append(name); shapes[name] = shape; i = tid[0]; tid[0] += 1; return i
+  in_args = sorted({u.arg for u in uops if u.op is Ops.PARAM and u.arg != 0})
+  input_ids = {}
+  for a in in_args:
+    input_ids[a] = add_tensor(f"in{a}", [N])
+    node_specs.append(("InputOperator", f"InputOperator:in{a}", [], [input_ids[a]]))
+  def const_tensor(v):
+    cid = add_tensor(f"k{tid[0]}", [1]); consts[str(cid)] = {"dtype": out_dtype, "data": [float(v)]}; return cid
+  def op_node(op, ins):
+    oid = add_tensor(f"t{tid[0]}", [N]); node_specs.append((op, f"{op}:{oid}", list(ins), [oid])); return oid
+  _BIN = {Ops.ADD: "Add", Ops.SUB: "Sub", Ops.MUL: "Mul", Ops.FDIV: "Div"}
+
+  def translate(u):
+    u = _peel_cast(u)
+    if u.op in (Ops.GEP, Ops.LOAD, Ops.INDEX):
+      pid = _operand_param(u).arg
+      if pid not in input_ids: raise ValueError("load from non-input param")
+      return input_ids[pid]
+    if u.op is Ops.CONST: return const_tensor(u.arg)
+    if u.op in _BIN: return op_node(_BIN[u.op], (translate(u.src[0]), translate(u.src[1])))
+    if u.op is Ops.RECIPROCAL: return op_node("Div", (const_tensor(1.0), translate(u.src[0])))
+    if u.op is Ops.NEG: return op_node("Neg", (translate(u.src[0]),))
+    raise ValueError(f"unsupported scalar op {u.op.name}")
+
+  res = op_node("Identity", (translate(lane),))
+  node_specs.append(("OutputOperator", "OutputOperator:out", [res], []))
+  return build_graph_rknn(names, shapes, node_specs, [f"in{a}" for a in in_args],
+                          ["out"], {"out": [N]}, consts=consts, dtype_tag=_dtype_tag(uops))
+
+
 class RKRenderer(Renderer):
     compiler = _Compiler()
     has_local = False
@@ -5491,6 +5554,9 @@ class RKRenderer(Renderer):
         except Exception: pass
         try:
             return _Blob(uops_to_linear_rknn(uops), meta)
+        except Exception: pass
+        try:
+            return _Blob(uops_to_scalar_rknn(uops), meta)
         except Exception: pass
         raise RuntimeError(f"RKRenderer: cannot render {len(uops)}-uop kernel "
                            f"(ops: {sorted(set(u.op.name for u in uops))})")
