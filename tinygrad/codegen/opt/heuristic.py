@@ -24,6 +24,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
     2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
   """
+  # some backends (e.g. RK->ONNX) need every reduction as a pure add-tree, not an accumulator loop
+  if getattr(k.ren, "full_unroll_reduces", False):
+    while k.unrollable_dims:
+      try: k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
+      except KernelOptError: break
+    return k
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
   if USE_TC > 0 and (len(k.axes_of(AxisType.GROUP_REDUCE, AxisType.REDUCE)) == 1 or (TC_OPT.value >= 1)):
     good_tc_opt = False
