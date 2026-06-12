@@ -2,17 +2,53 @@ import inspect, functools, base64, pickle
 from tinygrad.device import Compiled, Allocator, Compiler
 from tinygrad.renderer import Renderer, cstyle, nir, ptx, llvmir, wgsl
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
+from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, AxisType, graph_rewrite
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import dedup, cpu_profile, DEBUG, getenv
 
 # unrolling the kernel into per-element chunks is only needed for the dataflow/ONNX/NPU view; it explodes large
 # reductions (matmul/conv). default off -> RK runs the compact looped kernel on CPU. RK_UNROLL=1 to get chunks.
 RK_UNROLL = getenv("RK_UNROLL", 0)
-# a big unrolled kernel (mnist-size conv) produces chunks of thousands of nodes; RK_SUBMIT caps the nodes per
-# submit so each chunk is split into several bounded submits (0 = one submit per whole chunk).
-RK_SUBMIT = getenv("RK_SUBMIT", 0)
 
+# the matmul reductions are pulled out of the graph as a structured GEMM (M,K,N) before any unrolling, so only the
+# elementwise/epilogue work is unrolled into chunks. each extracted GEMM writes straight to the output buffer C; its
+# result value is replaced by a LOAD back from C[m,n] so the epilogue reads it. meta collected here, consumed in render.
+_RK_GEMM:list[tuple] = []
+
+def extract_matmul(sink:UOp):
+  # find the contraction accumulator loop (kept as a raw M,K,N reduce by structured_reduce). extract M,K,N + the affine
+  # A/B/C index maps, then replace the loop's result value with LOAD(C[m,n]); the K loop goes dead and only M,N remain.
+  topo = list(sink.toposort())
+  kr = [u for u in topo if u.op is Ops.RANGE and u.arg[1] is AxisType.REDUCE]
+  if len(kr) != 1: return None                                                       # only single-reduce GEMMs
+  K = kr[0]
+  prod = [u for u in topo if u.op is Ops.MUL and u.dtype is dtypes.float and all(s.op is Ops.LOAD for s in u.src)]
+  if len(prod) != 1: return None                                                     # MUL(LOAD A, LOAD B) is the product
+  la, lb = prod[0].src
+  ia, ib = la.src[0].src[1], lb.src[0].src[1]                                         # the index expressions into A,B
+  rng_of = lambda e: {u for u in e.toposort() if u.op is Ops.RANGE}
+  ra, rb = rng_of(ia), rng_of(ib)
+  if K not in ra or K not in rb or len(ra) != 2 or len(rb) != 2: return None
+  M, N = (ra-{K}).pop(), (rb-{K}).pop()                                               # A indexes (M,K); B indexes (K,N)
+  # the GEMM result is the value read out of the accumulator after the K loop (not the in-loop reload)
+  res = [u for u in topo if u.op is Ops.LOAD and u.src[0].src[0].op is Ops.AFTER and
+         any(s.op is Ops.END and K in s.src for s in u.src[0].src[0].src)]
+  if len(res) != 1: return None
+  res = res[0]
+  # the single output store this result flows into -> gives the output buffer C and its (m,n) index map
+  st = [u for u in topo if u.op is Ops.STORE and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM and res in u.src[1].toposort()]
+  if len(st) != 1: return None
+  cidx = st[0].src[0]
+  iv = lambda e, vm: graph_rewrite(e.substitute({r: r.const_like(v) for r, v in vm.items()}), symbolic).arg
+  ba, bb, cb = iv(ia,{M:0,K:0}), iv(ib,{K:0,N:0}), iv(cidx.src[1],{M:0,N:0})
+  am, ak = iv(ia,{M:1,K:0})-ba, iv(ia,{M:0,K:1})-ba
+  bk, bn = iv(ib,{K:1,N:0})-bb, iv(ib,{K:0,N:1})-bb
+  cm, cn = iv(cidx.src[1],{M:1,N:0})-cb, iv(cidx.src[1],{M:0,N:1})-cb
+  pa, pb = la.src[0].src[0], lb.src[0].src[0]                                         # the A,B param uops
+  _RK_GEMM.append((M.vmax+1, K.vmax+1, N.vmax+1, pa.arg, pb.arg, ba, am, ak, bb, bk, bn, cidx.src[0].arg, cb, cm, cn))
+  out = sink.substitute({res: UOp(Ops.LOAD, res.dtype, (cidx,))})                     # read the gemm output back from C[m,n]
+  # A,B no longer have any load after extraction; keep their params reachable (as NOOPs) so they stay in globals
+  return out.replace(src=out.src + tuple(UOp(Ops.NOOP, dtypes.void, (p,)) for p in (pa, pb)))
 
 def loop_unrolling(sink:UOp):
   # fully unroll every RANGE so the stream is range-free (every op explicit), mirrors VLIWRenderer.loop_unrolling.
@@ -26,7 +62,11 @@ def loop_unrolling(sink:UOp):
     elif u is not sink and any(s in copies for s in u.src):
       copies[u] = [UOp(u.op, u.dtype, tuple(copies[s][i] if s in copies else s for s in u.src), u.arg, u.tag) for i in range(r.vmax+1)]
   return UOp.sink(*[copies[s][i] if s in copies else s for i in range(r.vmax+1) for s in sink.src], arg=sink.arg)
-rk_prepare = PatternMatcher([(UPat(Ops.SINK, name="sink"), loop_unrolling)])+symbolic
+
+def rk_sink(sink:UOp):
+  if (ext:=extract_matmul(sink)) is not None: return ext   # pull the GEMM out first, then unroll only what's left
+  return loop_unrolling(sink)
+rk_prepare = PatternMatcher([(UPat(Ops.SINK, name="sink"), rk_sink)])+symbolic
 
 # the arithmetic ALU ops share one execution unit -> they go in a single "alu" chunk per level. every other op
 # (compare, bitwise, shift, cast, transcendental, ...) gets its own chunk.
@@ -45,7 +85,7 @@ def uops_to_chunks(uops:list[UOp]):
     elif u.op is Ops.CAST and u.src[0] in pof: pof[u], off[u] = pof[u.src[0]], off[u.src[0]]   # index cast
     elif u.op is Ops.LOAD: ix=u.src[0]; loads[u]=(pof[ix].arg, off[ix]); lvl[u]=0; isval[u]=True
     elif u.op is Ops.STORE: outs[off[u.src[0]]] = u.src[1]
-    elif u.op in (Ops.PARAM, Ops.SINK, Ops.GROUP): pass
+    elif u.op in (Ops.PARAM, Ops.SINK, Ops.GROUP, Ops.NOOP): pass
     else:                                                                                       # a compute op
       lvl[u] = L = 1 + max([lvl.get(s, 0) for s in u.src if isval.get(s)], default=0); isval[u] = True
       cat = "alu" if u.op in ALU_GROUP else u.op.name                                           # ALU ops share a chunk
@@ -56,7 +96,8 @@ def uops_to_chunks(uops:list[UOp]):
 class RKRenderer(Renderer):
   has_local = False
   supports_float4 = not RK_UNROLL          # scalar stream (for the per-element chunk view) only when unrolling
-  full_unroll_reduces = bool(RK_UNROLL)     # reductions -> pure add-tree (chunk-expressible) only when unrolling
+  structured_reduce = bool(RK_UNROLL)       # keep matmul as raw M,K,N ranges so extract_matmul can pull it out pre-unroll
+  full_unroll_reduces = bool(RK_UNROLL)     # any remaining (non-matmul) reduction -> add-tree via loop_unrolling
   # native ops must be a subset of what the uop runtime (python_alu) can execute; keep transcendentals native
   # so they don't decompose into float<->int bitcast (which ONNX can't express). (no FDIV -> uses RECIPROCAL+MUL)
   code_for_op = {Ops.ADD:"+", Ops.SUB:"-", Ops.MUL:"*", Ops.CMPLT:"<", Ops.CMPNE:"!=", Ops.MAX:"max",
@@ -68,6 +109,10 @@ class RKRenderer(Renderer):
       # break the unrolled uops into chunks and hand the chunk DAG to the runtime, not the full per-element uop
       # stream. the runtime compiles the DAG to C (clang) and runs it. each chunk = same op at the same level.
       chunks, loads, consts, outs = uops_to_chunks(uops)
+      # GEMMs were pulled out before unrolling (extract_matmul) and write straight to C; they run as the first submits.
+      # the epilogue/elementwise chunks then stay scalar and read C[m,n] back as an ordinary load.
+      gemms = list(_RK_GEMM); _RK_GEMM.clear()
+      prog:list = [("mm",)+g for g in gemms]
       nid:dict[UOp,int] = {}
       for _, us in chunks:
         for u in us: nid[u] = len(nid)
@@ -75,14 +120,13 @@ class RKRenderer(Renderer):
       # carrying the dtype keeps the stream consistently typed so the emitted C stays correct (e.g. uint64 << uint).
       ref = lambda s: (0, loads[s][0], loads[s][1], s.dtype.scalar()) if s in loads else \
                       (1, consts[s], s.dtype.scalar()) if s in consts else (2, nid[s], s.dtype.scalar())
-      # split each chunk into RK_SUBMIT-sized submits (same flat order -> node ids stay == runtime position).
-      # nodes in a chunk are all the same level, so they have no inter-dependency and slice safely.
-      prog = [[(u.op, [ref(s) for s in u.src], u.dtype.scalar()) for u in us[i:i+(RK_SUBMIT or len(us) or 1)]]
-              for _, us in chunks for i in range(0, len(us), RK_SUBMIT or len(us) or 1)]
+      # each chunk becomes one scalar submit (gemm submits first -> node ids stay == runtime scratch position).
+      prog += [[(u.op, [ref(s) for s in u.src], u.dtype.scalar()) for u in us] for _, us in chunks]
       out_list = [(o, ref(v), v.dtype.scalar()) for o, v in sorted(outs.items())]
       if DEBUG >= 6:
         dref = lambda s: f"in{loads[s][0]}[{loads[s][1]}]" if s in loads else f"={consts[s]}" if s in consts else f"%{idx[s]}"
         print(f"RKRenderer: {len(uops)} unrolled uops -> {len(chunks)} chunks ({len(nid)} nodes) in {len(prog)} submits")
+        for g in gemms: print(f"  GEMM submit (extracted pre-unroll): M={g[0]} K={g[1]} N={g[2]} -> C[{g[11]}]")
         for name, us in chunks:
           print(f"  {name}:")
           for u in us: print(f"    %{idx[u]:<3d} = {u.op.name}(" + ", ".join(dref(s) for s in u.src) + ")")
@@ -137,11 +181,21 @@ def chunks_to_c(prog, out_list, nnodes:int) -> tuple[list[str], int]:
     if op is Ops.FLOORMOD: return f"({{ {c} _a=({es[0]}),_b=({es[1]}); _a-_b*__builtin_floor{fsuf}(_a/_b); }})"
     if op in C_BIN: return f"(({es[0]}){C_BIN[op]}({es[1]}))"
     raise NotImplementedError(f"RK clang chunk: unsupported op {op}")
-  nbufs = max([1] + [s[1]+1 for sub in prog for _,srcs,_ in sub for s in srcs if s[0] == 0] + [r[1]+1 for _,r,_ in out_list if r[0] == 0])
+  is_mm = lambda sub: isinstance(sub, tuple) and sub[0] == "mm"
+  def mm_lines(M, K, N, bufA, bufB, ba, am, ak, bb, bk, bn, bufC, cb, cm, cn):
+    # the structured GEMM (M,K,N from the original ranges): one triple loop over the affine A/B index maps, writing
+    # each output straight to C via its affine output map. this is the only place the contraction is expanded.
+    return [f"const float* A=(const float*)b[{bufA}]; const float* Bm=(const float*)b[{bufB}]; float* C=(float*)b[{bufC}];",
+            f"for(int m=0;m<{M};m++)for(int n=0;n<{N};n++){{ float acc=0;",
+            f"for(int kk=0;kk<{K};kk++) acc+=A[{ba}+{am}*m+{ak}*kk]*Bm[{bb}+{bk}*kk+{bn}*n];",
+            f"C[{cb}+{cm}*m+{cn}*n]=acc; }}"]
+  nbufs = max([1] + [s[1]+1 for sub in prog if not is_mm(sub) for _,srcs,_ in sub for s in srcs if s[0] == 0] +
+              [r[1]+1 for _,r,_ in out_list if r[0] == 0] + [b+1 for sub in prog if is_mm(sub) for b in (sub[4], sub[5], sub[12])])
   store_lines = [f"(({ct(dt)}*)b[0])[{o}] = {expr(r)};" for o, r, dt in out_list]
   submits, gid = [], 0
   for si, sub in enumerate(prog or [[]]):
-    lines = [f"*({ct(dt)}*)(s+{(gid:=gid+1)-1}*8) = {rhs_of(op, srcs, dt)};" for op, srcs, dt in sub]
+    if is_mm(sub): lines = mm_lines(*sub[1:])
+    else: lines = [f"*({ct(dt)}*)(s+{(gid:=gid+1)-1}*8) = {rhs_of(op, srcs, dt)};" for op, srcs, dt in sub]
     if si == len(prog)-1 or not prog: lines += store_lines                     # output stores ride in the last submit
     submits.append(f"void k{si}(void** B, void* S){{ char** b=(char**)B; char* s=(char*)S;\n" + "\n".join(lines) + "\n}\n")
   return submits, nbufs

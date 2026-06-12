@@ -24,6 +24,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
     2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
   """
+  # some backends (e.g. RK structured matmul) extract the contraction themselves -> keep raw M,K,N ranges, no opts
+  if getattr(k.ren, "structured_reduce", False): return k
   # some backends (e.g. RK->ONNX) need every reduction as a pure add-tree, not an accumulator loop
   if getattr(k.ren, "full_unroll_reduces", False):
     while k.unrollable_dims:

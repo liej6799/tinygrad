@@ -32,11 +32,12 @@ if __name__ == "__main__":
       return Tensor(rng.integers(INT_LOW, INT_HIGH, (rows, cols), dtype=np_dtype)).realize()
     return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
 
+  ADDC = getenv("ADDC", 7.0)   # add a constant to the matmul -> kernel becomes matmul + elementwise add (breaks pure matmul)
   a, b = init_matrix(M, K), init_matrix(K, N)
   for i in range(CNT):
     if i > 0 and getenv("RAND", 0) != 0:
       a, b = init_matrix(M, K), init_matrix(K, N)
-    c = a.matmul(b, dtype=acc_dtype).realize()
+    c = (a.matmul(b, dtype=acc_dtype) + ADDC).realize()
 
   if getenv("SHOULD_USE_TC"):
     linear = compile_linear(a.matmul(b, dtype=acc_dtype).schedule_linear())
@@ -44,7 +45,7 @@ if __name__ == "__main__":
     applied_opts = call.src[0].src[0].arg.applied_opts
     assert any(opt.op is OptOps.TC for opt in applied_opts), f"TC not triggered, {applied_opts}"
 
-  ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
+  ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32) + ADDC
   res = c.numpy()
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
