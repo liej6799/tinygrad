@@ -120,6 +120,61 @@ def extract_elementwise(sink:UOp):
   if ocoeffs != strides or (root:=build(stores[0].src[1])) is None or root[0] != "node" or len(tasks) > 6: return None
   return {"n": n, "out": (stores[0].src[0].src[0].arg, obase), "tasks": tasks, "leaves": leaves}
 
+def peel_ew_subdags(uops:list[UOp]):
+  # a MIXED elementwise compact loop whose store value has an op the NPU DPU-EW can't do (compare/cast/max/mod/...):
+  # find each MAXIMAL float EW-binop sub-DAG (contiguous-affine leaves) and group it onto the NPU (chain_add) into a
+  # SCRATCH buffer. returns (ews, scratch): `ews` are NPU EW descriptors (out = a scratch id PAST the real params) and
+  # `scratch` maps each sub-DAG ROOT uop -> its scratch id, so compact_loop_to_c renders the root as a scratch LOAD and
+  # the non-EW remainder as a CPU loop. NO buffer is added to the kernel's globals -- the scratch lives only in render +
+  # the runtime (which allocates it). so e.g. (a+b)>c becomes ONE NPU add + a CPU compare.
+  stores = [u for u in uops if u.op is Ops.STORE]
+  rngs = [u for u in uops if u.op is Ops.RANGE]
+  if len(stores) != 1 or not rngs: return [], {}
+  n = 1
+  for r in rngs: n *= r.vmax+1
+  strides, acc = [], 1
+  for r in reversed(rngs): strides.insert(0, acc); acc *= r.vmax+1                       # row-major flatten strides
+  iv = lambda e, vm: graph_rewrite(e.substitute({r: r.const_like(v) for r, v in vm.items()}), symbolic).arg
+  def affine(idx):
+    base = iv(idx, {r:0 for r in rngs})
+    return base, [iv(idx, {**{rr:0 for rr in rngs}, r:1})-base for r in rngs]
+  def leaf(u):
+    if u.op is Ops.CONST: return ("const", u.arg)
+    if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM:
+      base, coeffs = affine(u.src[0].src[1])
+      return ("buf", u.src[0].src[0].arg, base) if coeffs == strides else None
+    return None
+  memo:dict = {}
+  def extractable(u):   # u's whole subtree is a float EW-binop DAG over contiguous leaves -> runnable as one NPU EW
+    if u not in memo: memo[u] = (leaf(u) is not None) or (u.op in EW_BINOPS and len(u.src) == 2 and
+                                                          dtypes.is_float(u.dtype) and all(extractable(s) for s in u.src))
+    return memo[u]
+  if extractable(stores[0].src[1]): return [], {}           # whole store is EW -> extract_elementwise handled it upstream
+  cons:dict = {}                                            # maximal roots = an extractable EW-binop feeding a NON-extractable
+  for u in uops:                                            # consumer (these are disjoint; a bare leaf isn't worth a submit)
+    for s in u.src: cons.setdefault(s, []).append(u)
+  roots = [u for u in uops if u.op in EW_BINOPS and extractable(u) and any(not extractable(c) for c in cons.get(u, []))]
+  if not roots: return [], {}
+  def taskgraph(root):                                       # the chain_add task DAG for one sub-DAG (children-first, shared collapse)
+    leaves, leaf_idx, tasks, node_of = [], {}, [], {}
+    def ref(v):
+      if (lf:=leaf(v)) is not None:
+        if lf not in leaf_idx: leaf_idx[lf] = len(leaves); leaves.append(lf)
+        return ("leaf", leaf_idx[lf])
+      if v in node_of: return ("node", node_of[v])
+      ra, rb = ref(v.src[0]), ref(v.src[1])
+      node_of[v] = len(tasks); tasks.append((EW_BINOPS[v.op], ra, rb))
+      return ("node", node_of[v])
+    ref(root); return tasks, leaves
+  nreal = max(u.arg for u in uops if u.op is Ops.PARAM) + 1  # scratch buffer ids start past the real kernel buffers
+  ews, scratch = [], {}
+  for root in roots:
+    tasks, leaves = taskgraph(root)
+    if len(tasks) > 6: continue                              # exceeds the toolkit-free regcmd cap -> leave this one on the CPU
+    sid = nreal + len(scratch)
+    ews.append({"n": n, "out": (sid, 0), "tasks": tasks, "leaves": leaves}); scratch[root] = sid
+  return ews, scratch
+
 def extract_bias_vector(sink:UOp):
   # after extract_matmul, detect a pure  C[m,n] + bias[n]  epilogue (per-column bias, broadcast over rows): the store
   # value is ADD(LOAD C[m,n] in place, LOAD bias[<contiguous axis only>]). record it as a bias VECTOR for the GEMM
@@ -150,12 +205,14 @@ def rk_sink(sink:UOp):
   if mm is not None: s = mm
   bv = extract_bias_vector(s) if mm is not None else None  # ...a  C[m,n]+bias[n]  epilogue -> a per-column bias VECTOR on the GEMM
   if bv is not None: s = bv
-  ew = extract_elementwise(s) if bv is None else None      # ...else pull the elementwise epilogue out structurally too (no unroll)
+  ew = extract_elementwise(s) if bv is None else None      # ...else pull the (whole-store) elementwise epilogue out structurally too
   if ew is not None:
     _RK_EW.append(ew)
     # the epilogue is now a descriptor; drop its store/ranges but keep every param reachable so globals stays correct
     s = UOp.sink(*[UOp(Ops.NOOP, dtypes.void, (p,)) for p in dedup([u for u in s.toposort() if u.op is Ops.PARAM])], arg=s.arg)
   if mm is None and ew is None: return None                # nothing structured -> leave the sink compact; render emits a C loop
+  # (a MIXED EW store -- one with a non-EW op like a compare -- is left compact here; render's peel_ew_subdags then groups
+  # its float-ALU sub-DAGs onto the NPU and renders the rest as a C loop, without adding a buffer to the kernel's globals.)
   return s                                                 # something extracted; re-apply, then render the leftover as a C loop
 rk_prepare = PatternMatcher([(UPat(Ops.SINK, name="sink"), rk_sink)])+symbolic
 
@@ -203,14 +260,18 @@ class RKRenderer(Renderer):
       for u in uops:
         print(f"  %{idx[u]:<3d} = {u.op.name:12s} {u.dtype}" + (" src=("+", ".join(f'%{idx[s]}' for s in u.src)+")" if u.src else "") +
               ("" if u.arg is None else f" arg={u.arg}"))
-    if (cl:=compact_loop_to_c(uops)) is not None:
+    ews_sub, scratch = peel_ew_subdags(uops)   # group a MIXED kernel's float-ALU sub-DAGs (e.g. the a+b in (a+b)>c) onto the NPU
+    if (cl:=compact_loop_to_c(uops, scratch)) is not None:
       # render the leftover compact loop straight to clang C (no unroll, no interpreter). a GEMM extracted before it
       # (matmul + a non-extractable epilogue, e.g. (a@b).relu()) still runs on the NPU first: carry the gemms and append
-      # the cloop as the last clang submit. no extractable EW reaches here (an extractable epilogue leaves no RANGE).
+      # the cloop as the last clang submit. any peeled float-ALU sub-DAG (ews_sub) runs on the NPU first, into a scratch
+      # buffer the cloop reads; the non-EW remainder (compare/cast/max/...) stays in the C loop.
       gemms = list(_RK_GEMM); _RK_GEMM.clear(); ews = list(_RK_EW); _RK_EW.clear(); _RK_BIAS.clear()
       npu_gemm = [g+(None,) for g in gemms]
-      prog:list = [("ew", e) for e in ews] + [("cloop", cl[0], cl[1])]
-      if DEBUG >= 3: print(f"RKRenderer: {len(uops)} compact uops -> clang C loop (CPU)"+(f", after {len(gemms)} NPU GEMM" if gemms else "")+":\n"+"\n".join(cl[0]))
+      prog:list = [("ew", e) for e in ews + ews_sub] + [("cloop", cl[0], cl[1])]
+      if DEBUG >= 3: print(f"RKRenderer: {len(uops)} compact uops -> clang C loop (CPU)" +
+                           (f", after {len(gemms)} NPU GEMM" if gemms else "") +
+                           (f" + {len(ews_sub)} NPU EW sub-DAG" if ews_sub else "") + ":\n" + "\n".join(cl[0]))
       return base64.b64encode(pickle.dumps(("chunks", prog, npu_gemm))).decode()
     # not renderable to C -> hand the uops straight to the (slow) uop interpreter
     if DEBUG >= 3: print(f"RKRenderer: {len(uops)} compact uops not renderable to C -> uop interpreter (CPU)")
@@ -257,15 +318,22 @@ def chunks_to_c(gemms, prog) -> tuple[list[str], list[str], int]:
   submits = [wrap(f"k{si}", ew_lines(sub[1]) if is_ew(sub) else sub[1] if is_cloop(sub) else []) for si, sub in enumerate(prog)]
   return gsubs, submits, nbufs
 
-def compact_loop_to_c(uops:list[UOp]):
+def compact_loop_to_c(uops:list[UOp], scratch:dict|None=None):
   # render a COMPACT looped sink -- elementwise AND reductions (via the register-accumulator form: DEFINE_REG + a
   # zero-store, an in-reduce-loop update store, then an output store) -- straight to one C function with nested
   # for-loops, by walking the uops in linearized order (RANGE->`for{`, END->`}`, STORE->assignment). directly from the
   # uops: NO unroll, NO per-element scalars, NO uop interpreter. returns ([submit], nbufs) or None if an op can't render.
+  # `scratch` (from peel_ew_subdags) maps a sub-DAG ROOT uop -> a scratch buffer id: that root renders as a read of the
+  # row-major scratch (the NPU already computed it) instead of recursing into its (now offloaded) float-ALU subtree.
   if not any(u.op is Ops.RANGE for u in uops): return None
+  scratch = scratch or {}
   bufs = {u: u.arg for u in uops if u.op is Ops.PARAM}
   regs = {u: f"acc{i}" for i, u in enumerate(u for u in uops if u.op is Ops.DEFINE_REG)}
   rng:dict = {}
+  rs = [u for u in uops if u.op is Ops.RANGE]                   # row-major scratch flatten: outermost range has the largest stride
+  sst, a = {}, 1
+  for r in reversed(rs): sst[r] = a; a *= r.vmax+1
+  def sflat(): return "+".join(rng[r] if sst[r] == 1 else f"{rng[r]}*{sst[r]}" for r in rs) or "0"
   def ct2(dt):
     if (s:=dt.scalar()) not in CT: raise NotImplementedError(s)
     return CT[s]
@@ -276,6 +344,7 @@ def compact_loop_to_c(uops:list[UOp]):
     if p.op is Ops.PARAM: return ("buf", bufs[p], ix.src[1])
     raise NotImplementedError(f"index base {p.op}")
   def ce(u):                                                    # render a value / index uop to a C expression
+    if u in scratch: return f"(({ct2(u.dtype)}*)b[{scratch[u]}])[{sflat()}]"   # NPU already computed this sub-DAG -> read scratch
     if u.op is Ops.CONST:
       if u.dtype is dtypes.bool: return "1" if u.arg else "0"
       return (f"{float(u.arg)!r}f" if u.dtype.scalar() in (dtypes.float, dtypes.half) else repr(float(u.arg))) \
@@ -314,7 +383,8 @@ def compact_loop_to_c(uops:list[UOp]):
         else: dest = f"(({ct2(u.src[1].dtype)}*)b[{mr[1]}])[{ce(mr[2])}]"
         lines.append("  "*depth + f"{dest} = {ce(u.src[1])};")
   except (NotImplementedError, KeyError): return None
-  return [f"{ct2(regdt.get(r, dtypes.float))} {n};" for r, n in regs.items()] + lines, max(bufs.values())+1   # (decls + loop body), nbufs
+  return [f"{ct2(regdt.get(r, dtypes.float))} {n};" for r, n in regs.items()] + lines, \
+         max(list(bufs.values()) + list(scratch.values())) + 1   # (decls + loop body), nbufs (incl. any scratch ids)
 
 class RKProgram:
   def __init__(self, device:str, name:str, lib:bytes, *args, **kwargs):
@@ -343,6 +413,9 @@ class RKProgram:
     with cpu_profile(self.name, self.device):
       if self.prog[0] == "chunks":                              # NPU GEMMs + EW (chain_add), each falling back to its clang fxn
         import numpy as np
+        bufs = list(bufs)                                       # extend with SCRATCH buffers for NPU EW sub-DAG outputs (ids >= nreal)
+        for sid in range(len(bufs), self._nbufs):
+          bufs.append(memoryview(bytearray(next(s[1]["n"] for s in self.prog[1] if s[0] == "ew" and s[1]["out"][0] == sid)*4)))
         B = (ctypes.c_void_p*self._nbufs)(*[mv_address(bufs[i]) for i in range(self._nbufs)])
         for i, (M, K, N, bufA, bufB, ba, am, ak, bb, bk, bn, bufC, cb, cm, cn, bias) in enumerate(self._npu_gemm):
           try:                                                  # GEMM on the NPU MAC (vendor gemm.py) FIRST -> writes C

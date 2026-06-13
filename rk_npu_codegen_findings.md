@@ -352,3 +352,30 @@ fusable epilogue → `mm`/`ew` submits, no leftover compute).
 Unrenderable ops (if any: `compact_loop_to_c` returns `None`) still fall back to the uop interpreter, which is
 correct. The `RK_UNROLL=0` mode (no extraction at all → everything to the interpreter) also remains as a debug
 escape hatch.
+
+### 9.1 Splitting a MIXED kernel: float-ALU on the NPU, the rest on the CPU (`peel_ew_subdags`)
+
+`extract_elementwise` only fires when the *whole* store value is a chain_add-able EW DAG (ADD/MUL/SUB/FDIV over
+contiguous fp32/fp16 loads). A kernel like `(a+b) > c` has a `CMPLT` at the root — the DPU-EW can't compare (§3.1:
+compares are CPU on this NVDLA-derived part) — so it used to render entirely as a CPU `compact_loop_to_c` loop.
+
+`peel_ew_subdags(uops)` (run in `render`'s cloop branch) now **groups the float-ALU sub-DAGs onto the NPU and leaves
+the rest on the CPU**: it finds each *maximal* float EW-binop sub-DAG whose subtree is all EW over contiguous leaves
+(e.g. the `a+b`, or the `(a+b)*e` in `((a+b)*e)>c`), emits one `chain_add` EW descriptor per sub-DAG (so an N-op ALU
+group is **one ioctl**, not N), and returns a `{root_uop: scratch_id}` map. `compact_loop_to_c(uops, scratch)` renders
+each such root as a **read of a row-major scratch buffer** (the NPU already computed it) instead of recursing into the
+offloaded subtree; the non-EW remainder (compare/cast/max/...) stays in the C loop.
+
+**Key constraint — no new buffer in the kernel's globals.** A scratch can't be added as a `PARAM`/`DEFINE_GLOBAL`:
+`ProgramInfo.from_sink` builds `globals` from every `PARAM.arg` (`uop/ops.py:1083`) and the realize path then does
+`bufs[i] for i in ast.arg.globals` — a render-time buffer the scheduler never created → `IndexError`. So the scratch
+lives **only in render + the runtime**: ids start *past* the real params, and `RKProgram.__call__` allocates one
+`bytearray(n*4)` per scratch id and appends it to `bufs` before building the clang `B` array. The NPU EW (or its
+`ew_lines` clang fallback) writes the scratch; the cloop reads it. Order in `__call__` is GEMMs → EW (incl. peeled
+sub-DAGs) → cloop, so the scratch is always written before the cloop reads it.
+
+Verified on the RK NPU: `(a+b)>12` → `EW chain (1 op) -> bufN` (one ioctl) + CPU compare, exact; `d+((a+b)>12)` exact;
+`((a+b)*e)>c` → `EW chain (2 op)` (the ALU grouped into one submit) + CPU compare, exact; an **int** `(ai+bi)>5` stays
+fully on the CPU (non-float → no peel). `test/backend/test_add_cmp.py` passes (its direct `compact_loop_to_c(uops)`
+call, with no scratch map, still renders the whole add+compare as one CPU loop). NPU-submit failures fall back to the
+peeled sub-DAG's `ew_lines` clang fxn, keeping the result correct.
