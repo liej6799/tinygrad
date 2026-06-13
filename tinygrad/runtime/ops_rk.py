@@ -1,4 +1,4 @@
-import inspect, functools, base64, pickle
+import inspect, functools, base64, pickle, math
 from tinygrad.device import Compiled, Allocator, Compiler
 from tinygrad.renderer import Renderer, cstyle, nir, ptx, llvmir, wgsl
 from tinygrad.dtype import dtypes
@@ -73,6 +73,12 @@ def extract_matmul(sink:UOp):
   return out.replace(src=out.src + tuple(UOp(Ops.NOOP, dtypes.void, (p,)) for p in (pa, pb)))
 
 EW_BINOPS = {Ops.ADD:"ADD", Ops.MUL:"MUL", Ops.SUB:"SUB", Ops.FDIV:"DIV"}   # extractable EW binops (must be in ew_lines' EW_C)
+NPF = {dtypes.float:"float32", dtypes.half:"float16"}   # float dtypes the NPU EW (chain_add) handles; the descriptor carries one
+                                                        # so the runtime reads/writes the buffer & sizes scratch at the right width
+# max DPU-EW ops PC-chained into ONE chain_add submit. chain_add grows its regcmd buffer, so this is NOT the old "1KB / 6
+# block" toolkit limit -- verified to 256 ops on hardware; capped here, beyond it the chain renders as a CPU C loop. (an
+# NPU mem/submit failure for a long chain still falls back to clang, so the cap is a perf knob, not a correctness one.)
+EW_MAX_OPS = 64
 
 def extract_elementwise(sink:UOp):
   # the ALU analogue of extract_matmul: detect a pure elementwise kernel (NO reduce) whose single STORE value is a
@@ -82,7 +88,7 @@ def extract_elementwise(sink:UOp):
   if any(u.op is Ops.RANGE and u.arg[1] is AxisType.REDUCE for u in topo): return None   # has a reduce -> not pure EW
   stores = [u for u in topo if u.op is Ops.STORE]
   if len(stores) != 1 or stores[0].src[0].op is not Ops.INDEX or stores[0].src[0].src[0].op is not Ops.PARAM: return None
-  if not dtypes.is_float(stores[0].src[1].dtype): return None              # the NPU EW / clang ew_lines are fp16/fp32 only -> non-float EW stays a C loop
+  if stores[0].src[1].dtype.scalar() not in NPF: return None               # the NPU EW / clang ew_lines are fp16/fp32 only -> other dtypes stay a C loop
   rngs = [u for u in topo if u.op is Ops.RANGE]
   if not rngs: return None
   n = 1
@@ -116,9 +122,9 @@ def extract_elementwise(sink:UOp):
     node_of[v] = len(tasks); tasks.append((EW_BINOPS[v.op], ra, rb))                    # children first -> topo order
     return ("node", node_of[v])
   obase, ocoeffs = affine(stores[0].src[0].src[1])
-  # one regcmd block per task in a shared 1KB buffer -> cap the graph at the toolkit-free limit, else fall back to scalar
-  if ocoeffs != strides or (root:=build(stores[0].src[1])) is None or root[0] != "node" or len(tasks) > 6: return None
-  return {"n": n, "out": (stores[0].src[0].src[0].arg, obase), "tasks": tasks, "leaves": leaves}
+  # the whole store is one chain_add submit (PC-chained DPU-EW tasks); cap the op count (EW_MAX_OPS), else fall to a C loop
+  if ocoeffs != strides or (root:=build(stores[0].src[1])) is None or root[0] != "node" or len(tasks) > EW_MAX_OPS: return None
+  return {"n": n, "out": (stores[0].src[0].src[0].arg, obase), "tasks": tasks, "leaves": leaves, "dt": NPF[stores[0].src[1].dtype.scalar()]}
 
 def peel_ew_subdags(uops:list[UOp]):
   # a MIXED elementwise compact loop whose store value has an op the NPU DPU-EW can't do (compare/cast/max/mod/...):
@@ -147,7 +153,7 @@ def peel_ew_subdags(uops:list[UOp]):
   memo:dict = {}
   def extractable(u):   # u's whole subtree is a float EW-binop DAG over contiguous leaves -> runnable as one NPU EW
     if u not in memo: memo[u] = (leaf(u) is not None) or (u.op in EW_BINOPS and len(u.src) == 2 and
-                                                          dtypes.is_float(u.dtype) and all(extractable(s) for s in u.src))
+                                                          u.dtype.scalar() in NPF and all(extractable(s) for s in u.src))
     return memo[u]
   if extractable(stores[0].src[1]): return [], {}           # whole store is EW -> extract_elementwise handled it upstream
   cons:dict = {}                                            # maximal roots = an extractable EW-binop feeding a NON-extractable
@@ -170,9 +176,9 @@ def peel_ew_subdags(uops:list[UOp]):
   ews, scratch = [], {}
   for root in roots:
     tasks, leaves = taskgraph(root)
-    if len(tasks) > 6: continue                              # exceeds the toolkit-free regcmd cap -> leave this one on the CPU
+    if len(tasks) > EW_MAX_OPS: continue                     # too long to PC-chain in one submit -> leave this sub-DAG on the CPU
     sid = nreal + len(scratch)
-    ews.append({"n": n, "out": (sid, 0), "tasks": tasks, "leaves": leaves}); scratch[root] = sid
+    ews.append({"n": n, "out": (sid, 0), "tasks": tasks, "leaves": leaves, "dt": NPF[root.dtype.scalar()]}); scratch[root] = sid
   return ews, scratch
 
 def extract_bias_vector(sink:UOp):
@@ -302,14 +308,16 @@ def chunks_to_c(gemms, prog) -> tuple[list[str], list[str], int]:
             f"  ((float*)b[{bufC}])[{cb}+{cm}*m+{cn}*n]=acc{bt};", "}"]
   def ew_lines(d):
     # the structured elementwise graph (extract_elementwise) as one C loop over n: each task is a binop over leaf
-    # buffers/consts or a prior task, writing the root straight to the output. no unroll -- the loop IS the range.
+    # buffers/consts or a prior task, writing the root straight to the output. no unroll -- the loop IS the range. the
+    # buffer reads/write use the kernel's float C type ({float|_Float16}) so the fp16 fallback matches the buffer width.
     leaves, tasks, (ob, obase) = d["leaves"], d["tasks"], d["out"]
-    refc = lambda r: (f"((float*)b[{leaves[r[1]][1]}])[{leaves[r[1]][2]}+i]" if leaves[r[1]][0] == "buf" else f"{float(leaves[r[1]][1])}f") \
+    cty = {"float32":"float", "float16":"_Float16"}[d["dt"]]
+    refc = lambda r: (f"(({cty}*)b[{leaves[r[1]][1]}])[{leaves[r[1]][2]}+i]" if leaves[r[1]][0] == "buf" else f"{float(leaves[r[1]][1])}f") \
                      if r[0] == "leaf" else f"t{r[1]}"
     body = [f"for(int i=0;i<{d['n']};i++){{"]
     for k, (op, ra, rb) in enumerate(tasks):
       body.append(f"  float t{k} = " + (f"fmaxf({refc(ra)},{refc(rb)})" if op == "MAX" else f"({refc(ra)}{EW_C[op]}{refc(rb)})") + ";")
-    return body + [f"  ((float*)b[{ob}])[{obase}+i] = t{len(tasks)-1};", "}"]
+    return body + [f"  (({cty}*)b[{ob}])[{obase}+i] = t{len(tasks)-1};", "}"]
   gemm_bufs = [b for g in gemms for b in (g[3], g[4], g[11])] + [g[15][0] for g in gemms if isinstance(g[15], tuple)]  # A,B,C (+bias buf)
   ew_bufs = [b for sub in prog if is_ew(sub) for b in [sub[1]["out"][0]] + [lf[1] for lf in sub[1]["leaves"] if lf[0] == "buf"]]
   nbufs = max([1] + [b+1 for b in gemm_bufs + ew_bufs] + [sub[2] for sub in prog if is_cloop(sub)])
@@ -347,8 +355,11 @@ def compact_loop_to_c(uops:list[UOp], scratch:dict|None=None):
     if u in scratch: return f"(({ct2(u.dtype)}*)b[{scratch[u]}])[{sflat()}]"   # NPU already computed this sub-DAG -> read scratch
     if u.op is Ops.CONST:
       if u.dtype is dtypes.bool: return "1" if u.arg else "0"
-      return (f"{float(u.arg)!r}f" if u.dtype.scalar() in (dtypes.float, dtypes.half) else repr(float(u.arg))) \
-             if dtypes.is_float(u.dtype) else str(int(u.arg))
+      if not dtypes.is_float(u.dtype): return str(int(u.arg))
+      v = float(u.arg)                                          # 'inff'/'nanf' aren't valid C literals -> use the builtins
+      if math.isinf(v): return ("-" if v < 0 else "") + "__builtin_inff()"
+      if math.isnan(v): return "__builtin_nanf(\"\")"
+      return f"{v!r}f" if u.dtype.scalar() in (dtypes.float, dtypes.half) else repr(v)
     if u.op is Ops.RANGE: return rng[u]
     if u.op is Ops.CAST: return f"({ct2(u.dtype)})({ce(u.src[0])})"
     if u.op is Ops.LOAD:
@@ -415,7 +426,8 @@ class RKProgram:
         import numpy as np
         bufs = list(bufs)                                       # extend with SCRATCH buffers for NPU EW sub-DAG outputs (ids >= nreal)
         for sid in range(len(bufs), self._nbufs):
-          bufs.append(memoryview(bytearray(next(s[1]["n"] for s in self.prog[1] if s[0] == "ew" and s[1]["out"][0] == sid)*4)))
+          d = next(s[1] for s in self.prog[1] if s[0] == "ew" and s[1]["out"][0] == sid)
+          bufs.append(memoryview(bytearray(d["n"] * np.dtype(d["dt"]).itemsize)))   # sized at the sub-DAG's float width (fp16/fp32)
         B = (ctypes.c_void_p*self._nbufs)(*[mv_address(bufs[i]) for i in range(self._nbufs)])
         for i, (M, K, N, bufA, bufB, ba, am, ak, bb, bk, bn, bufC, cb, cm, cn, bias) in enumerate(self._npu_gemm):
           try:                                                  # GEMM on the NPU MAC (vendor gemm.py) FIRST -> writes C
@@ -433,12 +445,12 @@ class RKProgram:
             self._gemm_fxns[i](B)
         for i, sub in enumerate(self.prog[1]):                  # then each EW epilogue: NPU DPU-EW (chain_add) first, clang fallback
           if sub[0] == "ew":
-            d = sub[1]; n = d["n"]; ob, obase = d["out"]
+            d = sub[1]; n = d["n"]; ob, obase = d["out"]; dt = np.dtype(d["dt"])   # fp16/fp32 -> read leaves & write at this width
             try:
-              lf2v = lambda lf: np.frombuffer(bufs[lf[1]], dtype=np.float32)[lf[2]:lf[2]+n] if lf[0] == "buf" else float(lf[1])
-              if DEBUG >= 2: print(f"\033[35m*** RK NPU\033[0m  EW chain ({len(d['tasks'])} op) n={n} -> buf{ob}[{obase}:]")
+              lf2v = lambda lf: np.frombuffer(bufs[lf[1]], dtype=dt)[lf[2]:lf[2]+n] if lf[0] == "buf" else float(lf[1])
+              if DEBUG >= 2: print(f"\033[35m*** RK NPU\033[0m  EW chain ({len(d['tasks'])} op) n={n} {dt} -> buf{ob}[{obase}:]")
               res = _chain_add().cached_graph(n, d["tasks"]).run([lf2v(lf) for lf in d["leaves"]])
-              np.frombuffer(bufs[ob], dtype=np.float32)[obase:obase+n] = np.asarray(res, dtype=np.float32)
+              np.frombuffer(bufs[ob], dtype=dt)[obase:obase+n] = np.asarray(res, dtype=dt)
             except (OSError, RuntimeError) as e:                # NPU EW submit failed -> recompute the epilogue on CPU (clang)
               if DEBUG >= 2: print(f"\033[33m*** RK NPU EW failed ({e}) -> CPU clang fallback\033[0m")
               self._fxns[i](B)
