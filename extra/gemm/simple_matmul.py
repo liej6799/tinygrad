@@ -33,11 +33,14 @@ if __name__ == "__main__":
     return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
 
   ADDC = getenv("ADDC", 7.0)   # add a constant to the matmul -> kernel becomes matmul + elementwise add (breaks pure matmul)
+  ADDT = getenv("ADDT", 0)     # add a full [M,N] tensor instead -> true elementwise ALU add (matmul -> NPU MAC, EW add -> separate submit)
+  ADDV = getenv("ADDV", 0)     # add a per-column bias vector [1,N] -> matmul + bias[n] (fused into the GEMM via augmentation)
   a, b = init_matrix(M, K), init_matrix(K, N)
+  d = init_matrix(M, N) if ADDT else init_matrix(1, N) if ADDV else None
   for i in range(CNT):
     if i > 0 and getenv("RAND", 0) != 0:
       a, b = init_matrix(M, K), init_matrix(K, N)
-    c = (a.matmul(b, dtype=acc_dtype) + ADDC).realize()
+    c = (a.matmul(b, dtype=acc_dtype) + (d if (ADDT or ADDV) else ADDC)).realize()
 
   if getenv("SHOULD_USE_TC"):
     linear = compile_linear(a.matmul(b, dtype=acc_dtype).schedule_linear())
@@ -45,7 +48,7 @@ if __name__ == "__main__":
     applied_opts = call.src[0].src[0].arg.applied_opts
     assert any(opt.op is OptOps.TC for opt in applied_opts), f"TC not triggered, {applied_opts}"
 
-  ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32) + ADDC
+  ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32) + (d.numpy().astype(np.float32) if (ADDT or ADDV) else ADDC)
   res = c.numpy()
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
