@@ -484,20 +484,22 @@ def compact_loop_to_c(uops:list[UOp], scratch:dict|None=None):
     if p.op is Ops.DEFINE_REG: return ("reg", regs[p])
     if p.op is Ops.PARAM: return ("buf", bufs[p], ix.src[1])
     raise NotImplementedError(f"index base {p.op}")
-  def ce(u):                                                    # render a value / index uop to a C expression
-    if u in scratch: return f"(({ct2(u.dtype)}*)b[{scratch[u]}])[{sflat()}]"   # NPU already computed this sub-DAG -> read scratch
-    if u.op is Ops.CONST:
+  tmp:dict = {}                                                 # value uop -> its C temp name. each is emitted ONCE; references use the
+  def ref(u):                                                   # name -> a shared sub-expression (e.g. threefry's rounds) is never re-inlined.
+    if u.op is Ops.CONST:                                       # the C ref for a uop: an inline literal (CONST/RANGE) or its temp name
       if u.dtype is dtypes.bool: return "1" if u.arg else "0"
       if not dtypes.is_float(u.dtype): return str(int(u.arg))
       v = float(u.arg)                                          # 'inff'/'nanf' aren't valid C literals -> use the builtins
       if math.isinf(v): return ("-" if v < 0 else "") + "__builtin_inff()"
       if math.isnan(v): return "__builtin_nanf(\"\")"
       return f"{v!r}f" if u.dtype.scalar() in (dtypes.float, dtypes.half) else repr(v)
-    if u.op is Ops.RANGE: return rng[u]
-    if u.op is Ops.CAST: return f"({ct2(u.dtype)})({ce(u.src[0])})"
+    return rng[u] if u.op is Ops.RANGE else tmp[u]
+  def expr(u):                                                  # the ONE-LEVEL C expression for a value uop, from its srcs' refs
+    if u in scratch: return f"(({ct2(u.dtype)}*)b[{scratch[u]}])[{sflat()}]"   # NPU already computed this sub-DAG -> read scratch
+    if u.op is Ops.CAST: return f"({ct2(u.dtype)})({ref(u.src[0])})"
     if u.op is Ops.LOAD:
-      mr = memref(u.src[0]); return mr[1] if mr[0] == "reg" else f"(({ct2(u.dtype)}*)b[{mr[1]}])[{ce(mr[2])}]"
-    es, op, f, c = [ce(s) for s in u.src], u.op, ('f' if u.dtype.scalar() in (dtypes.float, dtypes.half) else ''), ct2(u.dtype)
+      mr = memref(u.src[0]); return mr[1] if mr[0] == "reg" else f"(({ct2(u.dtype)}*)b[{mr[1]}])[{ref(mr[2])}]"
+    es, op, f, c = [ref(s) for s in u.src], u.op, ('f' if u.dtype.scalar() in (dtypes.float, dtypes.half) else ''), ct2(u.dtype)
     if op is Ops.MAX: return f"(({es[0]})>({es[1]})?({es[0]}):({es[1]}))"
     if op is Ops.WHERE: return f"(({es[0]})?({es[1]}):({es[2]}))"
     if op is Ops.TRUNC: return f"__builtin_trunc{f}({es[0]})" if f else f"({es[0]})"   # int trunc is a no-op; float/round family decompose to this
@@ -512,20 +514,22 @@ def compact_loop_to_c(uops:list[UOp], scratch:dict|None=None):
     if op in C_FN: return f"__builtin_{C_FN[op]}{f}({es[0]})"
     if op in C_BIN: return f"(({es[0]}){C_BIN[op]}({es[1]}))"
     raise NotImplementedError(f"RK cloop: op {op}")
-  regdt:dict = {}
-  lines, depth = [], 1
-  for u in uops:                                                # walk in linearized order: ranges open/close loops
+  SKIP = {Ops.CONST, Ops.RANGE, Ops.INDEX, Ops.PARAM, Ops.DEFINE_REG, Ops.AFTER, Ops.STORE, Ops.END, Ops.SINK, Ops.NOOP}
+  regdt:dict = {}; lines, depth = [], 1
+  for u in uops:                                                # walk in linearized order: ranges open/close loops, value uops -> temps
     if u.op is Ops.RANGE:
       rng[u] = f"r{len(rng)}"; lines.append("  "*depth + f"for(int {rng[u]}=0;{rng[u]}<{u.vmax+1};{rng[u]}++){{"); depth += 1
     elif u.op is Ops.END: depth -= 1; lines.append("  "*depth + "}")
-    elif u.op is Ops.STORE:                                     # ce()/ct2() raise NotImplementedError(op/dtype) if it can't render to C
+    elif u.op is Ops.STORE:                                     # expr()/ct2() raise NotImplementedError(op/dtype) if it can't render to C
       mr = memref(u.src[0])
       if mr[0] == "reg":
         p = u.src[0].src[0]
         while p.op in (Ops.CAST, Ops.AFTER): p = p.src[0]
         regdt[p] = u.src[1].dtype; dest = mr[1]
-      else: dest = f"(({ct2(u.src[1].dtype)}*)b[{mr[1]}])[{ce(mr[2])}]"
-      lines.append("  "*depth + f"{dest} = {ce(u.src[1])};")
+      else: dest = f"(({ct2(u.src[1].dtype)}*)b[{mr[1]}])[{ref(mr[2])}]"
+      lines.append("  "*depth + f"{dest} = {ref(u.src[1])};")
+    elif u.op not in SKIP:                                      # a value uop -> compute it once into a temp the rest reference by name
+      tmp[u] = f"t{len(tmp)}"; lines.append("  "*depth + f"{ct2(u.dtype)} {tmp[u]} = {expr(u)};")
   return [f"{ct2(regdt.get(r, dtypes.float))} {n};" for r, n in regs.items()] + lines, \
          max(list(bufs.values()) + list(scratch.values())) + 1   # (decls + loop body), nbufs (incl. any scratch ids)
 
