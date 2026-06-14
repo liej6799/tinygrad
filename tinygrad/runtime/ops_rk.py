@@ -1,4 +1,4 @@
-import inspect, functools, base64, pickle, math, os, mmap, ctypes, struct
+import inspect, functools, math, os, mmap, ctypes, struct
 from fcntl import ioctl
 from tinygrad.device import Compiled, Allocator, Compiler
 from tinygrad.renderer import Renderer, cstyle, nir, ptx, llvmir, wgsl
@@ -356,6 +356,12 @@ def rk_sink(sink:UOp):
   return s                                                 # something extracted; re-apply, then render the leftover as a C loop
 rk_prepare = PatternMatcher([(UPat(Ops.SINK, name="sink"), rk_sink)])+symbolic
 
+class RKSource:
+  # the rendered RK program, carried through the SOURCE/BINARY uops as a plain python object (no base64/pickle round-trip).
+  # hashed by identity so it can be a uop arg, and printed as a one-line summary under DEBUG>=4 (not a raw byte blob).
+  def __init__(self, data:tuple): self.data = data
+  def __repr__(self): return f"<RK program: {len(self.data[1])} chunk(s), {len(self.data[2])} GEMM>"
+
 class RKRenderer(Renderer):
   has_local = False
   supports_float4 = False                   # scalar stream: compact_loop_to_c renders scalar loads/stores, not vec4
@@ -366,7 +372,7 @@ class RKRenderer(Renderer):
   code_for_op = {Ops.ADD:"+", Ops.SUB:"-", Ops.MUL:"*", Ops.CMPLT:"<", Ops.CMPNE:"!=", Ops.MAX:"max",
                  Ops.SIN:"sin", Ops.SQRT:"sqrt", Ops.EXP2:"exp2", Ops.LOG2:"log2", Ops.RECIPROCAL:"recip"}
   pre_matcher = rk_prepare
-  def render(self, uops:list[UOp]) -> str:
+  def render(self, uops:list[UOp]) -> RKSource:
     idx = {u:i for i,u in enumerate(uops)}
     if not any(u.op is Ops.RANGE for u in uops):   # fully extracted: no leftover compute -- only structured GEMMs + EWs.
       # GEMMs (extract_matmul) write straight to C; the EW (extract_elementwise / extract_bias_vector) is a descriptor.
@@ -396,7 +402,7 @@ class RKRenderer(Renderer):
         for g in gemms: print(f"  GEMM (M={g[0]} K={g[1]} N={g[2]} -> C[{g[11]}]" +
                               (f" + {bias[g[11]]} fused (DPU BS)" if g[11] in bias else
                                f" + bias[{g[2]}] fused (augment buf{vbias[g[11]][0]})" if g[11] in vbias else "") + ") on NPU MAC")
-      return base64.b64encode(pickle.dumps(("chunks", prog, npu_gemm, npu_gemm_cmd))).decode()
+      return RKSource(("chunks", prog, npu_gemm, npu_gemm_cmd))
     if DEBUG >= 6:
       print(f"RKRenderer: {len(uops)} compact uops:")
       for u in uops:
@@ -415,10 +421,10 @@ class RKRenderer(Renderer):
     if DEBUG >= 3: print(f"RKRenderer: {len(uops)} compact uops -> clang C loop (CPU)" +
                          (f", after {len(gemms)} NPU GEMM" if gemms else "") +
                          (f" + {len(ews_sub)} NPU EW sub-DAG" if ews_sub else "") + ":\n" + "\n".join(cl[0]))
-    return base64.b64encode(pickle.dumps(("chunks", prog, npu_gemm, npu_gemm_cmd))).decode()
+    return RKSource(("chunks", prog, npu_gemm, npu_gemm_cmd))
 
 class RKCompiler(Compiler):
-  def compile(self, src:str) -> bytes: return base64.b64decode(src)
+  def compile(self, src:RKSource) -> RKSource: return src   # the rendered program is already a python object -- nothing to (de)serialize
 RKRenderer.compiler = RKCompiler()
 
 CT = {dtypes.float:"float", dtypes.half:"_Float16", dtypes.double:"double", dtypes.bool:"unsigned char", dtypes.int:"int",
@@ -533,6 +539,16 @@ def compact_loop_to_c(uops:list[UOp], scratch:dict|None=None):
   return [f"{ct2(regdt.get(r, dtypes.float))} {n};" for r, n in regs.items()] + lines, \
          max(list(bufs.values()) + list(scratch.values())) + 1   # (decls + loop body), nbufs (incl. any scratch ids)
 
+def _dump_cmd(label, task_regs):
+  # DEBUG>=6: print the WHOLE NPU register-command stream submitted for this job -- every 64-bit qword, decoded
+  # (target stream id, register addr, value). this is exactly what the renderer generated + the runtime patched.
+  tot = sum(len(r) for r in task_regs)
+  print(f"\033[90m*** RK NPU command [{label}]: {len(task_regs)} task(s), {tot} qwords ({tot*8} bytes)\033[0m")
+  for ti, regs in enumerate(task_regs):
+    for i, q in enumerate(regs):
+      q &= (1<<64)-1
+      print(f"\033[90m  t{ti}[{i:2d}] {q:016x}  tgt={q>>48:#06x} reg={q&0xFFFF:#06x} val={(q>>16)&0xFFFFFFFF:#010x}\033[0m")
+
 def _run_npu_ew(d, bufs, st):
   # RUN the renderer-generated DPU-EW command (d["npu"]): on first call allocate the per-(operand,tile) NPU buffers and patch
   # each block's 3 DMA-address slots; then lay the regcmd, write the input as fp16, submit. numpy-free: an fp16 source buffer's
@@ -547,6 +563,7 @@ def _run_npu_ew(d, bufs, st):
     for qw, sa, sb, dr, t in P["blocks"]:
       q = list(qw); q[12] = _E(_DPU,0x4020,addr(dr,t)); q[13] = _E(_RDMA,0x5018,addr(sa,t)); q[14] = _E(_RDMA,0x5038,addr(sb,t))
       st["task_regs"].append(q)
+  if DEBUG >= 6: _dump_cmd(f"DPU-EW n={n} {d['dt']}", st["task_regs"])
   npu.write_regs(st["task_regs"], 0x18, True, 0)              # DPU-EW: OPERATION_ENABLE=0x18, op_idx=task idx, end-NOP=0
   for i, lf in enumerate(d["leaves"]):                        # the fp16 bytes for this operand, scattered into the per-tile buffers
     f16 = _f16([float(lf[1])]*n) if lf[0] == "const" else bytes(bufs[lf[1]][lf[2]*2:(lf[2]+n)*2]) if isz == 2 else \
@@ -582,14 +599,15 @@ def _run_npu_gemm(g, plan, bufs):
           if row < N and col < ke: wp[((b0*rt+b1)*16+r)*32+c] = B[col*N+row]
   imap[:len(inp)*2] = _f16(inp); wmap[:len(wp)*2] = _f16(wp)
   task_regs = [_patch_gemm(t[2], imc.dma_addr+t[0], wmc.dma_addr, omc.dma_addr+t[1]) for t in plan["tiles"]]
+  if DEBUG >= 6: _dump_cmd(f"MAC {M}x{N}x{K}", task_regs)
   npu.write_regs(task_regs, 0xd, False, _E(0x0001,0,0))      # MAC: OPERATION_ENABLE=0xd, op_idx=0, end-NOP=E(0x0001,0,0)
   if npu.submit(len(task_regs), reset=True) < 0: raise RuntimeError("npu_submit failed")
   out = struct.unpack(f"<{M*ao}f", omap[:M*ao*4])             # fp32 padded output; de-interleave row m at stride align_out
   bufs[bufC][cb*4:(cb+M*N)*4] = struct.pack(f"<{M*N}f", *(out[m*ao+n] for m in range(M) for n in range(N)))
 
 class RKProgram:
-  def __init__(self, device:str, name:str, lib:bytes, *args, **kwargs):
-    self.device, self.name, self.prog = device, name, pickle.loads(lib)
+  def __init__(self, device:str, name:str, lib:RKSource, *args, **kwargs):
+    self.device, self.name, self.prog = device, name, lib.data
     self._fxns:list = []; self._gemm_fxns:list = []; self._ew_cache:dict = {}   # resident NPU buffers per EW submit
     self._npu_gemm = self.prog[2] if self.prog[0] == "chunks" else None    # GEMMs to run on the NPU MAC, or None
     self._npu_gemm_cmd = self.prog[3] if self.prog[0] == "chunks" else None # the renderer-generated GEMM register command per GEMM
