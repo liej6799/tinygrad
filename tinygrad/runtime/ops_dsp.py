@@ -1,9 +1,10 @@
 from __future__ import annotations
-import ctypes, os, mmap, tempfile, pathlib, array, functools, threading, contextlib, sys, subprocess, struct
+import ctypes, os, mmap, tempfile, pathlib, array, functools, threading, contextlib, sys, subprocess, struct, fcntl
 assert sys.platform != 'win32'
+if pathlib.Path('/system/lib64/libc.so').is_file(): os.environ.setdefault('LIBC_PATH', '/system/lib64/libc.so')
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler
-from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.dtype import dtypes
+from tinygrad.uop.ops import Ops, UOp, AddrSpace
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.runtime.autogen import libc, qcom_dsp
@@ -11,11 +12,17 @@ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-i
 
 from tinygrad.uop.ops import PatternMatcher, UPat
 
+dsp_pm = PatternMatcher([
+  (((UPat.var('x').maximum(0) ^ -1).maximum(-256) ^ -1).cast(dtypes.uchar.vec(128)),
+   lambda x: UOp(Ops.CUSTOM, dtypes.uchar.vec(128), src=tuple(UOp.vectorize(*[x.index(j) for j in range(i, i+32)]) for i in range(0, 128, 32)),
+     arg="__builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B({3}, {2}), __builtin_HEXAGON_V6_vpackwh_sat_128B({1}, {0}))")),
+])
+
 dsp_pm_late = PatternMatcher([
   (UPat.var("x")+UPat(Ops.STACK,src=UPat.var("y")), lambda x,y: x+UOp(Ops.CUSTOMI,x.dtype,(y,),arg="{0}") if x.op is not Ops.CUSTOMI else None),
   (UPat.var("x")*UPat(Ops.STACK,src=UPat.var("y")), lambda x,y: x*UOp(Ops.CUSTOMI,x.dtype,(y,),arg="{0}") if x.op is not Ops.CUSTOMI else None),
   (UPat.var("x")//UPat(Ops.STACK,src=UPat.var("y")), lambda x,y: x//UOp(Ops.CUSTOMI,x.dtype,(y,),arg="{0}") if x.op is not Ops.CUSTOMI else None),
-  (UPat(Ops.BUFFER, src=(UPat(Ops.STACK, src=UPat(Ops.CONST, arg=0)),), dtype=dtypes.uchar, name="d", allow_any_len=True),
+  (UPat(Ops.BUFFER, src=(UPat(Ops.STACK, src=UPat(Ops.CONST, arg=0)),), dtype=dtypes.uchar.vec(128), name="d", allow_any_len=True),
    lambda d: d.replace(src=(UOp(Ops.CUSTOMI, d.dtype, arg="__builtin_HEXAGON_V6_vd0_128B()"),)+d.src[1:]) if d.addrspace is AddrSpace.REG else None),
 ])
 
@@ -30,6 +37,7 @@ class DSPRenderer(ClangRenderer):
   buffer_suffix = " restrict __attribute__((align_value(128)))"
   kernel_typedef = "__attribute__((noinline)) void"
   extra_args = []
+  pre_matcher = dsp_pm
   extra_matcher = dsp_pm_late+ClangRenderer.extra_matcher
   string_rewrite = dsp_string+ClangRenderer.string_rewrite
   type_map = { **ClangRenderer.type_map, dtypes.uint64: "unsigned long long", dtypes.int64: "long long" }
@@ -83,7 +91,7 @@ class DSPProgram:
 
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*4)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    var_vals_mv.cast('i')[:] = array.array('i', tuple(b.size for b in bufs) + vals)
+    var_vals_mv.cast('i')[:] = array.array('i', tuple(b.size+b.offset for b in bufs) + vals)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
     self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
     return timer[0] / 1e6
@@ -92,12 +100,25 @@ class DSPBuffer:
   def __init__(self, va_addr:int, size:int, share_info, offset:int=0):
     self.va_addr, self.size, self.share_info, self.offset = va_addr, size, share_info, offset
 
+class IonAllocationData(ctypes.Structure):
+  _fields_ = [('len', ctypes.c_uint64), ('heap_id_mask', ctypes.c_uint32), ('flags', ctypes.c_uint32),
+              ('fd', ctypes.c_int32), ('unused', ctypes.c_uint32)]
+
+class IonShareInfo:
+  def __init__(self, fd:int): self.fd = fd
+
 class DSPAllocator(Allocator['DSPDevice']):
   def _alloc(self, size:int, options:BufferSpec):
     if getenv("MOCKDSP"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
     else:
-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
-      fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
+      try:
+        b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+        fd = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd
+      except OSError:
+        b = IonAllocationData(size, 1<<qcom_dsp.ION_SYSTEM_HEAP_ID, qcom_dsp.ION_FLAG_CACHED, -1, 0)
+        fcntl.ioctl(self.dev.ion_fd, (3<<30)|(ctypes.sizeof(b)<<16)|(ord('I')<<8), b, True)
+        fd, share_info = b.fd, IonShareInfo(b.fd)
+      flags = mmap.MAP_SHARED
     return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0)
 
   @suppress_finalizing
@@ -105,7 +126,7 @@ class DSPAllocator(Allocator['DSPDevice']):
     libc.munmap(opaque.va_addr, opaque.size)
     if opaque.share_info is not None:
       os.close(opaque.share_info.fd)
-      qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
+      if hasattr(opaque.share_info, 'handle'): qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
 
   def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
   def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
@@ -114,7 +135,11 @@ class DSPAllocator(Allocator['DSPDevice']):
 
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
-    compiler_args = "--target=hexagon -mcpu=hexagonv65 -fuse-ld=lld -nostdlib -mhvx=v65 -mhvx-length=128b"
+    # Hexagon DSP version. comma/AGNOS hardware is v65; newer Snapdragon SoCs use
+    # later cores (e.g. Snapdragon 888 / OnePlus 9 -> v68). Override with DSP_ARCH,
+    # e.g. DSP_ARCH=v68. Both -mcpu and -mhvx track the same version.
+    dsp_arch = getenv("DSP_ARCH", "v65")
+    compiler_args = f"--target=hexagon -mcpu=hexagon{dsp_arch} -fuse-ld=lld -nostdlib -mhvx={dsp_arch} -mhvx-length=128b"
     if mock: self.args = f"-static {compiler_args}"
     else:
       # Generate link script to pass into clang. Aligning all used sections to 4k fixes invoke problem.
@@ -145,7 +170,18 @@ class DSPDevice(Compiled):
     else:
       self.ion_fd = os.open('/dev/ion', os.O_RDONLY)
       super().__init__(device, DSPAllocator(self), [DSPRenderer], functools.partial(DSPProgram, self))
-      fastrpc_shell = memoryview(bytearray(pathlib.Path('/dsp/cdsp/fastrpc_shell_3').read_bytes()))
+      # FastRPC shell lookup. The cDSP shell lives at different paths across devices:
+      # comma/AGNOS exposes /dsp/cdsp/..., while stock Android (e.g. OnePlus 9 /
+      # Snapdragon 888) keeps it on the vendor_dsp partition at /vendor/dsp/cdsp/...
+      # Prefer the unsigned-PD shell (works without a signed test-sig) when present.
+      unsigned_names = ['/dsp/cdsp/fastrpc_shell_unsigned_3', '/vendor/dsp/cdsp/fastrpc_shell_unsigned_3']
+      signed_names   = ['/dsp/cdsp/fastrpc_shell_3', '/vendor/dsp/cdsp/fastrpc_shell_3']
+      unsigned_shell = next((p for p in unsigned_names if pathlib.Path(p).is_file()), None)
+      signed_shell   = next((p for p in signed_names   if pathlib.Path(p).is_file()), None)
+      self.unsigned_pd = getenv('DSP_UNSIGNED', int(unsigned_shell is not None))
+      default_shell = (unsigned_shell if self.unsigned_pd else signed_shell) or unsigned_shell or signed_shell
+      shell_path = getenv('DSP_SHELL', default_shell or '/dsp/cdsp/fastrpc_shell_3')
+      fastrpc_shell = memoryview(bytearray(pathlib.Path(shell_path).read_bytes()))
       self.shell_buf = self.allocator.alloc(round_up(fastrpc_shell.nbytes, 0x1000), BufferSpec(nolru=True))
       ctypes.memmove(self.shell_buf.va_addr, mv_address(fastrpc_shell), fastrpc_shell.nbytes)
 
@@ -186,7 +222,12 @@ class DSPDevice(Compiled):
     self.rpc_fd: int = os.open('/dev/adsprpc-smd', os.O_RDONLY | os.O_NONBLOCK)
     qcom_dsp.FASTRPC_IOCTL_GETINFO(self.rpc_fd, 3)
     qcom_dsp.FASTRPC_IOCTL_CONTROL(self.rpc_fd, req=0x3)
-    qcom_dsp.FASTRPC_IOCTL_INIT(self.rpc_fd, flags=0x1, file=self.shell_buf.va_addr, filelen=self.shell_buf.size, filefd=self.shell_buf.share_info.fd)
+    if self.unsigned_pd:
+      init = qcom_dsp.struct_fastrpc_ioctl_init(flags=0x1, file=self.shell_buf.va_addr, filelen=self.shell_buf.size,
+                                                filefd=self.shell_buf.share_info.fd, mem=0, memlen=0, memfd=0)
+      qcom_dsp.FASTRPC_IOCTL_INIT_ATTRS(self.rpc_fd, init=init, attrs=1<<3, siglen=0)
+    else:
+      qcom_dsp.FASTRPC_IOCTL_INIT(self.rpc_fd, flags=0x1, file=self.shell_buf.va_addr, filelen=self.shell_buf.size, filefd=self.shell_buf.share_info.fd)
     qcom_dsp.FASTRPC_IOCTL_INVOKE(self.rpc_fd, handle=3, sc=rpc_sc(method=3, ins=0, outs=0))
 
 class RPCListener(threading.Thread):
@@ -197,7 +238,7 @@ class RPCListener(threading.Thread):
   def run(self):
     # Setup initial request arguments.
     context, status, TINYFD = 0, 0xffffffff, 0xffff
-    req_args, _, _, _ = rpc_prep_args(ins=[msg_send:=memoryview(bytearray(0x10)).cast('I'), out_buf:=memoryview(bytearray(0x10000)).cast('I')],
+    req_args, _, _, _ = rpc_prep_args(ins=[msg_send:=memoryview(bytearray(0x10)).cast('I'), out_buf:=memoryview(bytearray(0x20000)).cast('I')],
                                       outs=[msg_recv:=memoryview(bytearray(0x10)).cast('I'), in_buf:=memoryview(bytearray(0x10000)).cast('I')])
     req_args[1].buf.len = 0
 
@@ -229,7 +270,8 @@ class RPCListener(threading.Thread):
         try: out_args[0].cast('I')[0] = TINYFD if (name:=in_args[3].tobytes()[:-1].decode()) == "tinylib" else os.open(name, os.O_RDONLY)
         except OSError: status = 1
       elif sc == 0x3010000:
-        if (fd:=in_args[0].cast('I')[0]) != TINYFD: os.close(fd)
+        fd = ctypes.c_int32(in_args[0].cast('I')[0]).value
+        if fd >= 0 and fd != TINYFD: os.close(fd)
       elif sc == 0x9010000: # seek
         if (fd:=in_args[0].cast('I')[0]) == TINYFD:
           assert in_args[0].cast('I')[2] == qcom_dsp.APPS_STD_SEEK_SET, "Supported only SEEK_SET"
@@ -238,7 +280,7 @@ class RPCListener(threading.Thread):
         status = 0 if res >= 0 else res
       elif sc == 0x4010200: # read
         if (fd:=in_args[0].cast('I')[0]) == TINYFD:
-          buf = self.device.binded_lib[self.device.binded_lib_off:self.device.binded_lib_off+in_args[0].cast('I')[1]]
+          buf = self.device.binded_lib[self.device.binded_lib_off:self.device.binded_lib_off+min(in_args[0].cast('I')[1], out_args[1].nbytes)]
           self.device.binded_lib_off += len(buf)
         else: buf = os.read(fd, in_args[0].cast('I')[1])
         out_args[1][:len(buf)] = buf
