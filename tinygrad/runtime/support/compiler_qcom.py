@@ -13,7 +13,11 @@ class QCOMCompiler(Compiler):
     self.arch, self.chip_id, self.llvm_inst = arch, 0x6030001, llvm_qcom.cl_compiler_create_llvm_instance()
     super().__init__(f"compile_qcomcl_{arch}")
 
-  def __del__(self): llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst)
+  def __del__(self):
+    # __init__ may not have reached the point of creating llvm_inst (e.g. this
+    # renderer's compiler is instantiated but unused when another renderer is
+    # selected, or llvm_qcom failed to load), so guard against it being unset.
+    if getattr(self, "llvm_inst", None) is not None: llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst)
 
   def __reduce__(self): return QCOMCompiler, (self.arch,)
 
