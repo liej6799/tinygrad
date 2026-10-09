@@ -79,6 +79,11 @@ class CLAllocator(Allocator['CLDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     return BufferStorage(checked(cl.clCreateBuffer(self.dev.context, cl.CL_MEM_READ_WRITE, size, None, status := ctypes.c_int32()), status))
 
+  def _offset(self, buf:cl.cl_mem, size:int, offset:int) -> cl.cl_mem:
+    region = cl.cl_buffer_region(offset, size)
+    return checked(cl.clCreateSubBuffer(buf, cl.CL_MEM_READ_WRITE, cl.CL_BUFFER_CREATE_TYPE_REGION,
+                                        ctypes.byref(region), status := ctypes.c_int32()), status)
+
   @suppress_finalizing
   def _free(self, storage:BufferStorage, options:BufferSpec): check(cl.clReleaseMemObject(storage.buf))
   def _copyin(self, dest:cl.cl_mem, src:memoryview):
